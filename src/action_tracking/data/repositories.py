@@ -606,7 +606,7 @@ class ProjectRepository:
         return {
             "id": project_id,
             "name": data.get("name", "").strip(),
-            "type": data.get("type") or "custom",
+            "type": data.get("type") or "Others",
             "owner_champion_id": data.get("owner_champion_id"),
             "status": data.get("status") or "active",
             "created_at": data.get("created_at") or now,

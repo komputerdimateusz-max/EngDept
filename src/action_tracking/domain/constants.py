@@ -7,4 +7,4 @@ ACTION_CATEGORIES: tuple[str, ...] = (
     "Development",
 )
 
-PROJECT_CATEGORIES: tuple[str, ...] = ("SL", "RL", "FL", "Others")
+PROJECT_TYPES: tuple[str, ...] = ("SL", "RL", "FL", "Others")
