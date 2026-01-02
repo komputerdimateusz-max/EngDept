@@ -400,7 +400,7 @@ class ProjectRepository:
                        END AS owner_champion_name
                 FROM projects p
                 LEFT JOIN champions ch ON ch.id = p.owner_champion_id
-                ORDER BY name
+                ORDER BY p.name
                 """
             )
         rows = [dict(r) for r in cur.fetchall()]
