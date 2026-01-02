@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import importlib.util
 import sqlite3
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from statistics import median
 from typing import Any
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -13,52 +14,122 @@ from action_tracking.data.repositories import ActionRepository, ChampionReposito
 from action_tracking.domain.constants import ACTION_CATEGORIES
 
 
-def _parse_date(value: Any, issues: list[str], field: str, action_id: str) -> date | None:
+@dataclass(frozen=True)
+class ParsedAction:
+    action_id: str
+    project_id: str | None
+    champion_id: str | None
+    status: str
+    created: date
+    closed: date | None
+    due: date | None
+
+
+def _parse_date(value: Any) -> date | None:
     if value in (None, ""):
         return None
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
     if isinstance(value, datetime):
         return value.date()
+    s = str(value)
     try:
-        return date.fromisoformat(str(value))
+        return date.fromisoformat(s)
     except ValueError:
         try:
-            return datetime.fromisoformat(str(value)).date()
+            return datetime.fromisoformat(s).date()
         except ValueError:
-            issues.append(f"{action_id}:{field}")
             return None
 
 
-def _week_end(target: date) -> date:
-    """Return the Sunday for the ISO week containing target."""
-    return target + timedelta(days=(7 - target.isoweekday()))
+def _current_week_start(today: date) -> date:
+    # ISO Monday start
+    return today - timedelta(days=today.isoweekday() - 1)
 
 
-def _week_start(target: date) -> date:
-    return target - timedelta(days=(target.isoweekday() - 1))
+def _build_week_buckets(today: date) -> list[dict[str, Any]]:
+    """
+    Fixed horizon: 4 weeks back + current + 4 weeks forward (always 9 buckets).
+    Buckets are pre-created with zeros so X-axis is stable even with no data.
+    """
+    current_week_start = _current_week_start(today)
+    week_starts = [current_week_start + timedelta(days=7 * i) for i in range(-4, 5)]
+    buckets: list[dict[str, Any]] = []
+    for week_start in week_starts:
+        week_end = week_start + timedelta(days=6)
+        iso_year, iso_week, _ = week_start.isocalendar()
+        buckets.append(
+            {
+                "week_start": week_start,
+                "week_end": week_end,
+                "week_label": f"{iso_year}-W{iso_week:02d}",
+                "actual_open": 0,
+                "actual_overdue": 0,
+                "planned_open": 0,
+            }
+        )
+    return buckets
 
 
-def _format_rate(value: float | None) -> str:
-    if value is None:
-        return "—"
-    return f"{value:.1%}"
+def _prepare_actions(rows: list[dict[str, Any]]) -> tuple[list[ParsedAction], int]:
+    parsed: list[ParsedAction] = []
+    issues = 0
+    for row in rows:
+        created = _parse_date(row.get("created_at"))
+        if created is None:
+            issues += 1
+            continue
+        closed = _parse_date(row.get("closed_at"))
+        due = _parse_date(row.get("due_date"))
+        parsed.append(
+            ParsedAction(
+                action_id=str(row.get("id", "")),
+                project_id=row.get("project_id"),
+                champion_id=row.get("owner_champion_id"),
+                status=str(row.get("status") or ""),
+                created=created,
+                closed=closed,
+                due=due,
+            )
+        )
+    return parsed, issues
 
 
-def _format_days(value: float | None) -> str:
-    if value is None:
-        return "—"
-    return f"{value:.1f} dni"
+def _open_at_cutoff(action: ParsedAction, cutoff: date) -> bool:
+    if action.status == "cancelled":
+        return False
+    return action.created <= cutoff and (action.closed is None or action.closed > cutoff)
 
 
-def _format_count(value: int | None) -> str:
-    if value is None:
-        return "—"
-    return f"{value}"
+def _weekly_backlog(actions: list[ParsedAction], today: date) -> pd.DataFrame:
+    buckets = _build_week_buckets(today)
+
+    for action in actions:
+        if action.status == "cancelled":
+            continue
+
+        for bucket in buckets:
+            week_end: date = bucket["week_end"]
+
+            # ACTUAL OPEN at end of week
+            if action.created <= week_end and (action.closed is None or action.closed > week_end):
+                bucket["actual_open"] += 1
+                if action.due is not None and action.due < week_end:
+                    bucket["actual_overdue"] += 1
+
+            # PLANNED OPEN at end of week (assume closure exactly at due_date; no early closures)
+            if action.created <= week_end and (action.due is None or action.due > week_end):
+                bucket["planned_open"] += 1
+
+    for bucket in buckets:
+        bucket["on_time_open"] = max(int(bucket["actual_open"]) - int(bucket["actual_overdue"]), 0)
+
+    return pd.DataFrame(buckets)
 
 
 def render(con: sqlite3.Connection) -> None:
-    st.header("KPI")
+    st.title("KPI")
+    st.caption("4 tygodnie wstecz + bieżący + 4 tygodnie w przód")
 
     repo = ActionRepository(con)
     project_repo = ProjectRepository(con)
@@ -67,29 +138,29 @@ def render(con: sqlite3.Connection) -> None:
     projects = project_repo.list_projects(include_counts=False)
     champions = champion_repo.list_champions()
 
-    project_names = {p["id"]: (p.get("name") or p["id"]) for p in projects}
-    champion_names = {c["id"]: c["display_name"] for c in champions}
+    project_names = {p["id"]: (p.get("name") or p.get("project_name") or p["id"]) for p in projects}
+    champion_names = {c["id"]: (c.get("display_name") or c.get("name") or c["id"]) for c in champions}
+
+    # Filters (no lookback here; fixed 9-week axis)
+    project_options = ["Wszystkie"] + [p["id"] for p in projects]
+    champion_options = ["(Wszyscy)"] + [c["id"] for c in champions]
+    category_options = ["(Wszystkie)"] + list(ACTION_CATEGORIES)
 
     st.subheader("Filtry")
-    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([1, 1.6, 1.6, 1.6])
-    lookback_weeks = filter_col1.selectbox("Lookback (tyg.)", [4, 8, 12, 24, 52], index=2)
-    selected_project = filter_col2.selectbox(
+    f1, f2, f3 = st.columns([1.6, 1.6, 1.2])
+    selected_project = f1.selectbox(
         "Projekt",
-        ["Wszystkie"] + [p["id"] for p in projects],
+        project_options,
         index=0,
         format_func=lambda pid: pid if pid == "Wszystkie" else project_names.get(pid, pid),
     )
-    selected_champion = filter_col3.selectbox(
+    selected_champion = f2.selectbox(
         "Champion",
-        ["(Wszyscy)"] + [c["id"] for c in champions],
+        champion_options,
         index=0,
         format_func=lambda cid: cid if cid == "(Wszyscy)" else champion_names.get(cid, cid),
     )
-    selected_category = filter_col4.selectbox(
-        "Kategoria",
-        ["(Wszystkie)"] + list(ACTION_CATEGORIES),
-        index=0,
-    )
+    selected_category = f3.selectbox("Kategoria", category_options, index=0)
 
     project_filter = None if selected_project == "Wszystkie" else selected_project
     champion_filter = None if selected_champion == "(Wszyscy)" else selected_champion
@@ -100,270 +171,196 @@ def render(con: sqlite3.Connection) -> None:
         champion_id=champion_filter,
         category=category_filter,
     )
+    actions, data_issues = _prepare_actions(rows)
 
     today = date.today()
-    week_end = _week_end(today)
-    week_start = _week_start(today)
-    lookback_end = week_end
-    lookback_start = lookback_end - timedelta(days=7 * (lookback_weeks - 1) + 6)
+    current_week_start = _current_week_start(today)
+    current_week_end = current_week_start + timedelta(days=6)
 
-    parsed_actions: list[dict[str, Any]] = []
-    issues: list[str] = []
-    for row in rows:
-        created_at = _parse_date(row.get("created_at"), issues, "created_at", row.get("id", "?"))
-        if created_at is None:
-            continue
-        parsed_actions.append(
-            {
-                "id": row.get("id"),
-                "status": row.get("status"),
-                "created_at": created_at,
-                "closed_at": _parse_date(row.get("closed_at"), issues, "closed_at", row.get("id", "?")),
-                "due_date": _parse_date(row.get("due_date"), issues, "due_date", row.get("id", "?")),
-                "owner_champion_id": row.get("owner_champion_id"),
-            }
-        )
+    open_now = [a for a in actions if _open_at_cutoff(a, today)]
+    overdue_now = [a for a in open_now if a.due is not None and a.due < today]
 
-    open_now = 0
-    overdue_now = 0
-    closed_this_week = 0
-    created_this_week = 0
-
-    closed_in_period: list[dict[str, Any]] = []
-
-    for action in parsed_actions:
-        created_at = action["created_at"]
-        closed_at = action["closed_at"]
-        due_date = action["due_date"]
-        status = action["status"]
-
-        is_open_now = (
-            created_at <= today
-            and (closed_at is None or closed_at > today)
-            and status not in ("cancelled",)
-        )
-        if is_open_now:
-            open_now += 1
-            if due_date and due_date < today:
-                overdue_now += 1
-
-        if closed_at and week_start <= closed_at <= week_end:
-            closed_this_week += 1
-
-        if week_start <= created_at <= week_end:
-            created_this_week += 1
-
-        if closed_at and lookback_start <= closed_at <= lookback_end:
-            closed_in_period.append(action)
-
-    overdue_rate = (overdue_now / open_now) if open_now else None
-
-    on_time_eligible = [a for a in closed_in_period if a["due_date"]]
-    on_time_closed = [a for a in on_time_eligible if a["closed_at"] and a["closed_at"] <= a["due_date"]]
-    on_time_rate = (len(on_time_closed) / len(on_time_eligible)) if on_time_eligible else None
-
-    close_durations = [
-        (a["closed_at"] - a["created_at"]).days
-        for a in closed_in_period
-        if a["closed_at"]
+    created_this_week = [
+        a for a in actions if a.status != "cancelled" and current_week_start <= a.created <= current_week_end
     ]
+    closed_this_week = [
+        a
+        for a in actions
+        if a.status != "cancelled"
+        and a.closed is not None
+        and current_week_start <= a.closed <= current_week_end
+    ]
+
+    # On-time close rate: only actions with due_date are eligible
+    eligible_closed = [a for a in closed_this_week if a.due is not None and a.closed is not None]
+    on_time_closed = [a for a in eligible_closed if a.closed <= a.due]  # type: ignore[operator]
+
+    overdue_rate = (len(overdue_now) / len(open_now)) if open_now else None
+    on_time_rate = (len(on_time_closed) / len(eligible_closed)) if eligible_closed else None
+
+    close_durations = [(a.closed - a.created).days for a in actions if a.closed is not None]
     median_close_days = float(median(close_durations)) if close_durations else None
 
-    st.subheader("KPI (teraz)")
-    kpi_cols = st.columns(4)
-    kpi_cols[0].metric("Otwarte", _format_count(open_now))
-    kpi_cols[1].metric("Po terminie", _format_count(overdue_now))
-    kpi_cols[2].metric("Overdue rate", _format_rate(overdue_rate))
-    kpi_cols[3].metric("Zamknięte w tym tygodniu", _format_count(closed_this_week))
+    # KPI tiles
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Otwarte (teraz)", f"{len(open_now)}")
+    k2.metric("Po terminie (teraz)", f"{len(overdue_now)}")
+    k3.metric("Overdue rate", "—" if overdue_rate is None else f"{overdue_rate:.1%}")
+    k4.metric("Utworzone w tym tyg.", f"{len(created_this_week)}")
+    k5.metric("Zamknięte w tym tyg.", f"{len(closed_this_week)}")
+    k6.metric("On-time close rate", "—" if on_time_rate is None else f"{on_time_rate:.1%}")
 
-    kpi_cols_2 = st.columns(3)
-    kpi_cols_2[0].metric("Utworzone w tym tygodniu", _format_count(created_this_week))
-    kpi_cols_2[1].metric("On-time close rate", _format_rate(on_time_rate))
-    kpi_cols_2[2].metric("Median time-to-close", _format_days(median_close_days))
+    st.caption(f"Median time-to-close: {'—' if median_close_days is None else f'{median_close_days:.1f} dni'}")
+    if data_issues:
+        st.caption(f"Pominięto {data_issues} rekordów z błędną datą.")
 
-    if issues:
-        st.caption(
-            "Pominięto rekordy z nieprawidłowym formatem daty: "
-            f"{len(issues)} pól."
+    # Weekly chart (fixed 9 weeks)
+    st.subheader("Weekly backlog (otwarte akcje na koniec tygodnia)")
+    weekly_df = _weekly_backlog(actions, today)
+    week_order = weekly_df["week_label"].tolist()
+
+    stacked = (
+        alt.Chart(weekly_df)
+        .transform_fold(["on_time_open", "actual_overdue"], as_=["metric", "count"])
+        .transform_calculate(
+            metric_label="datum.metric == 'on_time_open' ? 'On-time open' : 'Overdue open'"
         )
-
-    weekly_weeks = [lookback_start + timedelta(days=7 * i + 6) for i in range(lookback_weeks)]
-    weekly_rows: list[dict[str, Any]] = []
-    planned_rows: list[dict[str, Any]] = []
-
-    for week_end_date in weekly_weeks:
-        actual_open = 0
-        actual_overdue = 0
-        planned_open = 0
-
-        for action in parsed_actions:
-            created_at = action["created_at"]
-            closed_at = action["closed_at"]
-            due_date = action["due_date"]
-            status = action["status"]
-
-            is_actual_open = (
-                created_at <= week_end_date
-                and (closed_at is None or closed_at > week_end_date)
-                and status not in ("cancelled",)
-            )
-            if is_actual_open:
-                actual_open += 1
-                if due_date and due_date < week_end_date:
-                    actual_overdue += 1
-
-            is_planned_open = (
-                created_at <= week_end_date
-                and (due_date is None or due_date > week_end_date)
-                and status not in ("cancelled",)
-            )
-            if is_planned_open:
-                planned_open += 1
-
-        week_label = f"{week_end_date.isocalendar().year}-W{week_end_date.isocalendar().week:02d}"
-        actual_on_time = max(actual_open - actual_overdue, 0)
-        weekly_rows.append(
-            {
-                "week_label": week_label,
-                "type": "On-time open",
-                "count": actual_on_time,
-            }
-        )
-        weekly_rows.append(
-            {
-                "week_label": week_label,
-                "type": "Overdue open",
-                "count": actual_overdue,
-            }
-        )
-        planned_rows.append(
-            {
-                "week_label": week_label,
-                "planned_open": planned_open,
-            }
-        )
-
-    st.subheader("Weekly backlog (open actions na koniec tygodnia)")
-
-    has_altair = importlib.util.find_spec("altair") is not None
-    if has_altair:
-        import altair as alt
-
-        weekly_df = pd.DataFrame(weekly_rows)
-        planned_df = pd.DataFrame(planned_rows)
-        order = [row["week_label"] for row in planned_rows]
-
-        base = alt.Chart(weekly_df).encode(
-            x=alt.X("week_label:N", sort=order, title="ISO week (koniec tygodnia)"),
-            y=alt.Y("count:Q", title="Liczba otwartych akcji"),
+        .mark_bar()
+        .encode(
+            x=alt.X("week_label:N", sort=week_order, title="ISO week"),
+            y=alt.Y("count:Q", title="Liczba otwartych akcji", stack="zero"),
             color=alt.Color(
-                "type:N",
-                scale=alt.Scale(
-                    domain=["On-time open", "Overdue open"],
-                    range=["#4C78A8", "#E45756"],
-                ),
-                legend=alt.Legend(title="Status"),
+                "metric_label:N",
+                scale=alt.Scale(domain=["On-time open", "Overdue open"], range=["#4C78A8", "#E45756"]),
+                legend=alt.Legend(title=None),
             ),
+            tooltip=[
+                alt.Tooltip("week_label:N", title="Tydzień"),
+                alt.Tooltip("on_time_open:Q", title="On-time open"),
+                alt.Tooltip("actual_overdue:Q", title="Overdue open"),
+                alt.Tooltip("actual_open:Q", title="Actual open"),
+                alt.Tooltip("planned_open:Q", title="Planned open"),
+            ],
         )
-
-        actual_bars = base.mark_bar()
-        planned_overlay = (
-            alt.Chart(planned_df)
-            .mark_bar(
-                fillOpacity=0.0,
-                stroke="#333333",
-                strokeDash=[4, 2],
-                strokeWidth=2,
-            )
-            .encode(
-                x=alt.X("week_label:N", sort=order),
-                y=alt.Y("planned_open:Q"),
-            )
-        )
-
-        chart = alt.layer(actual_bars, planned_overlay).resolve_scale(y="shared")
-        st.altair_chart(chart, use_container_width=True)
-    else:
-        weekly_table = pd.DataFrame(planned_rows).set_index("week_label")
-        st.bar_chart(weekly_table, height=280)
-        st.caption("Altair niedostępny: pokazano tylko planned open.")
-
-    st.subheader("Champion backlog (obecny tydzień)")
-
-    champion_counts: dict[str, dict[str, int]] = {}
-    for action in parsed_actions:
-        created_at = action["created_at"]
-        closed_at = action["closed_at"]
-        due_date = action["due_date"]
-        status = action["status"]
-        if not (
-            created_at <= today
-            and (closed_at is None or closed_at > today)
-            and status not in ("cancelled",)
-        ):
-            continue
-
-        champion_id = action.get("owner_champion_id") or "(brak)"
-        champion_counts.setdefault(champion_id, {"open": 0, "overdue": 0})
-        champion_counts[champion_id]["open"] += 1
-        if due_date and due_date < today:
-            champion_counts[champion_id]["overdue"] += 1
-
-    champion_rows: list[dict[str, Any]] = []
-    for champion_id, counts in champion_counts.items():
-        total_open = counts["open"]
-        overdue_open = counts["overdue"]
-        on_time_open = max(total_open - overdue_open, 0)
-        champion_label = champion_names.get(champion_id, champion_id)
-        champion_rows.append(
-            {
-                "champion": champion_label,
-                "type": "On-time open",
-                "count": on_time_open,
-                "total_open": total_open,
-            }
-        )
-        champion_rows.append(
-            {
-                "champion": champion_label,
-                "type": "Overdue open",
-                "count": overdue_open,
-                "total_open": total_open,
-            }
-        )
-
-    if not champion_rows:
-        st.info("Brak otwartych akcji dla wybranych filtrów.")
-        return
-
-    champion_df = pd.DataFrame(champion_rows)
-    order = (
-        champion_df.drop_duplicates("champion")
-        .sort_values("total_open", ascending=False)["champion"]
-        .tolist()
     )
 
-    if has_altair:
-        import altair as alt
-
-        champ_chart = (
-            alt.Chart(champion_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("champion:N", sort=order, title="Champion"),
-                y=alt.Y("count:Q", title="Liczba otwartych akcji"),
-                color=alt.Color(
-                    "type:N",
-                    scale=alt.Scale(
-                        domain=["On-time open", "Overdue open"],
-                        range=["#4C78A8", "#E45756"],
-                    ),
-                    legend=alt.Legend(title="Status"),
-                ),
-            )
+    planned_outline = (
+        alt.Chart(weekly_df)
+        .mark_bar(fillOpacity=0.0, stroke="#333333", strokeDash=[4, 2], strokeWidth=2)
+        .encode(
+            x=alt.X("week_label:N", sort=week_order),
+            y=alt.Y("planned_open:Q"),
+            tooltip=[
+                alt.Tooltip("week_label:N", title="Tydzień"),
+                alt.Tooltip("planned_open:Q", title="Planned open"),
+            ],
         )
-        st.altair_chart(champ_chart, use_container_width=True)
-    else:
-        fallback = champion_df.pivot(index="champion", columns="type", values="count").fillna(0)
-        st.bar_chart(fallback, height=280)
-        st.caption("Altair niedostępny: wykres uproszczony.")
+    )
+
+    st.altair_chart(alt.layer(stacked, planned_outline).properties(height=320), use_container_width=True)
+
+    # Champion chart (current week / now)
+    st.subheader("Champion backlog (obecny tydzień)")
+    chart_col, table_col = st.columns([0.6, 0.4])
+
+    open_by_champion: dict[str, dict[str, int]] = {}
+    for a in open_now:
+        key = a.champion_id or "unassigned"
+        open_by_champion.setdefault(key, {"open": 0, "overdue": 0})
+        open_by_champion[key]["open"] += 1
+        if a.due is not None and a.due < today:
+            open_by_champion[key]["overdue"] += 1
+
+    champion_rows: list[dict[str, Any]] = []
+    for champion_id, counts in open_by_champion.items():
+        label = "Nieprzypisany" if champion_id == "unassigned" else champion_names.get(champion_id, champion_id)
+        total_open = counts["open"]
+        overdue_open = counts["overdue"]
+        champion_rows.append(
+            {"Champion": label, "type": "On-time open", "count": max(total_open - overdue_open, 0), "total": total_open}
+        )
+        champion_rows.append(
+            {"Champion": label, "type": "Overdue open", "count": overdue_open, "total": total_open}
+        )
+
+    with chart_col:
+        if not champion_rows:
+            st.info("Brak otwartych akcji dla wybranych filtrów.")
+        else:
+            champ_df = pd.DataFrame(champion_rows)
+            order = (
+                champ_df.drop_duplicates("Champion")
+                .sort_values("total", ascending=False)["Champion"]
+                .tolist()
+            )
+            champ_chart = (
+                alt.Chart(champ_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("count:Q", title="Otwarte"),
+                    y=alt.Y("Champion:N", sort=order, title=None),
+                    color=alt.Color(
+                        "type:N",
+                        scale=alt.Scale(domain=["On-time open", "Overdue open"], range=["#4C78A8", "#E45756"]),
+                        legend=alt.Legend(title=None),
+                    ),
+                    tooltip=[alt.Tooltip("Champion:N"), alt.Tooltip("type:N"), alt.Tooltip("count:Q")],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(champ_chart, use_container_width=True)
+
+    with table_col:
+        st.markdown("#### KPI detail table (Top 10)")
+        view = st.selectbox("Widok tabeli", ["Champion", "Projekt"], index=0)
+
+        if view == "Projekt":
+            group_labels = project_names
+            get_key = lambda a: a.project_id or "unassigned"
+        else:
+            group_labels = champion_names
+            get_key = lambda a: a.champion_id or "unassigned"
+
+        open_by_group: dict[str, dict[str, int]] = {}
+        for a in open_now:
+            k = get_key(a)
+            open_by_group.setdefault(k, {"open": 0, "overdue": 0})
+            open_by_group[k]["open"] += 1
+            if a.due is not None and a.due < today:
+                open_by_group[k]["overdue"] += 1
+
+        closed_by_group: dict[str, int] = {}
+        for a in closed_this_week:
+            k = get_key(a)
+            closed_by_group[k] = closed_by_group.get(k, 0) + 1
+
+        rows_out: list[dict[str, Any]] = []
+        for k, counts in open_by_group.items():
+            label = "Nieprzypisany" if k == "unassigned" else group_labels.get(k, k)
+            total_open = counts["open"]
+            overdue = counts["overdue"]
+            overdue_pct = (overdue / total_open) if total_open else None
+            rows_out.append(
+                {
+                    view: label,
+                    "Open": total_open,
+                    "Overdue": overdue,
+                    "Overdue %": "—" if overdue_pct is None else f"{overdue_pct:.1%}",
+                    "Closed this week": closed_by_group.get(k, 0),
+                }
+            )
+
+        if not rows_out:
+            st.info("Brak danych KPI dla wybranych filtrów.")
+        else:
+            df_out = pd.DataFrame(rows_out).sort_values("Open", ascending=False)
+            st.dataframe(df_out.head(10), use_container_width=True, height=320)
+
+    with st.expander("Definicje i założenia", expanded=False):
+        st.markdown(
+            """
+- **Planned open**: zakładamy zamknięcie w `due_date` (bez wcześniejszych zamknięć).
+- **Overdue**: `due_date < cutoff_date`.
+- **Open**: `created <= cutoff_date` oraz (`closed is null` lub `closed > cutoff_date`).
+"""
+        )
