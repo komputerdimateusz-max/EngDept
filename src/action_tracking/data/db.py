@@ -21,11 +21,16 @@ CREATE TABLE IF NOT EXISTS champions (
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  type TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'custom',
   owner_champion_id TEXT,
   status TEXT NOT NULL DEFAULT 'active',
   created_at TEXT,
   closed_at TEXT,
+  work_center TEXT NOT NULL DEFAULT '',
+  project_code TEXT,
+  project_sop TEXT,
+  project_eop TEXT,
+  related_work_center TEXT,
   FOREIGN KEY(owner_champion_id) REFERENCES champions(id)
 );
 
@@ -57,6 +62,14 @@ CREATE TABLE IF NOT EXISTS champion_projects (
 CREATE TABLE IF NOT EXISTS champion_changelog (
   id TEXT PRIMARY KEY,
   champion_id TEXT,
+  event_type TEXT NOT NULL,
+  event_at TEXT NOT NULL,
+  changes_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_changelog (
+  id TEXT PRIMARY KEY,
+  project_id TEXT,
   event_type TEXT NOT NULL,
   event_at TEXT NOT NULL,
   changes_json TEXT NOT NULL
@@ -148,11 +161,39 @@ def _migrate_to_v2(con: sqlite3.Connection) -> None:
     _set_user_version(con, 2)
 
 
+def _migrate_to_v3(con: sqlite3.Connection) -> None:
+    project_columns = {
+        "work_center": "TEXT NOT NULL DEFAULT ''",
+        "project_code": "TEXT",
+        "project_sop": "TEXT",
+        "project_eop": "TEXT",
+        "related_work_center": "TEXT",
+    }
+    for column, column_type in project_columns.items():
+        if not _column_exists(con, "projects", column):
+            con.execute(f"ALTER TABLE projects ADD COLUMN {column} {column_type};")
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_changelog (
+          id TEXT PRIMARY KEY,
+          project_id TEXT,
+          event_type TEXT NOT NULL,
+          event_at TEXT NOT NULL,
+          changes_json TEXT NOT NULL
+        );
+        """
+    )
+    _set_user_version(con, 3)
+
+
 def init_db(con: sqlite3.Connection) -> None:
     con.executescript(SCHEMA_SQL)
     current_version = _get_user_version(con)
     if current_version < 2:
         _migrate_to_v2(con)
+    if current_version < 3:
+        _migrate_to_v3(con)
     con.commit()
 
 def table_count(con: sqlite3.Connection, table: str) -> int:

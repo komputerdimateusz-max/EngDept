@@ -37,15 +37,230 @@ class ProjectRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
-    def list_projects(self) -> list[dict[str, Any]]:
+    def list_projects(self, include_counts: bool = True) -> list[dict[str, Any]]:
+        if include_counts:
+            cur = self.con.execute(
+                """
+                SELECT p.id,
+                       p.name,
+                       p.type,
+                       p.owner_champion_id,
+                       p.status,
+                       p.created_at,
+                       p.closed_at,
+                       p.work_center,
+                       p.project_code,
+                       p.project_sop,
+                       p.project_eop,
+                       p.related_work_center,
+                       COUNT(a.id) AS actions_total,
+                       COALESCE(SUM(CASE WHEN a.status IN ('done', 'cancelled') THEN 1 ELSE 0 END), 0)
+                           AS actions_closed,
+                       COALESCE(SUM(CASE WHEN a.status NOT IN ('done', 'cancelled') THEN 1 ELSE 0 END), 0)
+                           AS actions_open
+                FROM projects p
+                LEFT JOIN actions a ON a.project_id = p.id
+                GROUP BY p.id
+                ORDER BY p.name
+                """
+            )
+        else:
+            cur = self.con.execute(
+                """
+                SELECT id, name
+                FROM projects
+                ORDER BY name
+                """
+            )
+        rows = [dict(r) for r in cur.fetchall()]
+        if include_counts:
+            for row in rows:
+                total = row.get("actions_total") or 0
+                closed = row.get("actions_closed") or 0
+                row["pct_closed"] = round((closed / total) * 100, 1) if total else None
+        return rows
+
+    def list_changelog(self, limit: int = 50) -> list[dict[str, Any]]:
         cur = self.con.execute(
             """
-            SELECT id, name
-            FROM projects
-            ORDER BY name
-            """
+            SELECT pcl.*,
+                   p.name
+            FROM project_changelog pcl
+            LEFT JOIN projects p ON p.id = pcl.project_id
+            ORDER BY pcl.event_at DESC
+            LIMIT ?
+            """,
+            (limit,),
         )
         return [dict(r) for r in cur.fetchall()]
+
+    def create_project(self, data: dict[str, Any]) -> str:
+        project_id = data.get("id") or str(uuid4())
+        payload = self._normalize_project_payload(project_id, data)
+        self.con.execute(
+            """
+            INSERT INTO projects (
+                id,
+                name,
+                type,
+                owner_champion_id,
+                status,
+                created_at,
+                closed_at,
+                work_center,
+                project_code,
+                project_sop,
+                project_eop,
+                related_work_center
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["id"],
+                payload["name"],
+                payload["type"],
+                payload["owner_champion_id"],
+                payload["status"],
+                payload["created_at"],
+                payload["closed_at"],
+                payload["work_center"],
+                payload["project_code"],
+                payload["project_sop"],
+                payload["project_eop"],
+                payload["related_work_center"],
+            ),
+        )
+        self._log_changelog(
+            project_id,
+            "CREATE",
+            self._serialize_changes(payload),
+        )
+        self.con.commit()
+        return project_id
+
+    def update_project(self, project_id: str, data: dict[str, Any]) -> None:
+        before = self._get_project(project_id)
+        if not before:
+            raise ValueError("Project not found")
+
+        next_payload = {
+            "name": data.get("name", before["name"]),
+            "type": data.get("type", before["type"]),
+            "owner_champion_id": data.get("owner_champion_id", before["owner_champion_id"]),
+            "status": data.get("status", before["status"]),
+            "created_at": data.get("created_at", before["created_at"]),
+            "closed_at": data.get("closed_at", before["closed_at"]),
+            "work_center": data.get("work_center", before.get("work_center")),
+            "project_code": data.get("project_code", before.get("project_code")),
+            "project_sop": data.get("project_sop", before.get("project_sop")),
+            "project_eop": data.get("project_eop", before.get("project_eop")),
+            "related_work_center": data.get("related_work_center", before.get("related_work_center")),
+        }
+        changes = self._diff_changes(before, next_payload)
+        self.con.execute(
+            """
+            UPDATE projects
+            SET name = ?,
+                type = ?,
+                owner_champion_id = ?,
+                status = ?,
+                created_at = ?,
+                closed_at = ?,
+                work_center = ?,
+                project_code = ?,
+                project_sop = ?,
+                project_eop = ?,
+                related_work_center = ?
+            WHERE id = ?
+            """,
+            (
+                next_payload["name"],
+                next_payload["type"],
+                next_payload["owner_champion_id"],
+                next_payload["status"],
+                next_payload["created_at"],
+                next_payload["closed_at"],
+                next_payload["work_center"],
+                next_payload["project_code"],
+                next_payload["project_sop"],
+                next_payload["project_eop"],
+                next_payload["related_work_center"],
+                project_id,
+            ),
+        )
+        if changes:
+            self._log_changelog(
+                project_id,
+                "UPDATE",
+                self._serialize_changes(changes),
+            )
+        self.con.commit()
+
+    def delete_project(self, project_id: str) -> bool:
+        before = self._get_project(project_id)
+        if not before:
+            return True
+        try:
+            self.con.execute("BEGIN")
+            self._log_changelog(
+                project_id,
+                "DELETE",
+                self._serialize_changes(before),
+            )
+            self.con.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+            self.con.commit()
+            return True
+        except sqlite3.IntegrityError:
+            self.con.rollback()
+            return False
+
+    def _get_project(self, project_id: str) -> dict[str, Any] | None:
+        cur = self.con.execute(
+            """
+            SELECT *
+            FROM projects
+            WHERE id = ?
+            """,
+            (project_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def _log_changelog(self, project_id: str, event_type: str, changes_json: str) -> None:
+        event_at = datetime.now(timezone.utc).isoformat()
+        self.con.execute(
+            """
+            INSERT INTO project_changelog (id, project_id, event_type, event_at, changes_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (str(uuid4()), project_id, event_type, event_at, changes_json),
+        )
+
+    def _normalize_project_payload(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        return {
+            "id": project_id,
+            "name": data.get("name", "").strip(),
+            "type": data.get("type") or "custom",
+            "owner_champion_id": data.get("owner_champion_id"),
+            "status": data.get("status") or "active",
+            "created_at": data.get("created_at") or now,
+            "closed_at": data.get("closed_at"),
+            "work_center": data.get("work_center", "").strip(),
+            "project_code": data.get("project_code"),
+            "project_sop": data.get("project_sop"),
+            "project_eop": data.get("project_eop"),
+            "related_work_center": data.get("related_work_center"),
+        }
+
+    def _serialize_changes(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _diff_changes(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+        diffs: dict[str, Any] = {}
+        for key, value in after.items():
+            if before.get(key) != value:
+                diffs[key] = {"from": before.get(key), "to": value}
+        return diffs
 
 
 class ChampionRepository:
