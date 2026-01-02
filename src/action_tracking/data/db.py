@@ -11,7 +11,11 @@ CREATE TABLE IF NOT EXISTS champions (
   name TEXT NOT NULL,
   email TEXT,
   team TEXT,
-  active INTEGER NOT NULL DEFAULT 1
+  active INTEGER NOT NULL DEFAULT 1,
+  first_name TEXT NOT NULL DEFAULT '',
+  last_name TEXT NOT NULL DEFAULT '',
+  hire_date TEXT,
+  position TEXT
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -41,6 +45,22 @@ CREATE TABLE IF NOT EXISTS actions (
   FOREIGN KEY(project_id) REFERENCES projects(id),
   FOREIGN KEY(owner_champion_id) REFERENCES champions(id)
 );
+
+CREATE TABLE IF NOT EXISTS champion_projects (
+  champion_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  PRIMARY KEY (champion_id, project_id),
+  FOREIGN KEY(champion_id) REFERENCES champions(id) ON DELETE CASCADE,
+  FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS champion_changelog (
+  id TEXT PRIMARY KEY,
+  champion_id TEXT,
+  event_type TEXT NOT NULL,
+  event_at TEXT NOT NULL,
+  changes_json TEXT NOT NULL
+);
 """
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -50,8 +70,89 @@ def connect(db_path: Path) -> sqlite3.Connection:
     con.execute("PRAGMA foreign_keys=ON;")
     return con
 
+def _get_user_version(con: sqlite3.Connection) -> int:
+    row = con.execute("PRAGMA user_version;").fetchone()
+    return int(row[0]) if row else 0
+
+
+def _set_user_version(con: sqlite3.Connection, version: int) -> None:
+    con.execute(f"PRAGMA user_version = {version};")
+
+
+def _column_exists(con: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = con.execute(f"PRAGMA table_info({table});")
+    return any(row["name"] == column for row in cur.fetchall())
+
+
+def _backfill_champion_names(con: sqlite3.Connection) -> None:
+    rows = con.execute(
+        """
+        SELECT id, name, first_name, last_name
+        FROM champions
+        """
+    ).fetchall()
+    updates: list[tuple[str, str, str]] = []
+    for row in rows:
+        if (row["first_name"] or row["last_name"]) or not row["name"]:
+            continue
+        parts = row["name"].strip().split()
+        if not parts:
+            continue
+        first_name = parts[0]
+        last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+        updates.append((first_name, last_name, row["id"]))
+    if updates:
+        con.executemany(
+            """
+            UPDATE champions
+            SET first_name = ?, last_name = ?
+            WHERE id = ?
+            """,
+            updates,
+        )
+
+
+def _migrate_to_v2(con: sqlite3.Connection) -> None:
+    if not _column_exists(con, "champions", "first_name"):
+        con.execute("ALTER TABLE champions ADD COLUMN first_name TEXT NOT NULL DEFAULT '';")
+    if not _column_exists(con, "champions", "last_name"):
+        con.execute("ALTER TABLE champions ADD COLUMN last_name TEXT NOT NULL DEFAULT '';")
+    if not _column_exists(con, "champions", "hire_date"):
+        con.execute("ALTER TABLE champions ADD COLUMN hire_date TEXT;")
+    if not _column_exists(con, "champions", "position"):
+        con.execute("ALTER TABLE champions ADD COLUMN position TEXT;")
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS champion_projects (
+          champion_id TEXT NOT NULL,
+          project_id TEXT NOT NULL,
+          PRIMARY KEY (champion_id, project_id),
+          FOREIGN KEY(champion_id) REFERENCES champions(id) ON DELETE CASCADE,
+          FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS champion_changelog (
+          id TEXT PRIMARY KEY,
+          champion_id TEXT,
+          event_type TEXT NOT NULL,
+          event_at TEXT NOT NULL,
+          changes_json TEXT NOT NULL
+        );
+        """
+    )
+    _backfill_champion_names(con)
+    _set_user_version(con, 2)
+
+
 def init_db(con: sqlite3.Connection) -> None:
     con.executescript(SCHEMA_SQL)
+    current_version = _get_user_version(con)
+    if current_version < 2:
+        _migrate_to_v2(con)
     con.commit()
 
 def table_count(con: sqlite3.Connection, table: str) -> int:

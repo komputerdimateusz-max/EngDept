@@ -1,2 +1,2 @@
-id,name,email,team,active
-c1,Mateusz,,Engineering,1
+id,first_name,last_name,email,hire_date,position,active
+c1,Mateusz,Kowalski,,2022-01-15,Engineering Lead,1
