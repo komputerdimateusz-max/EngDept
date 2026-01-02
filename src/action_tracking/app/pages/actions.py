@@ -61,6 +61,17 @@ def _format_changes(
     return "; ".join(parts) if parts else "Brak danych."
 
 
+def _format_action_label(action: dict[str, Any], project_names: dict[str, str]) -> str:
+    title = action.get("title") or "—"
+    project_name = project_names.get(action.get("project_id"), "—")
+    action_id = str(action.get("id") or "")
+    if action_id.isdigit():
+        suffix = action_id
+    else:
+        suffix = action_id[-6:] if action_id else "—"
+    return f"{title} · {project_name} · #{suffix}"
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Akcje")
 
@@ -156,7 +167,7 @@ def render(con: sqlite3.Connection) -> None:
         action_options,
         format_func=lambda aid: "(nowa)"
         if aid == "(nowa)"
-        else f"{actions_by_id[aid]['title']} ({project_names.get(actions_by_id[aid]['project_id'], '—')})",
+        else _format_action_label(actions_by_id[aid], project_names),
     )
 
     editing = selected_action != "(nowa)"
@@ -273,7 +284,7 @@ def render(con: sqlite3.Connection) -> None:
         delete_options,
         format_func=lambda aid: "(brak)"
         if aid == "(brak)"
-        else f"{actions_by_id[aid]['title']} ({project_names.get(actions_by_id[aid]['project_id'], '—')})",
+        else _format_action_label(actions_by_id[aid], project_names),
         key="delete_action_select",
     )
     confirm_delete = st.checkbox(
