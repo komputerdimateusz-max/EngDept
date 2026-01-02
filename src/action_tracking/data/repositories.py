@@ -1022,7 +1022,8 @@ class ProductionDataRepository:
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(metric_date, work_center, scrap_cost_currency) DO UPDATE SET
                 scrap_qty = excluded.scrap_qty,
-                scrap_cost_amount = excluded.scrap_cost_amount
+                scrap_cost_amount = excluded.scrap_cost_amount,
+                scrap_cost_currency = excluded.scrap_cost_currency
             """,
             payload,
         )
