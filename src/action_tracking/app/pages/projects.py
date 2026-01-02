@@ -18,11 +18,21 @@ FIELD_LABELS = {
     "project_eop": "Project EOP",
     "related_work_center": "Powiązane Work Center",
     "type": "Typ",
-    "owner_champion_id": "Owner",
+    "owner_champion_id": "Champion",
     "status": "Status",
     "created_at": "Utworzono",
     "closed_at": "Zamknięto",
 }
+
+
+def _champion_display_name(champion: dict[str, Any]) -> str:
+    full_name = f"{champion.get('first_name', '')} {champion.get('last_name', '')}".strip()
+    if full_name:
+        return full_name
+    legacy_name = (champion.get("name") or "").strip()
+    if legacy_name:
+        return legacy_name
+    return (champion.get("email") or "").strip()
 
 
 def _format_value(field: str, value: Any, champion_names: dict[str, str]) -> str:
@@ -61,8 +71,7 @@ def render(con: sqlite3.Connection) -> None:
 
     champions = champion_repo.list_champions()
     champion_names = {
-        champion["id"]: f"{champion['first_name']} {champion['last_name']}".strip()
-        for champion in champions
+        champion["id"]: _champion_display_name(champion) for champion in champions
     }
     champion_options = ["(brak)"] + [champion["id"] for champion in champions]
 
@@ -83,7 +92,8 @@ def render(con: sqlite3.Connection) -> None:
                 "Nazwa projektu": project.get("name"),
                 "Work center": project.get("work_center"),
                 "Typ": project.get("type"),
-                "Owner": champion_names.get(project.get("owner_champion_id"), "—"),
+                "Champion": project.get("owner_champion_name")
+                or champion_names.get(project.get("owner_champion_id"), "—"),
                 "Status": project.get("status"),
                 "Akcje (łącznie)": total,
                 "Akcje (otwarte)": open_count,
@@ -153,7 +163,7 @@ def render(con: sqlite3.Connection) -> None:
             ),
         )
         owner_champion_id = st.selectbox(
-            "Owner",
+            "Champion",
             champion_options,
             index=champion_options.index(selected.get("owner_champion_id", "(brak)"))
             if editing and selected.get("owner_champion_id") in champion_options
