@@ -13,6 +13,7 @@ import streamlit as st
 from action_tracking.data.repositories import (
     ActionRepository,
     ChampionRepository,
+    EffectivenessRepository,
     ProjectRepository,
     SettingsRepository,
 )
@@ -138,6 +139,7 @@ def render(con: sqlite3.Connection) -> None:
     repo = ActionRepository(con)
     project_repo = ProjectRepository(con)
     champion_repo = ChampionRepository(con)
+    effectiveness_repo = EffectivenessRepository(con)
     settings_repo = SettingsRepository(con)
 
     projects = project_repo.list_projects(include_counts=False)
@@ -178,6 +180,9 @@ def render(con: sqlite3.Connection) -> None:
         category=category_filter,
     )
     actions, data_issues = _prepare_actions(rows)
+    effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(
+        [str(row.get("id")) for row in rows]
+    )
 
     today = date.today()
     current_week_start = _current_week_start(today)
@@ -219,6 +224,60 @@ def render(con: sqlite3.Connection) -> None:
     st.caption(f"Median time-to-close: {'—' if median_close_days is None else f'{median_close_days:.1f} dni'}")
     if data_issues:
         st.caption(f"Pominięto {data_issues} rekordów z błędną datą.")
+
+    scrap_actions = [
+        row
+        for row in rows
+        if row.get("category") == "Scrap reduction"
+        and row.get("status") == "done"
+        and row.get("closed_at")
+    ]
+    scrap_effectiveness = [
+        effectiveness_map.get(row.get("id") or "", {}).get("classification")
+        for row in scrap_actions
+    ]
+    effective_count = sum(1 for c in scrap_effectiveness if c == "effective")
+    no_change_count = sum(1 for c in scrap_effectiveness if c == "no_change")
+    worse_count = sum(1 for c in scrap_effectiveness if c == "worse")
+    insufficient_count = sum(1 for c in scrap_effectiveness if c == "insufficient_data")
+    eligible_effective = effective_count + no_change_count + worse_count
+    effective_rate = (effective_count / eligible_effective) if eligible_effective else None
+
+    st.subheader("Scrap effectiveness (done)")
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Effective actions (scrap)", f"{effective_count}")
+    e2.metric("Ineffective actions (scrap)", f"{worse_count}")
+    e3.metric("Insufficient data", f"{insufficient_count}")
+    e4.metric("Effective rate", "—" if effective_rate is None else f"{effective_rate:.1%}")
+
+    worse_rows: list[dict[str, Any]] = []
+    for row in scrap_actions:
+        effect = effectiveness_map.get(row.get("id") or "")
+        if not effect or effect.get("classification") != "worse":
+            continue
+        pct_change = effect.get("pct_change")
+        worse_rows.append(
+            {
+                "Action": row.get("title") or "—",
+                "Project": project_names.get(row.get("project_id"), row.get("project_id") or "—"),
+                "Pct change": "—" if not isinstance(pct_change, (int, float)) else f"{pct_change:.0%}",
+                "Baseline avg": effect.get("baseline_avg"),
+                "After avg": effect.get("after_avg"),
+                "_pct_change_value": pct_change if isinstance(pct_change, (int, float)) else None,
+            }
+        )
+
+    if worse_rows:
+        worse_rows = sorted(
+            worse_rows,
+            key=lambda item: item["_pct_change_value"] or 0,
+            reverse=True,
+        )
+        st.subheader("Top worse actions")
+        st.dataframe(
+            [{k: v for k, v in row.items() if not k.startswith("_")} for row in worse_rows[:5]],
+            use_container_width=True,
+        )
 
     # Weekly chart (fixed 9 weeks)
     st.subheader("Weekly backlog (otwarte akcje na koniec tygodnia)")

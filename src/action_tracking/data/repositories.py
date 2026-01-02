@@ -162,6 +162,7 @@ class ActionRepository:
     ) -> list[dict[str, Any]]:
         query = """
             SELECT id,
+                   title,
                    created_at,
                    closed_at,
                    due_date,
@@ -184,6 +185,34 @@ class ActionRepository:
             params.append(category)
         if filters:
             query += " WHERE " + " AND ".join(filters)
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_done_actions_for_effectiveness(
+        self,
+        project_id: str | None = None,
+        champion_id: str | None = None,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT id,
+                   project_id,
+                   closed_at,
+                   status,
+                   category
+            FROM actions
+            WHERE status = 'done' AND closed_at IS NOT NULL
+        """
+        params: list[Any] = []
+        if project_id:
+            query += " AND project_id = ?"
+            params.append(project_id)
+        if champion_id:
+            query += " AND owner_champion_id = ?"
+            params.append(champion_id)
+        if category:
+            query += " AND category = ?"
+            params.append(category)
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
@@ -456,6 +485,82 @@ class ActionRepository:
             if before.get(key) != value:
                 diffs[key] = {"from": before.get(key), "to": value}
         return diffs
+
+
+class EffectivenessRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def upsert_effectiveness(self, action_id: str, payload: dict[str, Any]) -> None:
+        record_id = payload.get("id") or str(uuid4())
+        self.con.execute(
+            """
+            INSERT INTO action_effectiveness (
+                id,
+                action_id,
+                metric,
+                baseline_from,
+                baseline_to,
+                after_from,
+                after_to,
+                baseline_days,
+                after_days,
+                baseline_avg,
+                after_avg,
+                delta,
+                pct_change,
+                classification,
+                computed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(action_id) DO UPDATE SET
+                metric = excluded.metric,
+                baseline_from = excluded.baseline_from,
+                baseline_to = excluded.baseline_to,
+                after_from = excluded.after_from,
+                after_to = excluded.after_to,
+                baseline_days = excluded.baseline_days,
+                after_days = excluded.after_days,
+                baseline_avg = excluded.baseline_avg,
+                after_avg = excluded.after_avg,
+                delta = excluded.delta,
+                pct_change = excluded.pct_change,
+                classification = excluded.classification,
+                computed_at = excluded.computed_at
+            """,
+            (
+                record_id,
+                action_id,
+                payload["metric"],
+                payload["baseline_from"],
+                payload["baseline_to"],
+                payload["after_from"],
+                payload["after_to"],
+                int(payload["baseline_days"]),
+                int(payload["after_days"]),
+                payload["baseline_avg"],
+                payload["after_avg"],
+                payload["delta"],
+                payload["pct_change"],
+                payload["classification"],
+                payload["computed_at"],
+            ),
+        )
+        self.con.commit()
+
+    def get_effectiveness_for_actions(self, action_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if not action_ids:
+            return {}
+        placeholders = ", ".join(["?"] * len(action_ids))
+        cur = self.con.execute(
+            f"""
+            SELECT *
+            FROM action_effectiveness
+            WHERE action_id IN ({placeholders})
+            """,
+            action_ids,
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        return {row["action_id"]: row for row in rows}
 
 
 class ProjectRepository:
@@ -958,7 +1063,7 @@ class ProductionDataRepository:
 
     def list_scrap_daily(
         self,
-        work_center: str | None,
+        work_centers: str | list[str] | None,
         date_from: date | str | None,
         date_to: date | str | None,
     ) -> list[dict[str, Any]]:
@@ -972,9 +1077,17 @@ class ProductionDataRepository:
         """
         filters: list[str] = []
         params: list[Any] = []
-        if work_center:
-            filters.append("work_center = ?")
-            params.append(work_center)
+        if work_centers is not None:
+            if isinstance(work_centers, str):
+                if work_centers:
+                    filters.append("work_center = ?")
+                    params.append(work_centers)
+            else:
+                if not work_centers:
+                    return []
+                placeholders = ", ".join(["?"] * len(work_centers))
+                filters.append(f"work_center IN ({placeholders})")
+                params.extend(work_centers)
         if date_from:
             filters.append("metric_date >= ?")
             params.append(self._normalize_date_filter(date_from))
