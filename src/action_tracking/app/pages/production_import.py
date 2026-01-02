@@ -68,15 +68,13 @@ def _prepare_scrap_rows(df: pd.DataFrame) -> tuple[list[dict[str, Any]], int]:
     skipped = int((~valid_mask).sum())
     df = df.loc[valid_mask].copy()
 
-    df["qty"] = pd.to_numeric(df["QTY [pcs]"], errors="coerce").fillna(0)
-    df["ok_qty"] = pd.to_numeric(df["OK S. QTY [pcs]"], errors="coerce").fillna(0)
+    df["ok_s_qty"] = pd.to_numeric(df["OK S. QTY [pcs]"], errors="coerce").fillna(0)
     df["scrap_value"] = pd.to_numeric(df["SCRAP VALUE [pln]"], errors="coerce").fillna(0)
 
     grouped = (
         df.groupby(["metric_date", "work_center"], dropna=False)
         .agg(
-            total_qty=("qty", "sum"),
-            total_ok_qty=("ok_qty", "sum"),
+            total_ok_s_qty=("ok_s_qty", "sum"),
             total_scrap_value=("scrap_value", "sum"),
         )
         .reset_index()
@@ -84,7 +82,7 @@ def _prepare_scrap_rows(df: pd.DataFrame) -> tuple[list[dict[str, Any]], int]:
 
     rows: list[dict[str, Any]] = []
     for _, row in grouped.iterrows():
-        scrap_qty = int(round(row["total_qty"] - row["total_ok_qty"]))
+        scrap_qty = int(round(row["total_ok_s_qty"]))
         rows.append(
             {
                 "metric_date": row["metric_date"],
@@ -188,6 +186,10 @@ def render(con: sqlite3.Connection) -> None:
     scrap_tab, kpi_tab = st.tabs(["Scrap", "OEE / Performance"])
 
     with scrap_tab:
+        st.caption(
+            "Ponowne zaimportowanie tego samego pliku nadpisze (upsert) wartości "
+            "dla tych samych dni i projektów."
+        )
         _render_import_tab(
             label="Scrap CSV",
             required_columns=SCRAP_REQUIRED_COLUMNS,
