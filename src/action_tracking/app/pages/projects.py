@@ -8,6 +8,7 @@ from typing import Any
 import streamlit as st
 
 from action_tracking.data.repositories import ChampionRepository, ProjectRepository
+from action_tracking.domain.constants import PROJECT_CATEGORIES
 
 
 FIELD_LABELS = {
@@ -155,12 +156,16 @@ def render(con: sqlite3.Connection) -> None:
             "Powiązane Work Center",
             value=selected.get("related_work_center", "") or "",
         )
+        selected_category = selected.get("type")
+        if editing and selected_category and selected_category not in PROJECT_CATEGORIES:
+            st.caption(f"Legacy category detected: {selected_category}")
+        category_index = PROJECT_CATEGORIES.index("Others")
+        if selected_category in PROJECT_CATEGORIES:
+            category_index = PROJECT_CATEGORIES.index(selected_category)
         project_type = st.selectbox(
             "Typ",
-            ["scrap", "savings", "ecr", "pdp", "custom"],
-            index=["scrap", "savings", "ecr", "pdp", "custom"].index(
-                selected.get("type") or "custom"
-            ),
+            PROJECT_CATEGORIES,
+            index=category_index,
         )
         owner_champion_id = st.selectbox(
             "Champion",
