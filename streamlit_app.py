@@ -1,27 +1,34 @@
 from __future__ import annotations
 
-from pathlib import Path
 import os
+from pathlib import Path
 
 import streamlit as st
 
-from action_tracking.data.db import connect, init_db, table_count
-from action_tracking.data.seed import seed_from_csv
+from action_tracking.data.db import connect, init_db
+from action_tracking.app.pages import explorer, kpi, actions, champions, settings
 
 st.set_page_config(page_title="engdept", layout="wide")
-st.title("engdept — Action Tracker (SQLite + CSV seed)")
 
+# --- DB init (globalnie, raz na start aplikacji) ---
 DATA_DIR = Path(os.getenv("ACTION_TRACKING_DATA_DIR", "./data"))
 DB_PATH = Path(os.getenv("ACTION_TRACKING_DB_PATH", DATA_DIR / "app.db"))
-SAMPLE_DIR = Path(os.getenv("ACTION_TRACKING_SAMPLE_DIR", DATA_DIR / "sample"))
 
 con = connect(DB_PATH)
 init_db(con)
 
-if table_count(con, "actions") == 0 and SAMPLE_DIR.exists():
-    seed_from_csv(con, SAMPLE_DIR)
-    st.success("Database seeded from CSV sample data.")
-else:
-    st.info("Database ready (seed not needed).")
+# --- Sidebar navigation ---
+st.sidebar.title("engdept")
 
-st.write("DB path:", str(DB_PATH.resolve()))
+PAGES = {
+    "Explorer": explorer.render,
+    "KPI": kpi.render,
+    "Akcje": lambda: actions.render(con),
+    "Champions": champions.render,
+    "Ustawienia Globalne": settings.render,
+}
+
+selected = st.sidebar.radio("Strony", list(PAGES.keys()), index=2)
+
+# --- Render selected page ---
+PAGES[selected]()
