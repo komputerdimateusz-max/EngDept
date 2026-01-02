@@ -6,3 +6,5 @@ ACTION_CATEGORIES: tuple[str, ...] = (
     "PDP",
     "Development",
 )
+
+PROJECT_CATEGORIES: tuple[str, ...] = ("SL", "RL", "FL", "Others")
