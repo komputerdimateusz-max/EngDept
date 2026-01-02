@@ -2,35 +2,346 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from uuid import uuid4
+
+
+ACTION_CATEGORIES = [
+    "Scrap reduction",
+    "OEE improvement",
+    "Cost savings",
+    "Vave",
+    "PDP",
+    "Development",
+]
 
 
 class ActionRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
-    def list_actions(self, status: str | None = None) -> list[dict[str, Any]]:
+    def list_actions(
+        self,
+        status: str | None = None,
+        project_id: str | None = None,
+        champion_id: str | None = None,
+        overdue_only: bool = False,
+        search_text: str | None = None,
+    ) -> list[dict[str, Any]]:
+        base_query = """
+            SELECT a.*,
+                   p.name AS project_name,
+                   TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS owner_name
+            FROM actions a
+            LEFT JOIN projects p ON p.id = a.project_id
+            LEFT JOIN champions ch ON ch.id = a.owner_champion_id
+        """
+        filters: list[str] = []
+        params: list[Any] = []
+        today = date.today().isoformat()
+
         if status:
-            cur = self.con.execute(
-                """
-                SELECT a.*
-                FROM actions a
-                WHERE a.status = ?
-                ORDER BY a.due_date IS NULL, a.due_date, a.created_at
-                """,
-                (status,),
+            filters.append("a.status = ?")
+            params.append(status)
+        if project_id:
+            filters.append("a.project_id = ?")
+            params.append(project_id)
+        if champion_id:
+            filters.append("a.owner_champion_id = ?")
+            params.append(champion_id)
+        if overdue_only:
+            filters.append(
+                "a.due_date IS NOT NULL AND a.due_date < ? AND a.status NOT IN ('done', 'cancelled')"
             )
-        else:
-            cur = self.con.execute(
-                """
-                SELECT a.*
-                FROM actions a
-                ORDER BY a.due_date IS NULL, a.due_date, a.created_at
-                """
-            )
+            params.append(today)
+        if search_text:
+            filters.append("a.title LIKE ?")
+            params.append(f"%{search_text.strip()}%")
+
+        if filters:
+            base_query += " WHERE " + " AND ".join(filters)
+
+        base_query += """
+            ORDER BY
+                CASE
+                    WHEN a.due_date IS NOT NULL
+                         AND a.due_date < ?
+                         AND a.status NOT IN ('done', 'cancelled')
+                    THEN 0
+                    ELSE 1
+                END,
+                a.due_date IS NULL,
+                a.due_date,
+                a.created_at
+        """
+        params.append(today)
+
+        cur = self.con.execute(base_query, params)
         return [dict(r) for r in cur.fetchall()]
+
+    def list_action_changelog(
+        self,
+        limit: int = 50,
+        project_id: str | None = None,
+        action_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT acl.*,
+                   a.title AS action_title,
+                   a.project_id AS project_id
+            FROM action_changelog acl
+            LEFT JOIN actions a ON a.id = acl.action_id
+        """
+        filters: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            filters.append("a.project_id = ?")
+            params.append(project_id)
+        if action_id:
+            filters.append("acl.action_id = ?")
+            params.append(action_id)
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+        query += " ORDER BY acl.event_at DESC LIMIT ?"
+        params.append(limit)
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def create_action(self, data: dict[str, Any]) -> str:
+        action_id = data.get("id") or str(uuid4())
+        payload = self._normalize_action_payload(action_id, data, existing=None)
+        self.con.execute(
+            """
+            INSERT INTO actions (
+                id,
+                project_id,
+                title,
+                description,
+                owner_champion_id,
+                priority,
+                status,
+                due_date,
+                created_at,
+                closed_at,
+                impact_type,
+                impact_value,
+                category
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["id"],
+                payload["project_id"],
+                payload["title"],
+                payload["description"],
+                payload["owner_champion_id"],
+                payload["priority"],
+                payload["status"],
+                payload["due_date"],
+                payload["created_at"],
+                payload["closed_at"],
+                payload["impact_type"],
+                payload["impact_value"],
+                payload["category"],
+            ),
+        )
+        self._log_changelog(
+            action_id,
+            "CREATE",
+            self._serialize_changes(payload),
+        )
+        self.con.commit()
+        return action_id
+
+    def update_action(self, action_id: str, data: dict[str, Any]) -> None:
+        before = self._get_action(action_id)
+        if not before:
+            raise ValueError("Action not found")
+        merged = self._merge_action_payload(before, data)
+        payload = self._normalize_action_payload(action_id, merged, existing=before)
+        changes = self._diff_changes(before, payload)
+        self.con.execute(
+            """
+            UPDATE actions
+            SET project_id = ?,
+                title = ?,
+                description = ?,
+                owner_champion_id = ?,
+                priority = ?,
+                status = ?,
+                due_date = ?,
+                created_at = ?,
+                closed_at = ?,
+                impact_type = ?,
+                impact_value = ?,
+                category = ?
+            WHERE id = ?
+            """,
+            (
+                payload["project_id"],
+                payload["title"],
+                payload["description"],
+                payload["owner_champion_id"],
+                payload["priority"],
+                payload["status"],
+                payload["due_date"],
+                payload["created_at"],
+                payload["closed_at"],
+                payload["impact_type"],
+                payload["impact_value"],
+                payload["category"],
+                action_id,
+            ),
+        )
+        if changes:
+            self._log_changelog(
+                action_id,
+                "UPDATE",
+                self._serialize_changes(changes),
+            )
+        self.con.commit()
+
+    def delete_action(self, action_id: str) -> None:
+        before = self._get_action(action_id)
+        if not before:
+            return
+        self._log_changelog(
+            action_id,
+            "DELETE",
+            self._serialize_changes(before),
+        )
+        self.con.execute("DELETE FROM actions WHERE id = ?", (action_id,))
+        self.con.commit()
+
+    def _merge_action_payload(self, before: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        fields = [
+            "project_id",
+            "title",
+            "description",
+            "owner_champion_id",
+            "priority",
+            "status",
+            "due_date",
+            "created_at",
+            "closed_at",
+            "impact_type",
+            "impact_value",
+            "category",
+        ]
+        merged: dict[str, Any] = {}
+        for field in fields:
+            if field in data:
+                merged[field] = data[field]
+            else:
+                merged[field] = before.get(field)
+        return merged
+
+    def _normalize_action_payload(
+        self,
+        action_id: str,
+        data: dict[str, Any],
+        existing: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        title = (data.get("title") or "").strip()
+        if not title:
+            raise ValueError("Krótka nazwa akcji jest wymagana.")
+        if len(title) > 20:
+            raise ValueError("Krótka nazwa akcji nie może przekraczać 20 znaków.")
+
+        description = (data.get("description") or "").strip()
+        if description and len(description) > 500:
+            raise ValueError("Opis akcji nie może przekraczać 500 znaków.")
+        description = description or None
+
+        category = data.get("category")
+        if not category:
+            raise ValueError("Kategoria akcji jest wymagana.")
+        if category not in ACTION_CATEGORIES:
+            raise ValueError("Wybrana kategoria akcji jest nieprawidłowa.")
+
+        project_id = (data.get("project_id") or "").strip()
+        if not project_id:
+            raise ValueError("Akcja musi być przypisana do projektu.")
+
+        owner_champion_id = (data.get("owner_champion_id") or "").strip() or None
+        priority = data.get("priority") or "med"
+        status = data.get("status") or "open"
+        due_date = data.get("due_date") or None
+
+        created_at = data.get("created_at") or (existing or {}).get("created_at")
+        created_at = created_at or date.today().isoformat()
+        created_date = self._parse_date(created_at, "created_at")
+        closed_at = data.get("closed_at") or None
+
+        if status == "done":
+            if not closed_at:
+                closed_at = date.today().isoformat()
+            closed_date = self._parse_date(closed_at, "closed_at")
+            if closed_date < created_date:
+                raise ValueError("Data zamknięcia nie może być wcześniejsza niż data utworzenia.")
+        else:
+            closed_at = None
+
+        return {
+            "id": action_id,
+            "project_id": project_id,
+            "title": title,
+            "description": description,
+            "owner_champion_id": owner_champion_id,
+            "priority": priority,
+            "status": status,
+            "due_date": due_date,
+            "created_at": created_date.isoformat(),
+            "closed_at": closed_at,
+            "impact_type": data.get("impact_type"),
+            "impact_value": data.get("impact_value"),
+            "category": category,
+        }
+
+    def _parse_date(self, value: Any, field_name: str) -> date:
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError as exc:
+            try:
+                return datetime.fromisoformat(str(value)).date()
+            except ValueError as exc_two:
+                raise ValueError(f"Nieprawidłowy format daty dla pola {field_name}.") from exc_two
+
+    def _get_action(self, action_id: str) -> dict[str, Any] | None:
+        cur = self.con.execute(
+            """
+            SELECT *
+            FROM actions
+            WHERE id = ?
+            """,
+            (action_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def _log_changelog(self, action_id: str, event_type: str, changes_json: str) -> None:
+        event_at = datetime.now(timezone.utc).isoformat()
+        self.con.execute(
+            """
+            INSERT INTO action_changelog (id, action_id, event_type, event_at, changes_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (str(uuid4()), action_id, event_type, event_at, changes_json),
+        )
+
+    def _serialize_changes(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _diff_changes(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+        diffs: dict[str, Any] = {}
+        for key, value in after.items():
+            if before.get(key) != value:
+                diffs[key] = {"from": before.get(key), "to": value}
+        return diffs
 
 
 class ProjectRepository:
@@ -281,7 +592,11 @@ class ChampionRepository:
             ORDER BY last_name, first_name
             """
         )
-        return [dict(r) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+        for row in rows:
+            display = f"{row.get('first_name', '')} {row.get('last_name', '')}".strip()
+            row["display_name"] = display or row.get("id")
+        return rows
 
     def list_changelog(self, limit: int = 50) -> list[dict[str, Any]]:
         cur = self.con.execute(
