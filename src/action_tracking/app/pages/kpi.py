@@ -10,8 +10,12 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from action_tracking.data.repositories import ActionRepository, ChampionRepository, ProjectRepository
-from action_tracking.domain.constants import ACTION_CATEGORIES
+from action_tracking.data.repositories import (
+    ActionRepository,
+    ChampionRepository,
+    ProjectRepository,
+    SettingsRepository,
+)
 
 
 @dataclass(frozen=True)
@@ -134,6 +138,7 @@ def render(con: sqlite3.Connection) -> None:
     repo = ActionRepository(con)
     project_repo = ProjectRepository(con)
     champion_repo = ChampionRepository(con)
+    settings_repo = SettingsRepository(con)
 
     projects = project_repo.list_projects(include_counts=False)
     champions = champion_repo.list_champions()
@@ -144,7 +149,8 @@ def render(con: sqlite3.Connection) -> None:
     # Filters (no lookback here; fixed 9-week axis)
     project_options = ["Wszystkie"] + [p["id"] for p in projects]
     champion_options = ["(Wszyscy)"] + [c["id"] for c in champions]
-    category_options = ["(Wszystkie)"] + list(ACTION_CATEGORIES)
+    active_categories = [c["name"] for c in settings_repo.list_action_categories(active_only=True)]
+    category_options = ["(Wszystkie)"] + active_categories
 
     st.subheader("Filtry")
     f1, f2, f3 = st.columns([1.6, 1.6, 1.2])

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
+from uuid import uuid4
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -83,6 +85,14 @@ CREATE TABLE IF NOT EXISTS action_changelog (
   event_at TEXT NOT NULL,
   changes_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS settings_action_categories (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  sort_order INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
 """
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -104,6 +114,18 @@ def _set_user_version(con: sqlite3.Connection, version: int) -> None:
 def _column_exists(con: sqlite3.Connection, table: str, column: str) -> bool:
     cur = con.execute(f"PRAGMA table_info({table});")
     return any(row["name"] == column for row in cur.fetchall())
+
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    cur = con.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        """,
+        (table,),
+    )
+    return cur.fetchone() is not None
 
 
 def _backfill_champion_names(con: sqlite3.Connection) -> None:
@@ -214,6 +236,49 @@ def _migrate_to_v4(con: sqlite3.Connection) -> None:
     _set_user_version(con, 4)
 
 
+def _migrate_to_v5(con: sqlite3.Connection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings_action_categories (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          sort_order INTEGER NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        """
+    )
+    _set_user_version(con, 5)
+
+
+def _seed_action_categories(con: sqlite3.Connection) -> None:
+    if not _table_exists(con, "settings_action_categories"):
+        return
+    row = con.execute("SELECT COUNT(1) AS n FROM settings_action_categories").fetchone()
+    if row and int(row["n"]) > 0:
+        return
+    defaults = [
+        "Scrap reduction",
+        "OEE improvement",
+        "Cost savings",
+        "Vave",
+        "PDP",
+        "Development",
+    ]
+    created_at = datetime.now(timezone.utc).isoformat()
+    payload = [
+        (str(uuid4()), name, 1, index + 1, created_at)
+        for index, name in enumerate(defaults)
+    ]
+    con.executemany(
+        """
+        INSERT INTO settings_action_categories (id, name, is_active, sort_order, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        payload,
+    )
+
+
 def init_db(con: sqlite3.Connection) -> None:
     con.executescript(SCHEMA_SQL)
     current_version = _get_user_version(con)
@@ -223,6 +288,9 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v3(con)
     if current_version < 4:
         _migrate_to_v4(con)
+    if current_version < 5:
+        _migrate_to_v5(con)
+    _seed_action_categories(con)
     con.commit()
 
 def table_count(con: sqlite3.Connection, table: str) -> int:

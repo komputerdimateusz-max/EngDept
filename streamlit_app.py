@@ -32,7 +32,7 @@ PAGES = {
     "Akcje": lambda: actions.render(con),
     "Champions": lambda: champions.render(con),
     "Projekty": lambda: projects.render(con),
-    "Ustawienia Globalne": settings.render,
+    "Ustawienia Globalne": lambda: settings.render(con),
 }
 
 selected = st.sidebar.radio("Strony", list(PAGES.keys()), index=2)
