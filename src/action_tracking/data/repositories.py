@@ -883,6 +883,157 @@ class ChampionRepository:
         )
         return [row["project_id"] for row in cur.fetchall()]
 
+
+class ProductionDataRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def upsert_scrap_daily(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        payload = [
+            (
+                row.get("id") or str(uuid4()),
+                row["metric_date"],
+                row["work_center"],
+                int(row["scrap_qty"]),
+                row.get("scrap_cost_amount"),
+                row.get("scrap_cost_currency", "PLN"),
+                row.get("created_at") or now,
+            )
+            for row in rows
+        ]
+        self.con.executemany(
+            """
+            INSERT INTO scrap_daily (
+                id,
+                metric_date,
+                work_center,
+                scrap_qty,
+                scrap_cost_amount,
+                scrap_cost_currency,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(metric_date, work_center, scrap_cost_currency) DO UPDATE SET
+                scrap_qty = excluded.scrap_qty,
+                scrap_cost_amount = excluded.scrap_cost_amount
+            """,
+            payload,
+        )
+        self.con.commit()
+
+    def upsert_production_kpi_daily(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        payload = [
+            (
+                row.get("id") or str(uuid4()),
+                row["metric_date"],
+                row["work_center"],
+                row.get("oee_pct"),
+                row.get("performance_pct"),
+                row.get("created_at") or now,
+            )
+            for row in rows
+        ]
+        self.con.executemany(
+            """
+            INSERT INTO production_kpi_daily (
+                id,
+                metric_date,
+                work_center,
+                oee_pct,
+                performance_pct,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(metric_date, work_center) DO UPDATE SET
+                oee_pct = excluded.oee_pct,
+                performance_pct = excluded.performance_pct
+            """,
+            payload,
+        )
+        self.con.commit()
+
+    def list_scrap_daily(
+        self,
+        work_center: str | None,
+        date_from: date | str | None,
+        date_to: date | str | None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT metric_date,
+                   work_center,
+                   scrap_qty,
+                   scrap_cost_amount,
+                   scrap_cost_currency
+            FROM scrap_daily
+        """
+        filters: list[str] = []
+        params: list[Any] = []
+        if work_center:
+            filters.append("work_center = ?")
+            params.append(work_center)
+        if date_from:
+            filters.append("metric_date >= ?")
+            params.append(self._normalize_date_filter(date_from))
+        if date_to:
+            filters.append("metric_date <= ?")
+            params.append(self._normalize_date_filter(date_to))
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+        query += " ORDER BY metric_date ASC, work_center ASC"
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_production_kpi_daily(
+        self,
+        work_center: str | None,
+        date_from: date | str | None,
+        date_to: date | str | None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT metric_date,
+                   work_center,
+                   oee_pct,
+                   performance_pct
+            FROM production_kpi_daily
+        """
+        filters: list[str] = []
+        params: list[Any] = []
+        if work_center:
+            filters.append("work_center = ?")
+            params.append(work_center)
+        if date_from:
+            filters.append("metric_date >= ?")
+            params.append(self._normalize_date_filter(date_from))
+        if date_to:
+            filters.append("metric_date <= ?")
+            params.append(self._normalize_date_filter(date_to))
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+        query += " ORDER BY metric_date ASC, work_center ASC"
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_work_centers(self) -> list[str]:
+        cur = self.con.execute(
+            """
+            SELECT work_center FROM scrap_daily
+            UNION
+            SELECT work_center FROM production_kpi_daily
+            ORDER BY work_center ASC
+            """
+        )
+        return [row["work_center"] for row in cur.fetchall()]
+
+    @staticmethod
+    def _normalize_date_filter(value: date | str) -> str:
+        if isinstance(value, date):
+            return value.isoformat()
+        return value
+
     def _get_champion(self, champion_id: str) -> dict[str, Any] | None:
         cur = self.con.execute(
             """

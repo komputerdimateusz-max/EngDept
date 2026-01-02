@@ -12,7 +12,15 @@ if SRC.exists() and str(SRC) not in sys.path:
 import streamlit as st
 
 from action_tracking.data.db import connect, init_db
-from action_tracking.app.pages import explorer, kpi, actions, champions, projects, settings
+from action_tracking.app.pages import (
+    explorer,
+    kpi,
+    actions,
+    champions,
+    projects,
+    settings,
+    production_import,
+)
 
 st.set_page_config(page_title="engdept", layout="wide")
 
@@ -27,7 +35,8 @@ init_db(con)
 st.sidebar.title("engdept")
 
 PAGES = {
-    "Explorer": explorer.render,
+    "Explorer": lambda: explorer.render(con),
+    "Import danych produkcyjnych": lambda: production_import.render(con),
     "KPI": lambda: kpi.render(con),
     "Akcje": lambda: actions.render(con),
     "Champions": lambda: champions.render(con),
