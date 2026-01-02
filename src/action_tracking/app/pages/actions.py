@@ -22,7 +22,7 @@ FIELD_LABELS: dict[str, str] = {
     "owner_champion_id": "Właściciel",
     "priority": "Priorytet",
     "status": "Status",
-    "due_date": "Termin",
+    "due_date": "Termin zamknięcia",
     "created_at": "Data utworzenia",
     "closed_at": "Data zamknięcia",
     "impact_type": "Typ wpływu",
@@ -134,7 +134,7 @@ def render(con: sqlite3.Connection) -> None:
                 "Owner": owner or "—",
                 "Status": row.get("status"),
                 "Priorytet": row.get("priority"),
-                "Termin": row.get("due_date"),
+                "Termin zamknięcia": row.get("due_date"),
                 "Data utworzenia": row.get("created_at"),
                 "Data zamknięcia": row.get("closed_at"),
             }
@@ -232,11 +232,11 @@ def render(con: sqlite3.Connection) -> None:
         )
 
         no_due_date = st.checkbox(
-            "Brak terminu",
+            "Brak terminu zamknięcia",
             value=due_date_value is None,
         )
         due_date = st.date_input(
-            "Termin",
+            "Termin zamknięcia",
             value=due_date_value or date.today(),
             disabled=no_due_date,
         )
