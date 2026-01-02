@@ -93,6 +93,27 @@ CREATE TABLE IF NOT EXISTS settings_action_categories (
   sort_order INTEGER NOT NULL,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS scrap_daily (
+  id TEXT PRIMARY KEY,
+  metric_date TEXT NOT NULL,
+  work_center TEXT NOT NULL,
+  scrap_qty INTEGER NOT NULL,
+  scrap_cost_amount REAL,
+  scrap_cost_currency TEXT NOT NULL DEFAULT 'PLN',
+  created_at TEXT NOT NULL,
+  UNIQUE(metric_date, work_center, scrap_cost_currency)
+);
+
+CREATE TABLE IF NOT EXISTS production_kpi_daily (
+  id TEXT PRIMARY KEY,
+  metric_date TEXT NOT NULL,
+  work_center TEXT NOT NULL,
+  oee_pct REAL,
+  performance_pct REAL,
+  created_at TEXT NOT NULL,
+  UNIQUE(metric_date, work_center)
+);
 """
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -251,6 +272,37 @@ def _migrate_to_v5(con: sqlite3.Connection) -> None:
     _set_user_version(con, 5)
 
 
+def _migrate_to_v6(con: sqlite3.Connection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scrap_daily (
+          id TEXT PRIMARY KEY,
+          metric_date TEXT NOT NULL,
+          work_center TEXT NOT NULL,
+          scrap_qty INTEGER NOT NULL,
+          scrap_cost_amount REAL,
+          scrap_cost_currency TEXT NOT NULL DEFAULT 'PLN',
+          created_at TEXT NOT NULL,
+          UNIQUE(metric_date, work_center, scrap_cost_currency)
+        );
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS production_kpi_daily (
+          id TEXT PRIMARY KEY,
+          metric_date TEXT NOT NULL,
+          work_center TEXT NOT NULL,
+          oee_pct REAL,
+          performance_pct REAL,
+          created_at TEXT NOT NULL,
+          UNIQUE(metric_date, work_center)
+        );
+        """
+    )
+    _set_user_version(con, 6)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "settings_action_categories"):
         return
@@ -290,6 +342,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v4(con)
     if current_version < 5:
         _migrate_to_v5(con)
+    if current_version < 6:
+        _migrate_to_v6(con)
     _seed_action_categories(con)
     con.commit()
 
