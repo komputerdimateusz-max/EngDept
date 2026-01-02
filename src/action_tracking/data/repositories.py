@@ -6,15 +6,89 @@ from datetime import date, datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from action_tracking.domain.constants import ACTION_CATEGORIES as DEFAULT_ACTION_CATEGORIES
 
-ACTION_CATEGORIES = [
-    "Scrap reduction",
-    "OEE improvement",
-    "Cost savings",
-    "Vave",
-    "PDP",
-    "Development",
-]
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    cur = con.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        """,
+        (table,),
+    )
+    return cur.fetchone() is not None
+
+
+class SettingsRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def list_action_categories(self, active_only: bool = True) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "settings_action_categories"):
+            return [
+                {
+                    "id": name,
+                    "name": name,
+                    "is_active": True,
+                    "sort_order": index + 1,
+                }
+                for index, name in enumerate(DEFAULT_ACTION_CATEGORIES)
+            ]
+        query = """
+            SELECT id, name, is_active, sort_order, created_at
+            FROM settings_action_categories
+        """
+        params: list[Any] = []
+        if active_only:
+            query += " WHERE is_active = 1"
+        query += " ORDER BY sort_order ASC, name ASC"
+        cur = self.con.execute(query, params)
+        rows = [dict(r) for r in cur.fetchall()]
+        for row in rows:
+            row["is_active"] = bool(row.get("is_active"))
+        return rows
+
+    def create_action_category(self, name: str, sort_order: int) -> str:
+        category_id = str(uuid4())
+        self.con.execute(
+            """
+            INSERT INTO settings_action_categories (id, name, is_active, sort_order, created_at)
+            VALUES (?, ?, 1, ?, ?)
+            """,
+            (category_id, name.strip(), int(sort_order), datetime.now(timezone.utc).isoformat()),
+        )
+        self.con.commit()
+        return category_id
+
+    def update_action_category(
+        self,
+        category_id: str,
+        name: str,
+        is_active: bool,
+        sort_order: int,
+    ) -> None:
+        self.con.execute(
+            """
+            UPDATE settings_action_categories
+            SET name = ?, is_active = ?, sort_order = ?
+            WHERE id = ?
+            """,
+            (name.strip(), 1 if is_active else 0, int(sort_order), category_id),
+        )
+        self.con.commit()
+
+    def delete_action_category(self, category_id: str) -> None:
+        self.con.execute(
+            """
+            UPDATE settings_action_categories
+            SET is_active = 0
+            WHERE id = ?
+            """,
+            (category_id,),
+        )
+        self.con.commit()
 
 
 class ActionRepository:
@@ -289,7 +363,7 @@ class ActionRepository:
         category = data.get("category")
         if not category:
             raise ValueError("Kategoria akcji jest wymagana.")
-        if category not in ACTION_CATEGORIES:
+        if category not in self._list_active_action_categories():
             raise ValueError("Wybrana kategoria akcji jest nieprawidłowa.")
 
         project_id = (data.get("project_id") or "").strip()
@@ -332,6 +406,11 @@ class ActionRepository:
             "impact_value": data.get("impact_value"),
             "category": category,
         }
+
+    def _list_active_action_categories(self) -> list[str]:
+        settings_repo = SettingsRepository(self.con)
+        categories = settings_repo.list_action_categories(active_only=True)
+        return [row["name"] for row in categories]
 
     def _parse_date(self, value: Any, field_name: str) -> date:
         if isinstance(value, date) and not isinstance(value, datetime):

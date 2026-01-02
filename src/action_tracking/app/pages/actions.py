@@ -11,8 +11,8 @@ from action_tracking.data.repositories import (
     ActionRepository,
     ChampionRepository,
     ProjectRepository,
+    SettingsRepository,
 )
-from action_tracking.domain.constants import ACTION_CATEGORIES
 
 
 FIELD_LABELS: dict[str, str] = {
@@ -78,6 +78,7 @@ def render(con: sqlite3.Connection) -> None:
     repo = ActionRepository(con)
     project_repo = ProjectRepository(con)
     champion_repo = ChampionRepository(con)
+    settings_repo = SettingsRepository(con)
 
     projects = project_repo.list_projects(include_counts=False)
     project_names = {
@@ -90,7 +91,8 @@ def render(con: sqlite3.Connection) -> None:
     status_options = ["(Wszystkie)", "open", "in_progress", "blocked", "done", "cancelled"]
     project_options = ["Wszystkie"] + [p["id"] for p in projects]
     champion_options = ["(Wszyscy)"] + [c["id"] for c in champions]
-    category_options = ["(Wszystkie)"] + list(ACTION_CATEGORIES)
+    active_categories = [c["name"] for c in settings_repo.list_action_categories(active_only=True)]
+    category_options = ["(Wszystkie)"] + active_categories
 
     col1, col2, col3, col4, col5, col6 = st.columns([1.2, 1.6, 1.6, 1.6, 1.1, 1.6])
     selected_status = col1.selectbox("Status", status_options, index=0)
@@ -191,12 +193,25 @@ def render(con: sqlite3.Connection) -> None:
             value=selected.get("description", "") or "",
             max_chars=500,
         )
+        selected_category = selected.get("category")
+        category_options_form = list(active_categories)
+        legacy_category = None
+        if selected_category and selected_category not in active_categories:
+            legacy_category = selected_category
+            category_options_form.append(selected_category)
+
+        def _format_category_option(option: str) -> str:
+            if legacy_category and option == legacy_category:
+                return f"(legacy: {option})"
+            return option
+
         category = st.selectbox(
             "Kategoria",
-            ACTION_CATEGORIES,
-            index=ACTION_CATEGORIES.index(selected.get("category"))
-            if selected.get("category") in ACTION_CATEGORIES
+            category_options_form,
+            index=category_options_form.index(selected_category)
+            if selected_category in category_options_form
             else 0,
+            format_func=_format_category_option,
         )
 
         project_ids = [p["id"] for p in projects]
@@ -256,6 +271,9 @@ def render(con: sqlite3.Connection) -> None:
         submitted = st.form_submit_button("Zapisz")
 
     if submitted:
+        if category not in active_categories:
+            st.error("Wybierz aktywną kategorię akcji.")
+            return
         payload = {
             "title": title,
             "description": description,
