@@ -114,6 +114,25 @@ CREATE TABLE IF NOT EXISTS production_kpi_daily (
   created_at TEXT NOT NULL,
   UNIQUE(metric_date, work_center)
 );
+
+CREATE TABLE IF NOT EXISTS action_effectiveness (
+  id TEXT PRIMARY KEY,
+  action_id TEXT NOT NULL UNIQUE,
+  metric TEXT NOT NULL,
+  baseline_from TEXT NOT NULL,
+  baseline_to TEXT NOT NULL,
+  after_from TEXT NOT NULL,
+  after_to TEXT NOT NULL,
+  baseline_days INTEGER NOT NULL,
+  after_days INTEGER NOT NULL,
+  baseline_avg REAL,
+  after_avg REAL,
+  delta REAL,
+  pct_change REAL,
+  classification TEXT NOT NULL,
+  computed_at TEXT NOT NULL,
+  FOREIGN KEY(action_id) REFERENCES actions(id)
+);
 """
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -303,6 +322,32 @@ def _migrate_to_v6(con: sqlite3.Connection) -> None:
     _set_user_version(con, 6)
 
 
+def _migrate_to_v7(con: sqlite3.Connection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS action_effectiveness (
+          id TEXT PRIMARY KEY,
+          action_id TEXT NOT NULL UNIQUE,
+          metric TEXT NOT NULL,
+          baseline_from TEXT NOT NULL,
+          baseline_to TEXT NOT NULL,
+          after_from TEXT NOT NULL,
+          after_to TEXT NOT NULL,
+          baseline_days INTEGER NOT NULL,
+          after_days INTEGER NOT NULL,
+          baseline_avg REAL,
+          after_avg REAL,
+          delta REAL,
+          pct_change REAL,
+          classification TEXT NOT NULL,
+          computed_at TEXT NOT NULL,
+          FOREIGN KEY(action_id) REFERENCES actions(id)
+        );
+        """
+    )
+    _set_user_version(con, 7)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "settings_action_categories"):
         return
@@ -344,6 +389,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v5(con)
     if current_version < 6:
         _migrate_to_v6(con)
+    if current_version < 7:
+        _migrate_to_v7(con)
     _seed_action_categories(con)
     con.commit()
 

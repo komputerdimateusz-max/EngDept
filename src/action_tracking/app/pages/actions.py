@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import streamlit as st
@@ -10,8 +10,15 @@ import streamlit as st
 from action_tracking.data.repositories import (
     ActionRepository,
     ChampionRepository,
+    EffectivenessRepository,
+    ProductionDataRepository,
     ProjectRepository,
     SettingsRepository,
+)
+from action_tracking.services.effectiveness import (
+    compute_scrap_effectiveness,
+    parse_date,
+    parse_work_centers,
 )
 
 
@@ -77,13 +84,16 @@ def render(con: sqlite3.Connection) -> None:
 
     repo = ActionRepository(con)
     project_repo = ProjectRepository(con)
+    production_repo = ProductionDataRepository(con)
+    effectiveness_repo = EffectivenessRepository(con)
     champion_repo = ChampionRepository(con)
     settings_repo = SettingsRepository(con)
 
-    projects = project_repo.list_projects(include_counts=False)
+    projects = project_repo.list_projects(include_counts=True)
     project_names = {
         p["id"]: (p.get("name") or p.get("project_name") or p["id"]) for p in projects
     }
+    projects_by_id = {p["id"]: p for p in projects}
 
     champions = champion_repo.list_champions()
     champion_names = {c["id"]: c["display_name"] for c in champions}
@@ -136,9 +146,82 @@ def render(con: sqlite3.Connection) -> None:
     st.subheader("Lista akcji")
     st.caption(f"Liczba akcji: {len(rows)}")
 
+    eligible_for_recompute = [
+        row
+        for row in rows
+        if row.get("category") == "Scrap reduction"
+        and row.get("status") == "done"
+        and row.get("closed_at")
+    ]
+
+    if st.button("Przelicz skuteczność (scrap)"):
+        recomputed = 0
+        skipped = 0
+        for action in eligible_for_recompute:
+            closed_date = parse_date(action.get("closed_at"))
+            if closed_date is None:
+                skipped += 1
+                continue
+
+            project = projects_by_id.get(action.get("project_id") or "", {})
+            work_centers = parse_work_centers(
+                project.get("work_center"), project.get("related_work_center")
+            )
+
+            if work_centers:
+                date_from = closed_date - timedelta(days=14)
+                date_to = closed_date + timedelta(days=14)
+                scrap_rows = production_repo.list_scrap_daily(
+                    work_centers,
+                    date_from,
+                    date_to,
+                )
+            else:
+                scrap_rows = []
+
+            payload = compute_scrap_effectiveness(action, work_centers, scrap_rows)
+            if payload is None:
+                skipped += 1
+                continue
+            effectiveness_repo.upsert_effectiveness(action["id"], payload)
+            recomputed += 1
+
+        st.success(
+            f"Przeliczono skuteczność dla {recomputed} akcji. "
+            f"Pominięto {skipped} akcji."
+        )
+
+    action_ids = [str(row.get("id")) for row in rows]
+    effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(action_ids)
+
+    def _format_effectiveness(action: dict[str, Any]) -> tuple[str, str]:
+        if action.get("category") != "Scrap reduction" or action.get("status") != "done":
+            return "—", "—"
+        if not action.get("closed_at"):
+            return "—", "—"
+        row = effectiveness_map.get(action.get("id"))
+        if not row:
+            return "—", "—"
+        classification = row.get("classification")
+        label_map = {
+            "effective": "✅ effective",
+            "no_change": "➖ no_change",
+            "worse": "❌ worse",
+            "insufficient_data": "⚠️ insufficient_data",
+            "no_scrap": "✅ no_scrap",
+            "unknown": "❔ unknown",
+        }
+        label = label_map.get(classification, "—")
+        pct_change = row.get("pct_change")
+        pct_label = "—"
+        if isinstance(pct_change, (int, float)):
+            pct_label = f"{pct_change:.0%}"
+        return label, pct_label
+
     table_rows: list[dict[str, Any]] = []
     for row in rows:
         owner = row.get("owner_name") or champion_names.get(row.get("owner_champion_id"), "")
+        effect_label, pct_label = _format_effectiveness(row)
         table_rows.append(
             {
                 "Krótka nazwa": row.get("title"),
@@ -150,6 +233,8 @@ def render(con: sqlite3.Connection) -> None:
                 "Termin": row.get("due_date"),
                 "Data utworzenia": row.get("created_at"),
                 "Data zamknięcia": row.get("closed_at"),
+                "Scrap effect": effect_label,
+                "% change": pct_label,
             }
         )
     st.dataframe(table_rows, use_container_width=True)
