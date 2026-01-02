@@ -8,14 +8,14 @@ from typing import Any
 import streamlit as st
 
 from action_tracking.data.repositories import (
-    ACTION_CATEGORIES,
     ActionRepository,
     ChampionRepository,
     ProjectRepository,
 )
+from action_tracking.domain.constants import ACTION_CATEGORIES
 
 
-FIELD_LABELS = {
+FIELD_LABELS: dict[str, str] = {
     "project_id": "Projekt",
     "title": "Krótka nazwa",
     "description": "Opis",
@@ -37,9 +37,11 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
-def _format_changes(event_type: str, changes: dict[str, Any], project_names: dict[str, str]) -> str:
+def _format_changes(
+    event_type: str, changes: dict[str, Any], project_names: dict[str, str]
+) -> str:
     if event_type == "UPDATE":
-        parts = []
+        parts: list[str] = []
         for field, payload in changes.items():
             label = FIELD_LABELS.get(field, field)
             before = payload.get("from")
@@ -67,34 +69,44 @@ def render(con: sqlite3.Connection) -> None:
     champion_repo = ChampionRepository(con)
 
     projects = project_repo.list_projects(include_counts=False)
-    project_names = {project["id"]: project["name"] for project in projects}
+    project_names = {
+        p["id"]: (p.get("name") or p.get("project_name") or p["id"]) for p in projects
+    }
+
     champions = champion_repo.list_champions()
-    champion_names = {champion["id"]: champion["display_name"] for champion in champions}
+    champion_names = {c["id"]: c["display_name"] for c in champions}
 
     status_options = ["(Wszystkie)", "open", "in_progress", "blocked", "done", "cancelled"]
-    project_options = ["Wszystkie"] + [project["id"] for project in projects]
-    champion_options = ["(Wszyscy)"] + [champion["id"] for champion in champions]
+    project_options = ["Wszystkie"] + [p["id"] for p in projects]
+    champion_options = ["(Wszyscy)"] + [c["id"] for c in champions]
+    category_options = ["(Wszystkie)"] + list(ACTION_CATEGORIES)
 
-    col1, col2, col3, col4, col5 = st.columns([1.2, 1.4, 1.4, 1.1, 1.9])
+    col1, col2, col3, col4, col5, col6 = st.columns([1.2, 1.6, 1.6, 1.6, 1.1, 1.6])
     selected_status = col1.selectbox("Status", status_options, index=0)
     selected_project = col2.selectbox(
         "Projekt",
         project_options,
         index=0,
-        format_func=lambda pid: pid if pid == "Wszystkie" else project_names.get(pid, pid),
+        format_func=lambda pid: pid
+        if pid == "Wszystkie"
+        else project_names.get(pid, pid),
     )
     selected_champion = col3.selectbox(
         "Champion",
         champion_options,
         index=0,
-        format_func=lambda cid: cid if cid == "(Wszyscy)" else champion_names.get(cid, cid),
+        format_func=lambda cid: cid
+        if cid == "(Wszyscy)"
+        else champion_names.get(cid, cid),
     )
-    overdue_only = col4.checkbox("Tylko po terminie")
-    search_text = col5.text_input("Szukaj (tytuł)")
+    selected_category = col4.selectbox("Kategoria", category_options, index=0)
+    overdue_only = col5.checkbox("Tylko po terminie")
+    search_text = col6.text_input("Szukaj (tytuł)")
 
     status_filter = None if selected_status == "(Wszystkie)" else selected_status
     project_filter = None if selected_project == "Wszystkie" else selected_project
     champion_filter = None if selected_champion == "(Wszyscy)" else selected_champion
+    category_filter = None if selected_category == "(Wszystkie)" else selected_category
 
     rows = repo.list_actions(
         status=status_filter,
@@ -104,9 +116,14 @@ def render(con: sqlite3.Connection) -> None:
         search_text=search_text or None,
     )
 
+    # Category filter is applied on UI level for now (repository can be extended later).
+    if category_filter:
+        rows = [r for r in rows if r.get("category") == category_filter]
+
     st.subheader("Lista akcji")
     st.caption(f"Liczba akcji: {len(rows)}")
-    table_rows = []
+
+    table_rows: list[dict[str, Any]] = []
     for row in rows:
         owner = row.get("owner_name") or champion_names.get(row.get("owner_champion_id"), "")
         table_rows.append(
@@ -125,10 +142,15 @@ def render(con: sqlite3.Connection) -> None:
     st.dataframe(table_rows, use_container_width=True)
 
     all_actions = repo.list_actions()
-    actions_by_id = {action["id"]: action for action in all_actions}
+    actions_by_id = {a["id"]: a for a in all_actions}
 
     st.subheader("Dodaj / Edytuj akcję")
-    action_options = ["(nowa)"] + [action["id"] for action in all_actions]
+
+    if not projects:
+        st.warning("Dodawanie akcji wymaga wcześniej utworzonych projektów.")
+        return
+
+    action_options = ["(nowa)"] + [a["id"] for a in all_actions]
     selected_action = st.selectbox(
         "Wybierz akcję do edycji",
         action_options,
@@ -136,16 +158,16 @@ def render(con: sqlite3.Connection) -> None:
         if aid == "(nowa)"
         else f"{actions_by_id[aid]['title']} ({project_names.get(actions_by_id[aid]['project_id'], '—')})",
     )
+
     editing = selected_action != "(nowa)"
     selected = actions_by_id.get(selected_action, {}) if editing else {}
 
-    if not projects:
-        st.warning("Dodawanie akcji wymaga wcześniej utworzonych projektów.")
-        return
-
     due_date_value = None
     if selected.get("due_date"):
-        due_date_value = date.fromisoformat(selected["due_date"])
+        try:
+            due_date_value = date.fromisoformat(selected["due_date"])
+        except ValueError:
+            due_date_value = None
 
     with st.form("action_form"):
         title = st.text_input(
@@ -165,15 +187,18 @@ def render(con: sqlite3.Connection) -> None:
             if selected.get("category") in ACTION_CATEGORIES
             else 0,
         )
+
+        project_ids = [p["id"] for p in projects]
         project_id = st.selectbox(
             "Projekt",
-            [project["id"] for project in projects],
-            index=[project["id"] for project in projects].index(selected.get("project_id"))
-            if selected.get("project_id") in project_names
+            project_ids,
+            index=project_ids.index(selected.get("project_id"))
+            if selected.get("project_id") in project_ids
             else 0,
             format_func=lambda pid: project_names.get(pid, pid),
         )
-        owner_options = ["(brak)"] + [champion["id"] for champion in champions]
+
+        owner_options = ["(brak)"] + [c["id"] for c in champions]
         owner_default = (
             owner_options.index(selected.get("owner_champion_id"))
             if selected.get("owner_champion_id") in owner_options
@@ -187,6 +212,7 @@ def render(con: sqlite3.Connection) -> None:
             if cid == "(brak)"
             else champion_names.get(cid, cid),
         )
+
         priority_options = ["low", "med", "high"]
         priority = st.selectbox(
             "Priorytet",
@@ -195,6 +221,7 @@ def render(con: sqlite3.Connection) -> None:
             if selected.get("priority") in priority_options
             else 1,
         )
+
         status_options_form = ["open", "in_progress", "blocked", "done", "cancelled"]
         status = st.selectbox(
             "Status",
@@ -203,6 +230,7 @@ def render(con: sqlite3.Connection) -> None:
             if selected.get("status") in status_options_form
             else 0,
         )
+
         no_due_date = st.checkbox(
             "Brak terminu",
             value=due_date_value is None,
@@ -212,6 +240,7 @@ def render(con: sqlite3.Connection) -> None:
             value=due_date_value or date.today(),
             disabled=no_due_date,
         )
+
         st.caption("Zmiana statusu na inny niż 'done' czyści datę zamknięcia.")
         submitted = st.form_submit_button("Zapisz")
 
@@ -238,7 +267,7 @@ def render(con: sqlite3.Connection) -> None:
             st.error(str(exc))
 
     st.subheader("Usuń akcję")
-    delete_options = ["(brak)"] + [action["id"] for action in all_actions]
+    delete_options = ["(brak)"] + [a["id"] for a in all_actions]
     delete_id = st.selectbox(
         "Wybierz akcję do usunięcia",
         delete_options,
@@ -261,15 +290,14 @@ def render(con: sqlite3.Connection) -> None:
         changelog_entries = repo.list_action_changelog(limit=50, project_id=project_filter)
         if not changelog_entries:
             st.caption("Brak wpisów w changelogu.")
-        for entry in changelog_entries:
-            changes = json.loads(entry["changes_json"])
-            action_title = (
-                entry.get("action_title")
-                or changes.get("title")
-                or entry.get("action_id")
-                or "Nieznana akcja"
-            )
-            st.markdown(
-                f"**{entry['event_at']}** · {entry['event_type']} · {action_title}"
-            )
-            st.caption(_format_changes(entry["event_type"], changes, project_names))
+        else:
+            for entry in changelog_entries:
+                changes = json.loads(entry["changes_json"])
+                action_title = (
+                    entry.get("action_title")
+                    or changes.get("title")
+                    or entry.get("action_id")
+                    or "Nieznana akcja"
+                )
+                st.markdown(f"**{entry['event_at']}** · {entry['event_type']} · {action_title}")
+                st.caption(_format_changes(entry["event_type"], changes, project_names))
