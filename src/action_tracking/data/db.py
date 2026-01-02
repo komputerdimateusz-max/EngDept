@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS actions (
   closed_at TEXT,
   impact_type TEXT,
   impact_value REAL,
+  category TEXT,
   FOREIGN KEY(project_id) REFERENCES projects(id),
   FOREIGN KEY(owner_champion_id) REFERENCES champions(id)
 );
@@ -70,6 +71,14 @@ CREATE TABLE IF NOT EXISTS champion_changelog (
 CREATE TABLE IF NOT EXISTS project_changelog (
   id TEXT PRIMARY KEY,
   project_id TEXT,
+  event_type TEXT NOT NULL,
+  event_at TEXT NOT NULL,
+  changes_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS action_changelog (
+  id TEXT PRIMARY KEY,
+  action_id TEXT,
   event_type TEXT NOT NULL,
   event_at TEXT NOT NULL,
   changes_json TEXT NOT NULL
@@ -187,6 +196,24 @@ def _migrate_to_v3(con: sqlite3.Connection) -> None:
     _set_user_version(con, 3)
 
 
+def _migrate_to_v4(con: sqlite3.Connection) -> None:
+    if not _column_exists(con, "actions", "category"):
+        con.execute("ALTER TABLE actions ADD COLUMN category TEXT;")
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS action_changelog (
+          id TEXT PRIMARY KEY,
+          action_id TEXT,
+          event_type TEXT NOT NULL,
+          event_at TEXT NOT NULL,
+          changes_json TEXT NOT NULL
+        );
+        """
+    )
+    _set_user_version(con, 4)
+
+
 def init_db(con: sqlite3.Connection) -> None:
     con.executescript(SCHEMA_SQL)
     current_version = _get_user_version(con)
@@ -194,6 +221,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v2(con)
     if current_version < 3:
         _migrate_to_v3(con)
+    if current_version < 4:
+        _migrate_to_v4(con)
     con.commit()
 
 def table_count(con: sqlite3.Connection, table: str) -> int:

@@ -1,2 +1,2 @@
-id,project_id,title,description,owner_champion_id,priority,status,due_date,created_at,closed_at,impact_type,impact_value
-a1,p1,Check root cause,,c1,high,open,2026-01-31,2026-01-02,,scrap,
+id,project_id,title,description,owner_champion_id,priority,status,due_date,created_at,closed_at,impact_type,impact_value,category
+a1,p1,Check root cause,,c1,high,open,2026-01-31,2026-01-02,,scrap,,Scrap reduction
