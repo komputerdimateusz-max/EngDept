@@ -80,6 +80,39 @@ class ActionRepository:
         cur = self.con.execute(base_query, params)
         return [dict(r) for r in cur.fetchall()]
 
+    def list_actions_for_kpi(
+        self,
+        project_id: str | None = None,
+        champion_id: str | None = None,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT id,
+                   project_id,
+                   owner_champion_id,
+                   status,
+                   created_at,
+                   closed_at,
+                   due_date,
+                   category
+            FROM actions
+        """
+        filters: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            filters.append("project_id = ?")
+            params.append(project_id)
+        if champion_id:
+            filters.append("owner_champion_id = ?")
+            params.append(champion_id)
+        if category:
+            filters.append("category = ?")
+            params.append(category)
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
     def list_action_changelog(
         self,
         limit: int = 50,
