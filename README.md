@@ -1,9 +1,7 @@
 # EngDept
 Baza danych działu technicznego
 
-## Uruchomienie lokalne
+## Troubleshooting
+If you run without installing, streamlit_app.py adds src/ to sys.path
 
-```bash
-python -m pip install -e .
-streamlit run streamlit_app.py
-```
+Recommended: pip install -e .
