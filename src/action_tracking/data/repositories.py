@@ -267,6 +267,8 @@ class ActionRepository:
         priority = data.get("priority") or "med"
         status = data.get("status") or "open"
         due_date = data.get("due_date") or None
+        if due_date:
+            due_date = self._parse_date(due_date, "due_date").isoformat()
 
         created_at = data.get("created_at") or (existing or {}).get("created_at")
         created_at = created_at or date.today().isoformat()
