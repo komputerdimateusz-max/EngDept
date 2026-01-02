@@ -45,6 +45,14 @@ class ProjectRepository:
                        p.name,
                        p.type,
                        p.owner_champion_id,
+                       CASE
+                           WHEN TRIM(COALESCE(ch.first_name, '')) != ''
+                             OR TRIM(COALESCE(ch.last_name, '')) != ''
+                               THEN TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, ''))
+                           WHEN TRIM(COALESCE(ch.name, '')) != '' THEN ch.name
+                           WHEN TRIM(COALESCE(ch.email, '')) != '' THEN ch.email
+                           ELSE NULL
+                       END AS owner_champion_name,
                        p.status,
                        p.created_at,
                        p.closed_at,
@@ -59,6 +67,7 @@ class ProjectRepository:
                        COALESCE(SUM(CASE WHEN a.status NOT IN ('done', 'cancelled') THEN 1 ELSE 0 END), 0)
                            AS actions_open
                 FROM projects p
+                LEFT JOIN champions ch ON ch.id = p.owner_champion_id
                 LEFT JOIN actions a ON a.project_id = p.id
                 GROUP BY p.id
                 ORDER BY p.name
@@ -67,8 +76,19 @@ class ProjectRepository:
         else:
             cur = self.con.execute(
                 """
-                SELECT id, name
-                FROM projects
+                SELECT p.id,
+                       p.name,
+                       p.owner_champion_id,
+                       CASE
+                           WHEN TRIM(COALESCE(ch.first_name, '')) != ''
+                             OR TRIM(COALESCE(ch.last_name, '')) != ''
+                               THEN TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, ''))
+                           WHEN TRIM(COALESCE(ch.name, '')) != '' THEN ch.name
+                           WHEN TRIM(COALESCE(ch.email, '')) != '' THEN ch.email
+                           ELSE NULL
+                       END AS owner_champion_name
+                FROM projects p
+                LEFT JOIN champions ch ON ch.id = p.owner_champion_id
                 ORDER BY name
                 """
             )
