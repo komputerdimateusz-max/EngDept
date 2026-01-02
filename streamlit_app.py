@@ -28,7 +28,7 @@ st.sidebar.title("engdept")
 
 PAGES = {
     "Explorer": explorer.render,
-    "KPI": kpi.render,
+    "KPI": lambda: kpi.render(con),
     "Akcje": lambda: actions.render(con),
     "Champions": lambda: champions.render(con),
     "Projekty": lambda: projects.render(con),
