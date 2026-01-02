@@ -46,6 +46,18 @@ def seed_from_csv(con: sqlite3.Connection, sample_dir: Path) -> None:
     projects = _read_csv(sample_dir / "projects.csv")
     actions = _read_csv(sample_dir / "actions.csv")
 
+    if not champions.empty:
+        if "name" not in champions.columns:
+            first_names = champions.get("first_name", "")
+            last_names = champions.get("last_name", "")
+            champions["name"] = (
+                first_names.fillna("").astype(str).str.strip()
+                + " "
+                + last_names.fillna("").astype(str).str.strip()
+            ).str.strip()
+        if "active" in champions.columns:
+            champions["active"] = champions["active"].fillna(1)
+
     # kolejność ważna (FK)
     _upsert_df(con, "champions", champions)
     _upsert_df(con, "projects", projects)
