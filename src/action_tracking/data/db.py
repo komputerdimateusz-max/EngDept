@@ -155,6 +155,7 @@ CREATE TABLE IF NOT EXISTS category_rules (
   category TEXT PRIMARY KEY,
   effect_model TEXT NOT NULL,
   savings_model TEXT NOT NULL,
+  overlay_targets TEXT,
   requires_scope_link INTEGER NOT NULL,
   is_active INTEGER NOT NULL,
   description TEXT,
@@ -457,6 +458,7 @@ def _migrate_to_v10(con: sqlite3.Connection) -> None:
           category TEXT PRIMARY KEY,
           effect_model TEXT NOT NULL,
           savings_model TEXT NOT NULL,
+          overlay_targets TEXT,
           requires_scope_link INTEGER NOT NULL,
           is_active INTEGER NOT NULL,
           description TEXT,
@@ -534,6 +536,14 @@ def _migrate_to_v13(con: sqlite3.Connection) -> None:
                 (payload, effect_model),
             )
     _set_user_version(con, 13)
+
+
+def _migrate_to_v14(con: sqlite3.Connection) -> None:
+    if _table_exists(con, "category_rules") and not _column_exists(
+        con, "category_rules", "overlay_targets"
+    ):
+        con.execute("ALTER TABLE category_rules ADD COLUMN overlay_targets TEXT;")
+    _set_user_version(con, 14)
 
 
 def _seed_action_categories(con: sqlite3.Connection) -> None:
@@ -665,6 +675,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v12(con)
     if current_version < 13:
         _migrate_to_v13(con)
+    if current_version < 14:
+        _migrate_to_v14(con)
     _seed_action_categories(con)
     _seed_category_rules(con)
     con.commit()

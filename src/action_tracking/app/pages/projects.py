@@ -13,6 +13,7 @@ from action_tracking.data.repositories import (
     ActionRepository,
     ChampionRepository,
     EffectivenessRepository,
+    GlobalSettingsRepository,
     ProductionDataRepository,
     ProjectRepository,
 )
@@ -23,12 +24,12 @@ from action_tracking.services.effectiveness import (
     parse_work_centers,
     suggest_work_centers,
 )
-from action_tracking.services.impact_aspects import (
-    IMPACT_ASPECT_COLORS,
-    IMPACT_ASPECT_LABELS,
-    parse_impact_aspects,
-)
 from action_tracking.services.normalize import normalize_key
+from action_tracking.services.overlay_targets import (
+    OVERLAY_TARGET_COLORS,
+    OVERLAY_TARGET_LABELS,
+    default_overlay_targets,
+)
 
 
 FIELD_LABELS = {
@@ -237,7 +238,7 @@ def _line_chart_with_markers(
     title: str,
     markers_df: pd.DataFrame,
     show_markers: bool,
-    aspect: str,
+    overlay_target: str,
 ) -> alt.Chart:
     base = (
         alt.Chart(data)
@@ -250,12 +251,12 @@ def _line_chart_with_markers(
     )
     if not show_markers or markers_df.empty:
         return base
-    filtered_markers = markers_df[markers_df["aspect"] == aspect]
+    filtered_markers = markers_df[markers_df["overlay_target"] == overlay_target]
     if filtered_markers.empty:
         return base
-    marker_labels = list(IMPACT_ASPECT_COLORS.keys())
+    marker_labels = list(OVERLAY_TARGET_COLORS.keys())
     marker_colors = [
-        IMPACT_ASPECT_COLORS.get(label, "#9e9e9e") for label in marker_labels
+        OVERLAY_TARGET_COLORS.get(label, "#9e9e9e") for label in marker_labels
     ]
     marker_layer = (
         alt.Chart(filtered_markers)
@@ -263,7 +264,7 @@ def _line_chart_with_markers(
         .encode(
             x=alt.X("closed_at:T"),
             color=alt.Color(
-                "aspect:N",
+                "overlay_target:N",
                 scale=alt.Scale(domain=marker_labels, range=marker_colors),
                 legend=None,
             ),
@@ -272,13 +273,28 @@ def _line_chart_with_markers(
                 alt.Tooltip("closed_at:T", title="Zamknięta"),
                 alt.Tooltip("owner:N", title="Owner"),
                 alt.Tooltip("category:N", title="Kategoria"),
-                alt.Tooltip("aspect_label:N", title="Aspekt"),
+                alt.Tooltip("overlay_label:N", title="Wykres"),
                 alt.Tooltip("delta_scrap_qty:N", title="Δ scrap qty"),
                 alt.Tooltip("delta_scrap_pln:N", title="Δ scrap PLN"),
             ],
         )
     )
     return base + marker_layer
+
+
+def _resolve_overlay_targets(
+    action_row: dict[str, Any],
+    rules_repo: GlobalSettingsRepository,
+) -> list[str]:
+    rule = rules_repo.resolve_category_rule(action_row.get("category") or "")
+    if rule and rule.get("overlay_targets_configured"):
+        overlay_targets = list(rule.get("overlay_targets") or [])
+    else:
+        overlay_targets = []
+    if overlay_targets:
+        return overlay_targets
+    effect_model = rule.get("effectiveness_model") if rule else None
+    return default_overlay_targets(effect_model)
 
 
 def _project_matches_work_centers(
@@ -374,6 +390,7 @@ def render(con: sqlite3.Connection) -> None:
     action_repo = ActionRepository(con)
     effectiveness_repo = EffectivenessRepository(con)
     production_repo = ProductionDataRepository(con)
+    rules_repo = GlobalSettingsRepository(con)
 
     champions = champion_repo.list_champions()
     champion_names = {
@@ -571,17 +588,19 @@ def render(con: sqlite3.Connection) -> None:
             short_id = _short_action_id(action_id)
             action_label = f"{title} ({short_id})" if short_id else title
             closed_date = parse_date(action.get("closed_at"))
-            aspects = parse_impact_aspects(action.get("impact_aspects"))
             if closed_date and selected_from <= closed_date <= selected_to:
-                for aspect in aspects:
+                overlay_targets = _resolve_overlay_targets(action, rules_repo)
+                for overlay_target in overlay_targets:
                     closed_markers.append(
                         {
                             "closed_at": pd.to_datetime(closed_date),
                             "action_label": action_label,
                             "owner": owner or "—",
                             "category": action.get("category") or "—",
-                            "aspect": aspect,
-                            "aspect_label": IMPACT_ASPECT_LABELS.get(aspect, aspect),
+                            "overlay_target": overlay_target,
+                            "overlay_label": OVERLAY_TARGET_LABELS.get(
+                                overlay_target, overlay_target
+                            ),
                             "delta_scrap_qty": _format_delta(
                                 _effectiveness_delta(effect_row, "scrap_qty")
                             ),
@@ -748,7 +767,7 @@ def render(con: sqlite3.Connection) -> None:
                     "Scrap qty (suma)",
                     markers_df,
                     show_markers,
-                    "SCRAP",
+                    "SCRAP_QTY",
                 ),
                 use_container_width=True,
             )
@@ -760,7 +779,7 @@ def render(con: sqlite3.Connection) -> None:
                     "Scrap PLN (suma)",
                     markers_df,
                     show_markers,
-                    "SCRAP",
+                    "SCRAP_COST",
                 ),
                 use_container_width=True,
             )
@@ -797,8 +816,8 @@ def render(con: sqlite3.Connection) -> None:
             st.info("Brak danych KPI w wybranym zakresie.")
 
         st.caption(
-            "Markery pokazują daty zamknięcia akcji oraz aspekt wpływu "
-            "(Scrap/OEE/Performance)."
+            "Markery pokazują daty zamknięcia akcji oraz docelowe wykresy "
+            "(ustawiane w Global Settings → reguły kategorii)."
         )
 
         st.subheader("Akcje w wybranym zakresie")

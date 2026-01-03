@@ -9,6 +9,10 @@ from uuid import uuid4
 from action_tracking.domain.constants import ACTION_CATEGORIES as DEFAULT_ACTION_CATEGORIES
 from action_tracking.services.impact_aspects import normalize_impact_aspects
 from action_tracking.services.normalize import normalize_key
+from action_tracking.services.overlay_targets import (
+    parse_overlay_targets,
+    serialize_overlay_targets,
+)
 
 
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
@@ -86,6 +90,7 @@ def _default_category_rule(category: str) -> dict[str, Any]:
             "requires_scope_link": bool(base["requires_scope_link"]),
             "is_active": bool(base["is_active"]),
             "description": base.get("description"),
+            "overlay_targets": None,
             "updated_at": None,
         }
     return {
@@ -95,6 +100,7 @@ def _default_category_rule(category: str) -> dict[str, Any]:
         "requires_scope_link": False,
         "is_active": True,
         "description": "Brak zdefiniowanej metodologii dla tej kategorii.",
+        "overlay_targets": None,
         "updated_at": None,
     }
 
@@ -229,6 +235,7 @@ class GlobalSettingsRepository:
                 SELECT category AS category_label,
                        effect_model AS effectiveness_model,
                        savings_model,
+                       overlay_targets,
                        requires_scope_link,
                        description,
                        is_active
@@ -260,6 +267,7 @@ class GlobalSettingsRepository:
                 SELECT category,
                        effect_model,
                        savings_model,
+                       overlay_targets,
                        requires_scope_link,
                        is_active,
                        description,
@@ -289,6 +297,7 @@ class GlobalSettingsRepository:
                 SELECT category,
                        effect_model,
                        savings_model,
+                       overlay_targets,
                        requires_scope_link,
                        is_active,
                        description,
@@ -314,14 +323,16 @@ class GlobalSettingsRepository:
                 category,
                 effect_model,
                 savings_model,
+                overlay_targets,
                 requires_scope_link,
                 is_active,
                 description,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(category) DO UPDATE SET
                 effect_model = excluded.effect_model,
                 savings_model = excluded.savings_model,
+                overlay_targets = excluded.overlay_targets,
                 requires_scope_link = excluded.requires_scope_link,
                 is_active = excluded.is_active,
                 description = excluded.description,
@@ -331,6 +342,7 @@ class GlobalSettingsRepository:
                 rule["category"],
                 rule["effect_model"],
                 rule["savings_model"],
+                rule.get("overlay_targets"),
                 1 if rule["requires_scope_link"] else 0,
                 1 if rule["is_active"] else 0,
                 rule.get("description"),
@@ -369,18 +381,24 @@ class GlobalSettingsRepository:
         return rules_map.get(normalize_key(category_label))
 
     def _normalize_rule_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        overlay_targets_raw = row.get("overlay_targets")
+        row["overlay_targets"] = parse_overlay_targets(overlay_targets_raw)
+        row["overlay_targets_configured"] = overlay_targets_raw not in (None, "")
         row["requires_scope_link"] = bool(row.get("requires_scope_link"))
         row["is_active"] = bool(row.get("is_active"))
         return row
 
     def _normalize_category_rule_row(self, row: dict[str, Any]) -> dict[str, Any]:
         category_label = row.get("category_label") or row.get("category") or ""
+        overlay_targets_raw = row.get("overlay_targets")
         return {
             "category_label": category_label,
             "effectiveness_model": row.get("effectiveness_model")
             or row.get("effect_model")
             or "NONE",
             "savings_model": row.get("savings_model") or "NONE",
+            "overlay_targets": parse_overlay_targets(overlay_targets_raw),
+            "overlay_targets_configured": overlay_targets_raw not in (None, ""),
             "requires_scope_link": bool(row.get("requires_scope_link")),
             "description": row.get("description"),
             "is_active": bool(row.get("is_active", True)),
@@ -394,6 +412,7 @@ class GlobalSettingsRepository:
             "category": category,
             "effect_model": payload.get("effect_model") or "NONE",
             "savings_model": payload.get("savings_model") or "NONE",
+            "overlay_targets": serialize_overlay_targets(payload.get("overlay_targets")),
             "requires_scope_link": bool(payload.get("requires_scope_link")),
             "is_active": bool(payload.get("is_active", True)),
             "description": description,

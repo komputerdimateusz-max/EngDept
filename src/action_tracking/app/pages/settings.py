@@ -16,6 +16,11 @@ from action_tracking.data.repositories import (
 )
 from action_tracking.integrations.email_sender import smtp_config_status
 from action_tracking.services.normalize import normalize_key
+from action_tracking.services.overlay_targets import (
+    OVERLAY_TARGET_LABELS,
+    OVERLAY_TARGETS,
+    default_overlay_targets,
+)
 
 
 def _truthy_env(value: str | None) -> bool:
@@ -234,6 +239,8 @@ def render(con: sqlite3.Connection) -> None:
             "category_label": selected_category,
             "effectiveness_model": "NONE",
             "savings_model": "NONE",
+            "overlay_targets": [],
+            "overlay_targets_configured": False,
             "requires_scope_link": False,
             "is_active": True,
             "description": None,
@@ -241,6 +248,12 @@ def render(con: sqlite3.Connection) -> None:
 
         effect_options = ["SCRAP", "OEE", "PERFORMANCE", "NONE"]
         savings_options = ["AUTO_SCRAP_COST", "MANUAL_REQUIRED", "AUTO_TIME_TO_PLN", "NONE"]
+        default_targets = default_overlay_targets(selected_rule.get("effectiveness_model"))
+        selected_targets = (
+            selected_rule.get("overlay_targets")
+            if selected_rule.get("overlay_targets_configured")
+            else default_targets
+        )
 
         st.caption(
             f"Zapisana etykieta: '{selected_category}' | normalized: '{normalize_key(selected_category)}'"
@@ -261,6 +274,15 @@ def render(con: sqlite3.Connection) -> None:
                 "Wymaga powiązania z projektem (WC)",
                 value=bool(selected_rule.get("requires_scope_link")),
             )
+            overlay_targets = st.multiselect(
+                "Overlay na wykresach",
+                list(OVERLAY_TARGETS),
+                default=selected_targets,
+                format_func=lambda value: OVERLAY_TARGET_LABELS.get(value, value),
+            )
+            st.caption(
+                "Ustawia, na których wykresach pojawiają się markery zamknięcia akcji."
+            )
             is_active = st.checkbox(
                 "Aktywna",
                 value=bool(selected_rule.get("is_active")),
@@ -279,6 +301,7 @@ def render(con: sqlite3.Connection) -> None:
                         {
                             "effect_model": effect_model,
                             "savings_model": savings_model,
+                            "overlay_targets": overlay_targets,
                             "requires_scope_link": requires_scope_link,
                             "is_active": is_active,
                             "description": description,
