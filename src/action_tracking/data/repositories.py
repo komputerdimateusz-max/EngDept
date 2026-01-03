@@ -351,6 +351,7 @@ class ActionRepository:
         status: str | None = None,
         project_id: str | None = None,
         champion_id: str | None = None,
+        is_draft: bool | None = None,
         overdue_only: bool = False,
         search_text: str | None = None,
     ) -> list[dict[str, Any]]:
@@ -375,6 +376,9 @@ class ActionRepository:
         if champion_id:
             filters.append("a.owner_champion_id = ?")
             params.append(champion_id)
+        if is_draft is not None:
+            filters.append("a.is_draft = ?")
+            params.append(1 if is_draft else 0)
         if overdue_only:
             filters.append(
                 "a.due_date IS NOT NULL AND a.due_date < ? AND a.status NOT IN ('done', 'cancelled')"
@@ -422,6 +426,7 @@ class ActionRepository:
                    category,
                    project_id
             FROM actions
+            WHERE is_draft = 0
         """
         filters: list[str] = []
         params: list[Any] = []
@@ -435,7 +440,7 @@ class ActionRepository:
             filters.append("category = ?")
             params.append(category)
         if filters:
-            query += " WHERE " + " AND ".join(filters)
+            query += " AND " + " AND ".join(filters)
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
@@ -452,7 +457,7 @@ class ActionRepository:
                    status,
                    category
             FROM actions
-            WHERE status = 'done' AND closed_at IS NOT NULL
+            WHERE status = 'done' AND closed_at IS NOT NULL AND is_draft = 0
         """
         params: list[Any] = []
         if project_id:
@@ -493,7 +498,7 @@ class ActionRepository:
             FROM actions a
             LEFT JOIN projects p ON p.id = a.project_id
             LEFT JOIN action_effectiveness ae ON ae.action_id = a.id
-            WHERE a.created_at IS NOT NULL
+            WHERE a.created_at IS NOT NULL AND a.is_draft = 0
         """
         filters: list[str] = []
         params: list[Any] = []
@@ -544,6 +549,7 @@ class ActionRepository:
             FROM actions a
             LEFT JOIN champions ch ON ch.id = a.owner_champion_id
             WHERE a.project_id = ?
+              AND a.is_draft = 0
               AND (
                 (a.created_at IS NOT NULL AND date(a.created_at) BETWEEN date(?) AND date(?))
                 OR (a.closed_at IS NOT NULL AND date(a.closed_at) BETWEEN date(?) AND date(?))
@@ -596,6 +602,7 @@ class ActionRepository:
                 owner_champion_id,
                 priority,
                 status,
+                is_draft,
                 due_date,
                 created_at,
                 closed_at,
@@ -604,8 +611,12 @@ class ActionRepository:
                 category,
                 manual_savings_amount,
                 manual_savings_currency,
-                manual_savings_note
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                manual_savings_note,
+                source,
+                source_message_id,
+                submitted_by_email,
+                submitted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["id"],
@@ -615,6 +626,7 @@ class ActionRepository:
                 payload["owner_champion_id"],
                 payload["priority"],
                 payload["status"],
+                payload["is_draft"],
                 payload["due_date"],
                 payload["created_at"],
                 payload["closed_at"],
@@ -624,6 +636,10 @@ class ActionRepository:
                 payload["manual_savings_amount"],
                 payload["manual_savings_currency"],
                 payload["manual_savings_note"],
+                payload["source"],
+                payload["source_message_id"],
+                payload["submitted_by_email"],
+                payload["submitted_at"],
             ),
         )
         self._log_changelog(
@@ -650,6 +666,7 @@ class ActionRepository:
                 owner_champion_id = ?,
                 priority = ?,
                 status = ?,
+                is_draft = ?,
                 due_date = ?,
                 created_at = ?,
                 closed_at = ?,
@@ -658,7 +675,11 @@ class ActionRepository:
                 category = ?,
                 manual_savings_amount = ?,
                 manual_savings_currency = ?,
-                manual_savings_note = ?
+                manual_savings_note = ?,
+                source = ?,
+                source_message_id = ?,
+                submitted_by_email = ?,
+                submitted_at = ?
             WHERE id = ?
             """,
             (
@@ -668,6 +689,7 @@ class ActionRepository:
                 payload["owner_champion_id"],
                 payload["priority"],
                 payload["status"],
+                payload["is_draft"],
                 payload["due_date"],
                 payload["created_at"],
                 payload["closed_at"],
@@ -677,6 +699,10 @@ class ActionRepository:
                 payload["manual_savings_amount"],
                 payload["manual_savings_currency"],
                 payload["manual_savings_note"],
+                payload["source"],
+                payload["source_message_id"],
+                payload["submitted_by_email"],
+                payload["submitted_at"],
                 action_id,
             ),
         )
@@ -700,6 +726,81 @@ class ActionRepository:
         self.con.execute("DELETE FROM actions WHERE id = ?", (action_id,))
         self.con.commit()
 
+    def create_draft(self, data: dict[str, Any]) -> str:
+        action_id = data.get("id") or str(uuid4())
+        payload = self._normalize_draft_payload(action_id, data)
+        self.con.execute(
+            """
+            INSERT INTO actions (
+                id,
+                project_id,
+                title,
+                description,
+                owner_champion_id,
+                priority,
+                status,
+                is_draft,
+                due_date,
+                created_at,
+                closed_at,
+                impact_type,
+                impact_value,
+                category,
+                manual_savings_amount,
+                manual_savings_currency,
+                manual_savings_note,
+                source,
+                source_message_id,
+                submitted_by_email,
+                submitted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["id"],
+                payload["project_id"],
+                payload["title"],
+                payload["description"],
+                payload["owner_champion_id"],
+                payload["priority"],
+                payload["status"],
+                payload["is_draft"],
+                payload["due_date"],
+                payload["created_at"],
+                payload["closed_at"],
+                payload["impact_type"],
+                payload["impact_value"],
+                payload["category"],
+                payload["manual_savings_amount"],
+                payload["manual_savings_currency"],
+                payload["manual_savings_note"],
+                payload["source"],
+                payload["source_message_id"],
+                payload["submitted_by_email"],
+                payload["submitted_at"],
+            ),
+        )
+        self._log_changelog(
+            action_id,
+            "CREATE",
+            self._serialize_changes(payload),
+        )
+        self.con.commit()
+        return action_id
+
+    def get_action_by_source_message_id(self, message_id: str) -> dict[str, Any] | None:
+        if not message_id:
+            return None
+        cur = self.con.execute(
+            """
+            SELECT *
+            FROM actions
+            WHERE source_message_id = ?
+            """,
+            (message_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
     def _merge_action_payload(self, before: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
         fields = [
             "project_id",
@@ -708,6 +809,7 @@ class ActionRepository:
             "owner_champion_id",
             "priority",
             "status",
+            "is_draft",
             "due_date",
             "created_at",
             "closed_at",
@@ -717,6 +819,10 @@ class ActionRepository:
             "manual_savings_amount",
             "manual_savings_currency",
             "manual_savings_note",
+            "source",
+            "source_message_id",
+            "submitted_by_email",
+            "submitted_at",
         ]
         merged: dict[str, Any] = {}
         for field in fields:
@@ -759,6 +865,7 @@ class ActionRepository:
         owner_champion_id = (data.get("owner_champion_id") or "").strip() or None
         priority = data.get("priority") or "med"
         status = data.get("status") or "open"
+        is_draft = 1 if bool(data.get("is_draft")) else 0
         due_date = data.get("due_date") or None
         if due_date:
             due_date = self._parse_date(due_date, "due_date").isoformat()
@@ -799,6 +906,7 @@ class ActionRepository:
             "owner_champion_id": owner_champion_id,
             "priority": priority,
             "status": status,
+            "is_draft": is_draft,
             "due_date": due_date,
             "created_at": created_date.isoformat(),
             "closed_at": closed_at,
@@ -808,6 +916,64 @@ class ActionRepository:
             "manual_savings_amount": manual_savings_amount,
             "manual_savings_currency": manual_savings_currency,
             "manual_savings_note": manual_savings_note,
+            "source": data.get("source"),
+            "source_message_id": data.get("source_message_id"),
+            "submitted_by_email": data.get("submitted_by_email"),
+            "submitted_at": data.get("submitted_at"),
+        }
+
+    def _normalize_draft_payload(self, action_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        title = (data.get("title") or "").strip()
+        if not title:
+            raise ValueError("Krótka nazwa akcji jest wymagana.")
+        if len(title) > 20:
+            raise ValueError("Krótka nazwa akcji nie może przekraczać 20 znaków.")
+
+        description = (data.get("description") or "").strip()
+        if not description:
+            raise ValueError("Opis akcji jest wymagany.")
+        if len(description) > 500:
+            raise ValueError("Opis akcji nie może przekraczać 500 znaków.")
+
+        owner_champion_id = (data.get("owner_champion_id") or "").strip()
+        if not owner_champion_id:
+            raise ValueError("Champion jest wymagany dla draftu.")
+
+        category = (data.get("category") or "").strip() or None
+        if category and category not in self._list_active_action_categories():
+            raise ValueError("Wybrana kategoria akcji jest nieprawidłowa.")
+
+        priority = data.get("priority") or "med"
+        status = data.get("status") or "open"
+        due_date = data.get("due_date") or None
+        if due_date:
+            due_date = self._parse_date(due_date, "due_date").isoformat()
+
+        created_at = data.get("created_at") or date.today().isoformat()
+        created_date = self._parse_date(created_at, "created_at")
+
+        return {
+            "id": action_id,
+            "project_id": data.get("project_id"),
+            "title": title,
+            "description": description,
+            "owner_champion_id": owner_champion_id,
+            "priority": priority,
+            "status": status,
+            "is_draft": 1,
+            "due_date": due_date,
+            "created_at": created_date.isoformat(),
+            "closed_at": None,
+            "impact_type": None,
+            "impact_value": None,
+            "category": category,
+            "manual_savings_amount": None,
+            "manual_savings_currency": None,
+            "manual_savings_note": None,
+            "source": data.get("source"),
+            "source_message_id": data.get("source_message_id"),
+            "submitted_by_email": data.get("submitted_by_email"),
+            "submitted_at": data.get("submitted_at"),
         }
 
     def _list_active_action_categories(self) -> list[str]:
@@ -975,7 +1141,7 @@ class ProjectRepository:
                            AS actions_open
                 FROM projects p
                 LEFT JOIN champions ch ON ch.id = p.owner_champion_id
-                LEFT JOIN actions a ON a.project_id = p.id
+                LEFT JOIN actions a ON a.project_id = p.id AND a.is_draft = 0
                 GROUP BY p.id
                 ORDER BY p.name
                 """
