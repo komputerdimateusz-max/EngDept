@@ -104,6 +104,14 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
     return cur.fetchone() is not None
 
 
+def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        cur = con.execute(f"PRAGMA table_info({table})")
+        return {r[1] for r in cur.fetchall()}
+    except sqlite3.Error:
+        return set()
+
+
 def _normalize_impact_aspects_payload(value: Any) -> str | None:
     """
     impact_aspects stored as JSON string in DB.
@@ -1361,6 +1369,79 @@ class ProjectRepository:
         self.con.commit()
         return project_id
 
+    def update_project(self, project_id: str, data: dict[str, Any]) -> None:
+        if not project_id:
+            raise ValueError("project_id is required")
+        if not _table_exists(self.con, "projects"):
+            raise ValueError("projects table missing")
+
+        cols = _table_columns(self.con, "projects")
+        if not cols:
+            raise ValueError("projects table has no columns")
+
+        name = (data.get("name") or "").strip()
+        work_center = (data.get("work_center") or "").strip()
+        if not name:
+            raise ValueError("name is required")
+        if not work_center:
+            raise ValueError("work_center is required")
+
+        data_keys = set(data.keys())
+        payload: dict[str, Any] = {}
+
+        if "name" in data_keys and "name" in cols:
+            payload["name"] = name
+        if "work_center" in data_keys and "work_center" in cols:
+            payload["work_center"] = work_center
+        if "project_code" in data_keys and "project_code" in cols:
+            payload["project_code"] = (data.get("project_code") or "").strip() or None
+        if "project_sop" in data_keys and "project_sop" in cols:
+            project_sop = data.get("project_sop") or None
+            if project_sop:
+                project_sop = self._parse_date(project_sop, "project_sop").isoformat()
+            payload["project_sop"] = project_sop
+        if "project_eop" in data_keys and "project_eop" in cols:
+            project_eop = data.get("project_eop") or None
+            if project_eop:
+                project_eop = self._parse_date(project_eop, "project_eop").isoformat()
+            payload["project_eop"] = project_eop
+        if "related_work_center" in data_keys and "related_work_center" in cols:
+            payload["related_work_center"] = (data.get("related_work_center") or "").strip() or None
+        if "type" in data_keys and "type" in cols:
+            payload["type"] = (data.get("type") or "custom").strip() or "custom"
+        if "owner_champion_id" in data_keys and "owner_champion_id" in cols:
+            payload["owner_champion_id"] = (data.get("owner_champion_id") or "").strip() or None
+        if "created_at" in data_keys and "created_at" in cols:
+            created_at = data.get("created_at") or None
+            if created_at:
+                created_at = self._parse_date(created_at, "created_at").isoformat()
+            payload["created_at"] = created_at
+        if "status" in data_keys and "status" in cols:
+            status = (data.get("status") or "active").strip() or "active"
+            payload["status"] = status
+            if "closed_at" in cols:
+                if status == "closed":
+                    existing_closed_at = None
+                    cur = self.con.execute("SELECT closed_at FROM projects WHERE id = ?", (project_id,))
+                    row = cur.fetchone()
+                    if row:
+                        existing_closed_at = row["closed_at"]
+                    payload["closed_at"] = existing_closed_at or date.today().isoformat()
+                else:
+                    payload["closed_at"] = None
+
+        if not payload:
+            return
+
+        sets = [f"{col} = ?" for col in payload.keys()]
+        params = list(payload.values())
+        params.append(project_id)
+        self.con.execute(
+            f"UPDATE projects SET {', '.join(sets)} WHERE id = ?",
+            params,
+        )
+        self.con.commit()
+
     def list_projects(self, include_counts: bool = True) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "projects"):
             return []
@@ -1571,6 +1652,52 @@ class ChampionRepository:
             limit=limit,
             entity_id=champion_id,
         )
+
+    def create_champion(self, data: dict[str, Any]) -> str:
+        if not _table_exists(self.con, "champions"):
+            raise ValueError("champions table missing")
+
+        cols = _table_columns(self.con, "champions")
+        if not cols:
+            raise ValueError("champions table has no columns")
+
+        champion_id = data.get("id") or str(uuid4())
+        first_name = (data.get("first_name") or "").strip() or None
+        last_name = (data.get("last_name") or "").strip() or None
+        email = (data.get("email") or "").strip() or None
+        active = data.get("active")
+        active_value = int(True if active is None else bool(active))
+        hire_date = data.get("hire_date") or None
+        if isinstance(hire_date, datetime):
+            hire_date = hire_date.date().isoformat()
+        elif isinstance(hire_date, date):
+            hire_date = hire_date.isoformat()
+        elif hire_date:
+            hire_date = str(hire_date)
+
+        payload = {
+            "id": champion_id,
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": email,
+            "active": active_value,
+            "hire_date": hire_date,
+            "position": (data.get("position") or "").strip() or None,
+            "team": (data.get("team") or "").strip() or None,
+        }
+
+        insert_cols = [c for c in payload.keys() if c in cols]
+        if not insert_cols:
+            raise ValueError("champions table has no insertable columns")
+
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        values = [payload[c] for c in insert_cols]
+        self.con.execute(
+            f"INSERT INTO champions ({', '.join(insert_cols)}) VALUES ({placeholders})",
+            values,
+        )
+        self.con.commit()
+        return champion_id
 
 
 # =====================================================
