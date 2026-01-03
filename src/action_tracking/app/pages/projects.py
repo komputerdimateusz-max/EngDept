@@ -347,9 +347,12 @@ def render(con: sqlite3.Connection) -> None:
     prod_work_center_keys = set(prod_work_center_map)
 
     st.subheader("Outcome projektu (produkcja)")
+    outcome_available = True
     if not projects:
         st.info("Brak projektów do analizy.")
-    else:
+        outcome_available = False
+
+    if outcome_available:
         today = date.today()
         default_from = today - timedelta(days=90)
 
@@ -371,128 +374,340 @@ def render(con: sqlite3.Connection) -> None:
         )
         st.caption("Waluta kosztów: PLN (v1).")
 
-        outcome_ready = True
         if selected_from > selected_to:
             st.error("Zakres dat jest nieprawidłowy (Data od > Data do).")
-            outcome_ready = False
+            outcome_available = False
 
+    if outcome_available:
         selected_project = projects_by_id.get(selected_project_id, {})
         primary_wc = selected_project.get("work_center")
-        if outcome_ready and not (primary_wc and primary_wc.strip()):
+        if not (primary_wc and primary_wc.strip()):
             st.error("Projekt nie ma przypisanego Work Center.")
-            outcome_ready = False
+            outcome_available = False
 
+    if outcome_available:
         related_wc = (
             selected_project.get("related_work_center") if include_related else None
         )
         work_centers = parse_work_centers(primary_wc, related_wc)
-        if outcome_ready and not work_centers:
+        if not work_centers:
             st.error("Nie znaleziono Work Center dla projektu.")
-            outcome_ready = False
+            outcome_available = False
 
-        if outcome_ready:
-            scrap_rows_all = production_repo.list_scrap_daily(
-                work_centers,
-                selected_from,
-                selected_to,
-                currency=None,
+    if outcome_available:
+        scrap_rows_all = production_repo.list_scrap_daily(
+            work_centers,
+            selected_from,
+            selected_to,
+            currency=None,
+        )
+        kpi_rows = production_repo.list_kpi_daily(
+            work_centers,
+            selected_from,
+            selected_to,
+        )
+
+        if not scrap_rows_all and not kpi_rows:
+            st.info("Brak danych produkcyjnych dla wybranego zakresu.")
+            outcome_available = False
+
+    if outcome_available:
+        non_pln_currencies = {
+            row.get("scrap_cost_currency")
+            for row in scrap_rows_all
+            if row.get("scrap_cost_currency")
+            and row.get("scrap_cost_currency") != "PLN"
+        }
+        if non_pln_currencies:
+            st.info(
+                "Dostępne są dane scrap w innych walutach (pominięto): "
+                + ", ".join(sorted(non_pln_currencies))
             )
-            kpi_rows = production_repo.list_kpi_daily(
-                work_centers,
-                selected_from,
-                selected_to,
+
+        scrap_rows = [
+            row
+            for row in scrap_rows_all
+            if row.get("scrap_cost_currency") == "PLN"
+        ]
+
+        scrap_df = pd.DataFrame(scrap_rows)
+        if not scrap_df.empty:
+            scrap_df["metric_date"] = pd.to_datetime(
+                scrap_df["metric_date"], errors="coerce"
+            )
+            scrap_df = scrap_df.dropna(subset=["metric_date"])
+            scrap_daily = (
+                scrap_df.groupby("metric_date", as_index=False)
+                .agg(
+                    scrap_qty_sum=("scrap_qty", "sum"),
+                    scrap_pln_sum=("scrap_cost_amount", "sum"),
+                )
+                .sort_values("metric_date")
+            )
+        else:
+            scrap_daily = pd.DataFrame(
+                columns=["metric_date", "scrap_qty_sum", "scrap_pln_sum"]
             )
 
-            if not scrap_rows_all and not kpi_rows:
-                st.info("Brak danych produkcyjnych dla wybranego zakresu.")
-
-            non_pln_currencies = {
-                row.get("scrap_cost_currency")
-                for row in scrap_rows_all
-                if row.get("scrap_cost_currency")
-                and row.get("scrap_cost_currency") != "PLN"
-            }
-            if non_pln_currencies:
-                st.info(
-                    "Dostępne są dane scrap w innych walutach (pominięto): "
-                    + ", ".join(sorted(non_pln_currencies))
-                )
-
-            scrap_rows = [
-                row
-                for row in scrap_rows_all
-                if row.get("scrap_cost_currency") == "PLN"
-            ]
-
-            scrap_df = pd.DataFrame(scrap_rows)
-            if not scrap_df.empty:
-                scrap_df["metric_date"] = pd.to_datetime(
-                    scrap_df["metric_date"], errors="coerce"
-                )
-                scrap_df = scrap_df.dropna(subset=["metric_date"])
-                scrap_daily = (
-                    scrap_df.groupby("metric_date", as_index=False)
-                    .agg(
-                        scrap_qty_sum=("scrap_qty", "sum"),
-                        scrap_pln_sum=("scrap_cost_amount", "sum"),
+        kpi_df = pd.DataFrame(kpi_rows)
+        if not kpi_df.empty:
+            kpi_df["metric_date"] = pd.to_datetime(
+                kpi_df["metric_date"], errors="coerce"
+            )
+            kpi_df = kpi_df.dropna(subset=["metric_date"])
+            kpi_daily = (
+                kpi_df.groupby("metric_date")
+                .apply(
+                    lambda group: pd.Series(
+                        {
+                            "oee_avg": _weighted_or_mean(
+                                group["oee_pct"], group.get("worktime_min")
+                            ),
+                            "performance_avg": _weighted_or_mean(
+                                group["performance_pct"], group.get("worktime_min")
+                            ),
+                        }
                     )
-                    .sort_values("metric_date")
                 )
-            else:
-                scrap_daily = pd.DataFrame(
-                    columns=["metric_date", "scrap_qty_sum", "scrap_pln_sum"]
-                )
-
-            kpi_df = pd.DataFrame(kpi_rows)
-            if not kpi_df.empty:
-                kpi_df["metric_date"] = pd.to_datetime(
-                    kpi_df["metric_date"], errors="coerce"
-                )
-                kpi_df = kpi_df.dropna(subset=["metric_date"])
-                kpi_daily = (
-                    kpi_df.groupby("metric_date")
-                    .apply(
-                        lambda group: pd.Series(
-                            {
-                                "oee_avg": _weighted_or_mean(
-                                    group["oee_pct"], group.get("worktime_min")
-                                ),
-                                "performance_avg": _weighted_or_mean(
-                                    group["performance_pct"], group.get("worktime_min")
-                                ),
-                            }
-                        )
-                    )
-                    .reset_index()
-                    .sort_values("metric_date")
-                )
-            else:
-                kpi_daily = pd.DataFrame(
-                    columns=["metric_date", "oee_avg", "performance_avg"]
-                )
-
-            oee_scale = "unknown"
-            perf_scale = "unknown"
-            if not kpi_daily.empty:
-                kpi_daily["oee_avg"], oee_scale = _as_percent_series(
-                    kpi_daily["oee_avg"]
-                )
-                kpi_daily["performance_avg"], perf_scale = _as_percent_series(
-                    kpi_daily["performance_avg"]
-                )
-
-            actions = action_repo.list_actions_for_project_outcome(
-                selected_project_id,
-                selected_from,
-                selected_to,
+                .reset_index()
+                .sort_values("metric_date")
             )
-            action_ids = [str(row.get("id")) for row in actions]
-            effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(
-                action_ids
+        else:
+            kpi_daily = pd.DataFrame(
+                columns=["metric_date", "oee_avg", "performance_avg"]
             )
 
-            closed_markers: list[dict[str, Any]] = []
-            for action in actions:
+        oee_scale = "unknown"
+        perf_scale = "unknown"
+        if not kpi_daily.empty:
+            kpi_daily["oee_avg"], oee_scale = _as_percent_series(kpi_daily["oee_avg"])
+            kpi_daily["performance_avg"], perf_scale = _as_percent_series(
+                kpi_daily["performance_avg"]
+            )
+
+        actions = action_repo.list_actions_for_project_outcome(
+            selected_project_id,
+            selected_from,
+            selected_to,
+        )
+        action_ids = [str(row.get("id")) for row in actions]
+        effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(
+            action_ids
+        )
+
+        closed_markers: list[dict[str, Any]] = []
+        for action in actions:
+            action_id = str(action.get("id") or "")
+            owner = action.get("owner_name") or champion_names.get(
+                action.get("owner_champion_id"), "—"
+            )
+            effect_row = effectiveness_map.get(action_id)
+            effect_label, _ = _effectiveness_style(effect_row)
+            title = action.get("title") or ""
+            short_id = _short_action_id(action_id)
+            action_label = f"{title} ({short_id})" if short_id else title
+            closed_date = parse_date(action.get("closed_at"))
+            if closed_date and selected_from <= closed_date <= selected_to:
+                closed_markers.append(
+                    {
+                        "closed_at": pd.to_datetime(closed_date),
+                        "action_label": action_label,
+                        "owner": owner or "—",
+                        "effect_label": "Neutral"
+                        if effect_label == "Not computed"
+                        else effect_label,
+                        "delta_scrap_qty": _format_delta(
+                            _effectiveness_delta(effect_row, "scrap_qty")
+                        ),
+                        "delta_scrap_pln": _format_delta(
+                            _effectiveness_delta(effect_row, "scrap_cost")
+                            or _effectiveness_delta(effect_row, "scrap_pln")
+                        ),
+                    }
+                )
+
+        markers_df = pd.DataFrame(closed_markers)
+
+        merged_daily = pd.merge(
+            scrap_daily, kpi_daily, on="metric_date", how="outer"
+        ).sort_values("metric_date")
+
+        if "metric_date" not in merged_daily.columns:
+            st.info("Brak danych produkcyjnych dla wybranego zakresu.")
+            outcome_available = False
+
+    if outcome_available:
+        merged_daily["metric_date"] = pd.to_datetime(
+            merged_daily["metric_date"], errors="coerce"
+        )
+        merged_daily = merged_daily.dropna(subset=["metric_date"]).sort_values(
+            "metric_date"
+        )
+        if merged_daily.empty:
+            st.info("Brak poprawnych danych produkcyjnych dla wybranego zakresu.")
+            outcome_available = False
+
+    if outcome_available:
+        baseline_from, baseline_to, after_from, after_to, used_halves = _window_bounds(
+            selected_from,
+            selected_to,
+        )
+        if used_halves:
+            st.warning(
+                "Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after)."
+            )
+
+        baseline_mask = (merged_daily["metric_date"].dt.date >= baseline_from) & (
+            merged_daily["metric_date"].dt.date <= baseline_to
+        )
+        after_mask = (merged_daily["metric_date"].dt.date >= after_from) & (
+            merged_daily["metric_date"].dt.date <= after_to
+        )
+
+        baseline_slice = merged_daily.loc[baseline_mask]
+        after_slice = merged_daily.loc[after_mask]
+
+        baseline_scrap_qty = _mean_or_none(baseline_slice.get("scrap_qty_sum"))
+        after_scrap_qty = _mean_or_none(after_slice.get("scrap_qty_sum"))
+        baseline_scrap_pln = _mean_or_none(baseline_slice.get("scrap_pln_sum"))
+        after_scrap_pln = _mean_or_none(after_slice.get("scrap_pln_sum"))
+        baseline_oee = _mean_or_none(baseline_slice.get("oee_avg"))
+        after_oee = _mean_or_none(after_slice.get("oee_avg"))
+        baseline_perf = _mean_or_none(baseline_slice.get("performance_avg"))
+        after_perf = _mean_or_none(after_slice.get("performance_avg"))
+
+        kpi_cols = st.columns(4)
+        kpi_cols[0].metric(
+            "Śr. scrap qty/dzień",
+            _format_metric_value(after_scrap_qty, "{:.2f}"),
+        )
+        kpi_cols[0].markdown(
+            _scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"),
+            unsafe_allow_html=True,
+        )
+        kpi_cols[0].caption(
+            f"Baseline: {_format_metric_value(baseline_scrap_qty, '{:.2f}')}"
+        )
+        kpi_cols[1].metric(
+            "Śr. scrap PLN/dzień",
+            _format_metric_value(after_scrap_pln, "{:.2f}"),
+        )
+        kpi_cols[1].markdown(
+            _scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"),
+            unsafe_allow_html=True,
+        )
+        kpi_cols[1].caption(
+            f"Baseline: {_format_metric_value(baseline_scrap_pln, '{:.2f}')}"
+        )
+        kpi_cols[2].metric(
+            "Śr. OEE%",
+            _format_metric_value(after_oee, "{:.1f}%"),
+            delta=_metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
+        )
+        kpi_cols[2].caption(
+            f"Baseline: {_format_metric_value(baseline_oee, '{:.1f}%')}"
+        )
+        kpi_cols[3].metric(
+            "Śr. Performance%",
+            _format_metric_value(after_perf, "{:.1f}%"),
+            delta=_metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
+        )
+        kpi_cols[3].caption(
+            f"Baseline: {_format_metric_value(baseline_perf, '{:.1f}%')}"
+        )
+        st.caption("Dla scrap spadek = poprawa.")
+        if oee_scale != "unknown" or perf_scale != "unknown":
+            st.caption(
+                "Wykryta skala KPI: "
+                f"OEE={oee_scale}, Performance={perf_scale}."
+            )
+
+        marker_count = len(markers_df)
+        show_markers_default = marker_count > 0 and marker_count <= 20
+        show_markers = st.checkbox(
+            "Pokaż markery zamknięcia akcji",
+            value=show_markers_default,
+            disabled=marker_count == 0,
+        )
+        if marker_count == 0:
+            st.caption("Brak zamkniętych akcji w wybranym zakresie dat.")
+        if marker_count > 20:
+            st.warning(
+                "W zakresie jest dużo zamkniętych akcji — aby zachować czytelność, "
+                "markery są domyślnie ukryte."
+            )
+            if show_markers:
+                show_all_markers = st.checkbox("Pokaż wszystkie markery", value=False)
+                if not show_all_markers:
+                    markers_df = markers_df.sort_values("closed_at").tail(20)
+                    st.caption("Pokazano 20 ostatnich zamkniętych akcji.")
+
+        chart_cols = st.columns(2)
+        if not scrap_daily.empty:
+            chart_cols[0].altair_chart(
+                _line_chart_with_markers(
+                    scrap_daily,
+                    "scrap_qty_sum",
+                    "Scrap qty",
+                    "Scrap qty (suma)",
+                    markers_df,
+                    show_markers,
+                ),
+                use_container_width=True,
+            )
+            chart_cols[1].altair_chart(
+                _line_chart_with_markers(
+                    scrap_daily,
+                    "scrap_pln_sum",
+                    "Scrap PLN",
+                    "Scrap PLN (suma)",
+                    markers_df,
+                    show_markers,
+                ),
+                use_container_width=True,
+            )
+        else:
+            st.info("Brak danych scrap (PLN) w wybranym zakresie.")
+
+        chart_cols = st.columns(2)
+        if not kpi_daily.empty:
+            chart_cols[0].altair_chart(
+                _line_chart_with_markers(
+                    kpi_daily,
+                    "oee_avg",
+                    "OEE (%)",
+                    "OEE (średnia, %)",
+                    markers_df,
+                    show_markers,
+                ),
+                use_container_width=True,
+            )
+            chart_cols[1].altair_chart(
+                _line_chart_with_markers(
+                    kpi_daily,
+                    "performance_avg",
+                    "Performance (%)",
+                    "Performance (średnia, %)",
+                    markers_df,
+                    show_markers,
+                ),
+                use_container_width=True,
+            )
+        else:
+            st.info("Brak danych KPI w wybranym zakresie.")
+
+        st.caption(
+            "Markery pokazują daty zamknięcia akcji. Kolor markera odzwierciedla "
+            "skuteczność scrap (jeśli policzona): zielony = effective, szary = "
+            "neutral/unknown, czerwony = ineffective."
+        )
+
+        st.subheader("Akcje w wybranym zakresie")
+        if not actions:
+            st.caption("Brak akcji w wybranym zakresie.")
+        else:
+            action_table: list[dict[str, Any]] = []
+            for action in sorted(actions, key=_actions_sort_key):
                 action_id = str(action.get("id") or "")
                 owner = action.get("owner_name") or champion_names.get(
                     action.get("owner_champion_id"), "—"
@@ -502,265 +717,50 @@ def render(con: sqlite3.Connection) -> None:
                 title = action.get("title") or ""
                 short_id = _short_action_id(action_id)
                 action_label = f"{title} ({short_id})" if short_id else title
-                closed_date = parse_date(action.get("closed_at"))
-                if closed_date and selected_from <= closed_date <= selected_to:
-                    closed_markers.append(
-                        {
-                            "closed_at": pd.to_datetime(closed_date),
-                            "action_label": action_label,
-                            "owner": owner or "—",
-                            "effect_label": "Neutral"
-                            if effect_label == "Not computed"
-                            else effect_label,
-                            "delta_scrap_qty": _format_delta(
-                                _effectiveness_delta(effect_row, "scrap_qty")
-                            ),
-                            "delta_scrap_pln": _format_delta(
-                                _effectiveness_delta(effect_row, "scrap_cost")
-                                or _effectiveness_delta(effect_row, "scrap_pln")
-                            ),
-                        }
-                    )
-
-            markers_df = pd.DataFrame(closed_markers)
-
-            merged_daily = pd.merge(
-                scrap_daily, kpi_daily, on="metric_date", how="outer"
-            ).sort_values("metric_date")
-
-            if "metric_date" not in merged_daily.columns:
-                st.info("Brak danych produkcyjnych dla wybranego zakresu.")
-                return
-
-            merged_daily["metric_date"] = pd.to_datetime(
-                merged_daily["metric_date"], errors="coerce"
-            )
-            merged_daily = merged_daily.dropna(subset=["metric_date"]).sort_values(
-                "metric_date"
-            )
-            if merged_daily.empty:
-                st.info("Brak poprawnych danych produkcyjnych dla wybranego zakresu.")
-                return
-
-            baseline_from, baseline_to, after_from, after_to, used_halves = (
-                _window_bounds(
-                    selected_from,
-                    selected_to,
-                )
-            )
-            if used_halves:
-                st.warning(
-                    "Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after)."
-                )
-
-            baseline_mask = (
-                merged_daily["metric_date"].dt.date >= baseline_from
-            ) & (merged_daily["metric_date"].dt.date <= baseline_to)
-            after_mask = (merged_daily["metric_date"].dt.date >= after_from) & (
-                merged_daily["metric_date"].dt.date <= after_to
-            )
-
-            baseline_slice = merged_daily.loc[baseline_mask]
-            after_slice = merged_daily.loc[after_mask]
-
-            baseline_scrap_qty = _mean_or_none(baseline_slice.get("scrap_qty_sum"))
-            after_scrap_qty = _mean_or_none(after_slice.get("scrap_qty_sum"))
-            baseline_scrap_pln = _mean_or_none(baseline_slice.get("scrap_pln_sum"))
-            after_scrap_pln = _mean_or_none(after_slice.get("scrap_pln_sum"))
-            baseline_oee = _mean_or_none(baseline_slice.get("oee_avg"))
-            after_oee = _mean_or_none(after_slice.get("oee_avg"))
-            baseline_perf = _mean_or_none(baseline_slice.get("performance_avg"))
-            after_perf = _mean_or_none(after_slice.get("performance_avg"))
-
-            kpi_cols = st.columns(4)
-            kpi_cols[0].metric(
-                "Śr. scrap qty/dzień",
-                _format_metric_value(after_scrap_qty, "{:.2f}"),
-            )
-            kpi_cols[0].markdown(
-                _scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"),
-                unsafe_allow_html=True,
-            )
-            kpi_cols[0].caption(
-                f"Baseline: {_format_metric_value(baseline_scrap_qty, '{:.2f}')}"
-            )
-            kpi_cols[1].metric(
-                "Śr. scrap PLN/dzień",
-                _format_metric_value(after_scrap_pln, "{:.2f}"),
-            )
-            kpi_cols[1].markdown(
-                _scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"),
-                unsafe_allow_html=True,
-            )
-            kpi_cols[1].caption(
-                f"Baseline: {_format_metric_value(baseline_scrap_pln, '{:.2f}')}"
-            )
-            kpi_cols[2].metric(
-                "Śr. OEE%",
-                _format_metric_value(after_oee, "{:.1f}%"),
-                delta=_metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
-            )
-            kpi_cols[2].caption(
-                f"Baseline: {_format_metric_value(baseline_oee, '{:.1f}%')}"
-            )
-            kpi_cols[3].metric(
-                "Śr. Performance%",
-                _format_metric_value(after_perf, "{:.1f}%"),
-                delta=_metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
-            )
-            kpi_cols[3].caption(
-                f"Baseline: {_format_metric_value(baseline_perf, '{:.1f}%')}"
-            )
-            st.caption("Dla scrap spadek = poprawa.")
-            if oee_scale != "unknown" or perf_scale != "unknown":
-                st.caption(
-                    "Wykryta skala KPI: "
-                    f"OEE={oee_scale}, Performance={perf_scale}."
-                )
-
-            marker_count = len(markers_df)
-            show_markers_default = marker_count > 0 and marker_count <= 20
-            show_markers = st.checkbox(
-                "Pokaż markery zamknięcia akcji",
-                value=show_markers_default,
-                disabled=marker_count == 0,
-            )
-            if marker_count == 0:
-                st.caption("Brak zamkniętych akcji w wybranym zakresie dat.")
-            if marker_count > 20:
-                st.warning(
-                    "W zakresie jest dużo zamkniętych akcji — aby zachować czytelność, "
-                    "markery są domyślnie ukryte."
-                )
-                if show_markers:
-                    show_all_markers = st.checkbox(
-                        "Pokaż wszystkie markery", value=False
-                    )
-                    if not show_all_markers:
-                        markers_df = markers_df.sort_values("closed_at").tail(20)
-                        st.caption("Pokazano 20 ostatnich zamkniętych akcji.")
-
-            chart_cols = st.columns(2)
-            if not scrap_daily.empty:
-                chart_cols[0].altair_chart(
-                    _line_chart_with_markers(
-                        scrap_daily,
-                        "scrap_qty_sum",
-                        "Scrap qty",
-                        "Scrap qty (suma)",
-                        markers_df,
-                        show_markers,
-                    ),
-                    use_container_width=True,
-                )
-                chart_cols[1].altair_chart(
-                    _line_chart_with_markers(
-                        scrap_daily,
-                        "scrap_pln_sum",
-                        "Scrap PLN",
-                        "Scrap PLN (suma)",
-                        markers_df,
-                        show_markers,
-                    ),
-                    use_container_width=True,
-                )
-            else:
-                st.info("Brak danych scrap (PLN) w wybranym zakresie.")
-
-            chart_cols = st.columns(2)
-            if not kpi_daily.empty:
-                chart_cols[0].altair_chart(
-                    _line_chart_with_markers(
-                        kpi_daily,
-                        "oee_avg",
-                        "OEE (%)",
-                        "OEE (średnia, %)",
-                        markers_df,
-                        show_markers,
-                    ),
-                    use_container_width=True,
-                )
-                chart_cols[1].altair_chart(
-                    _line_chart_with_markers(
-                        kpi_daily,
-                        "performance_avg",
-                        "Performance (%)",
-                        "Performance (średnia, %)",
-                        markers_df,
-                        show_markers,
-                    ),
-                    use_container_width=True,
-                )
-            else:
-                st.info("Brak danych KPI w wybranym zakresie.")
-
-            st.caption(
-                "Markery pokazują daty zamknięcia akcji. Kolor markera odzwierciedla "
-                "skuteczność scrap (jeśli policzona): zielony = effective, szary = "
-                "neutral/unknown, czerwony = ineffective."
-            )
-
-            st.subheader("Akcje w wybranym zakresie")
-            if not actions:
-                st.caption("Brak akcji w wybranym zakresie.")
-            else:
-                action_table: list[dict[str, Any]] = []
-                for action in sorted(actions, key=_actions_sort_key):
-                    action_id = str(action.get("id") or "")
-                    owner = action.get("owner_name") or champion_names.get(
-                        action.get("owner_champion_id"), "—"
-                    )
-                    effect_row = effectiveness_map.get(action_id)
-                    effect_label, _ = _effectiveness_style(effect_row)
-                    title = action.get("title") or ""
-                    short_id = _short_action_id(action_id)
-                    action_label = f"{title} ({short_id})" if short_id else title
-                    action_table.append(
-                        {
-                            "Zamknięta": _format_action_date(
-                                action.get("closed_at")
-                            ),
-                            "Akcja": action_label,
-                            "Kategoria": action.get("category") or "—",
-                            "Status": action.get("status") or "—",
-                            "Termin": _format_action_date(action.get("due_date")),
-                            "Owner": owner or "—",
-                            "Skuteczność": effect_label,
-                            "Δ scrap qty": _format_delta(
-                                _effectiveness_delta(effect_row, "scrap_qty")
-                            ),
-                            "Δ scrap PLN": _format_delta(
-                                _effectiveness_delta(effect_row, "scrap_cost")
-                                or _effectiveness_delta(effect_row, "scrap_pln")
-                            ),
-                            "Utworzono": _format_action_date(
-                                action.get("created_at")
-                            ),
-                        }
-                    )
-                st.dataframe(action_table, use_container_width=True)
-
-            st.subheader("Dzienny podgląd (audit)")
-            if merged_daily.empty:
-                st.caption("Brak danych do wyświetlenia w tabeli.")
-            else:
-                merged_daily = merged_daily.sort_values("metric_date")
-                if len(merged_daily) > 180:
-                    merged_daily = merged_daily.tail(180)
-                audit_rows = merged_daily.rename(
-                    columns={
-                        "metric_date": "metric_date",
-                        "scrap_qty_sum": "scrap_qty_sum",
-                        "scrap_pln_sum": "scrap_pln_sum",
-                        "oee_avg": "oee_avg",
-                        "performance_avg": "performance_avg",
+                action_table.append(
+                    {
+                        "Zamknięta": _format_action_date(action.get("closed_at")),
+                        "Akcja": action_label,
+                        "Kategoria": action.get("category") or "—",
+                        "Status": action.get("status") or "—",
+                        "Termin": _format_action_date(action.get("due_date")),
+                        "Owner": owner or "—",
+                        "Skuteczność": effect_label,
+                        "Δ scrap qty": _format_delta(
+                            _effectiveness_delta(effect_row, "scrap_qty")
+                        ),
+                        "Δ scrap PLN": _format_delta(
+                            _effectiveness_delta(effect_row, "scrap_cost")
+                            or _effectiveness_delta(effect_row, "scrap_pln")
+                        ),
+                        "Utworzono": _format_action_date(action.get("created_at")),
                     }
                 )
-                audit_rows["metric_date"] = audit_rows["metric_date"].dt.date
-                st.dataframe(audit_rows, use_container_width=True)
+            st.dataframe(action_table, use_container_width=True)
+
+        st.subheader("Dzienny podgląd (audit)")
+        if merged_daily.empty:
+            st.caption("Brak danych do wyświetlenia w tabeli.")
+        else:
+            merged_daily = merged_daily.sort_values("metric_date")
+            if len(merged_daily) > 180:
+                merged_daily = merged_daily.tail(180)
+            audit_rows = merged_daily.rename(
+                columns={
+                    "metric_date": "metric_date",
+                    "scrap_qty_sum": "scrap_qty_sum",
+                    "scrap_pln_sum": "scrap_pln_sum",
+                    "oee_avg": "oee_avg",
+                    "performance_avg": "performance_avg",
+                }
+            )
+            audit_rows["metric_date"] = audit_rows["metric_date"].dt.date
+            st.dataframe(audit_rows, use_container_width=True)
     with st.expander("📁 Zarządzanie projektami (lista + edycja)", expanded=False):
         st.subheader("Lista projektów")
         st.caption(f"Liczba projektów: {len(projects)}")
+        if not projects:
+            st.info("Brak projektów.")
         table_rows = []
         for project in projects:
             total = project.get("actions_total") or 0
