@@ -374,14 +374,22 @@ def render(con: sqlite3.Connection) -> None:
             format_func=_format_category_option,
             key="draft_action_category_select",
         )
-        rule = _resolve_rule(category, warn=True)
-        st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
-        st.caption(
-            "Metoda obliczeń: "
-            f"Skuteczność = {rule.get('effectiveness_model')}, "
-            f"Oszczędności = {rule.get('savings_model')}, "
-            f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
-        )
+        raw_rule = rules_repo.resolve_category_rule(category) or {}
+        rule = raw_rule or _resolve_rule(category, warn=False)
+        savings_model = (
+            rule.get("savings_model") or rule.get("savings_method") or "NONE"
+        ).strip().upper()
+        if raw_rule:
+            st.info(
+                "Metoda liczenia: "
+                f"effectiveness={rule.get('effectiveness_model','—')} | "
+                f"savings={rule.get('savings_model','—')} | "
+                f"requires_wc={bool(rule.get('requires_scope_link'))}"
+            )
+            st.caption(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
+        else:
+            st.warning("Brak reguły dla kategorii — domyślnie wymagane ręczne oszczędności.")
+            savings_model = "MANUAL_REQUIRED"
         st.caption("Zmiana kategorii odświeża metodę liczenia i wymagane pola.")
         with st.form("complete_draft_form"):
             title = st.text_input(
@@ -448,7 +456,11 @@ def render(con: sqlite3.Connection) -> None:
                 disabled=no_due_date,
             )
 
-            manual_required = rule.get("savings_model") == "MANUAL_REQUIRED"
+            manual_required = savings_model == "MANUAL_REQUIRED"
+            if not manual_required:
+                st.session_state.pop("draft_manual_savings_amount", None)
+                st.session_state.pop("draft_manual_savings_currency", None)
+                st.session_state.pop("draft_manual_savings_note", None)
             manual_amount = None
             manual_currency = None
             manual_note = ""
@@ -459,6 +471,7 @@ def render(con: sqlite3.Connection) -> None:
                     min_value=0.0,
                     value=float(selected.get("manual_savings_amount") or 0.0),
                     step=100.0,
+                    key="draft_manual_savings_amount",
                 )
                 manual_currency = st.selectbox(
                     "Waluta",
@@ -466,11 +479,13 @@ def render(con: sqlite3.Connection) -> None:
                     index=0
                     if (selected.get("manual_savings_currency") or "PLN") == "PLN"
                     else 1,
+                    key="draft_manual_savings_currency",
                 )
                 manual_note = st.text_area(
                     "Uzasadnienie oszczędności",
                     value=selected.get("manual_savings_note") or "",
                     max_chars=500,
+                    key="draft_manual_savings_note",
                 )
 
             st.caption("Zmiana statusu na inny niż 'done' czyści datę zamknięcia.")
@@ -539,14 +554,22 @@ def render(con: sqlite3.Connection) -> None:
             format_func=_format_category_option,
             key="action_category_select",
         )
-        rule = _resolve_rule(category, warn=True)
-        st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
-        st.caption(
-            "Metoda obliczeń: "
-            f"Skuteczność = {rule.get('effectiveness_model')}, "
-            f"Oszczędności = {rule.get('savings_model')}, "
-            f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
-        )
+        raw_rule = rules_repo.resolve_category_rule(category) or {}
+        rule = raw_rule or _resolve_rule(category, warn=False)
+        savings_model = (
+            rule.get("savings_model") or rule.get("savings_method") or "NONE"
+        ).strip().upper()
+        if raw_rule:
+            st.info(
+                "Metoda liczenia: "
+                f"effectiveness={rule.get('effectiveness_model','—')} | "
+                f"savings={rule.get('savings_model','—')} | "
+                f"requires_wc={bool(rule.get('requires_scope_link'))}"
+            )
+            st.caption(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
+        else:
+            st.warning("Brak reguły dla kategorii — domyślnie wymagane ręczne oszczędności.")
+            savings_model = "MANUAL_REQUIRED"
         st.caption("Zmiana kategorii odświeża metodę liczenia i wymagane pola.")
         with st.form("action_form"):
             title = st.text_input(
@@ -613,7 +636,11 @@ def render(con: sqlite3.Connection) -> None:
                 disabled=no_due_date,
             )
 
-            manual_required = rule.get("savings_model") == "MANUAL_REQUIRED"
+            manual_required = savings_model == "MANUAL_REQUIRED"
+            if not manual_required:
+                st.session_state.pop("action_manual_savings_amount", None)
+                st.session_state.pop("action_manual_savings_currency", None)
+                st.session_state.pop("action_manual_savings_note", None)
             manual_amount = None
             manual_currency = None
             manual_note = ""
@@ -624,6 +651,7 @@ def render(con: sqlite3.Connection) -> None:
                     min_value=0.0,
                     value=float(selected.get("manual_savings_amount") or 0.0),
                     step=100.0,
+                    key="action_manual_savings_amount",
                 )
                 manual_currency = st.selectbox(
                     "Waluta",
@@ -631,11 +659,13 @@ def render(con: sqlite3.Connection) -> None:
                     index=0
                     if (selected.get("manual_savings_currency") or "PLN") == "PLN"
                     else 1,
+                    key="action_manual_savings_currency",
                 )
                 manual_note = st.text_area(
                     "Uzasadnienie oszczędności",
                     value=selected.get("manual_savings_note") or "",
                     max_chars=500,
+                    key="action_manual_savings_note",
                 )
 
             st.caption("Zmiana statusu na inny niż 'done' czyści datę zamknięcia.")
