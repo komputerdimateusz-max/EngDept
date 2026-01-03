@@ -384,3 +384,105 @@ class WcInboxRepository:
         for r in rows:
             r["sources"] = json.loads(r.get("sources") or "[]")
         return rows
+# =====================================================
+# NOTIFICATIONS (email log)
+# =====================================================
+
+class NotificationRepository:
+    """
+    Used by: app/pages/settings.py
+    Provides a simple log + dedup (unique_key) for sent notifications.
+    Table: email_notifications_log
+    """
+
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def was_sent(self, unique_key: str) -> bool:
+        if not unique_key:
+            return False
+        if not _table_exists(self.con, "email_notifications_log"):
+            return False
+        try:
+            cur = self.con.execute(
+                """
+                SELECT 1
+                FROM email_notifications_log
+                WHERE unique_key = ?
+                LIMIT 1
+                """,
+                (unique_key,),
+            )
+            return cur.fetchone() is not None
+        except sqlite3.Error:
+            return False
+
+    def log_sent(
+        self,
+        notification_type: str,
+        recipient_email: str,
+        action_id: str | None,
+        payload: dict[str, Any] | None,
+        unique_key: str,
+    ) -> None:
+        if not unique_key:
+            return
+        if not _table_exists(self.con, "email_notifications_log"):
+            # migration not applied yet -> ignore silently (so app doesn't crash)
+            return
+
+        payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
+        now = datetime.now(timezone.utc).isoformat()
+
+        try:
+            self.con.execute(
+                """
+                INSERT INTO email_notifications_log (
+                    id,
+                    created_at,
+                    notification_type,
+                    recipient_email,
+                    action_id,
+                    payload_json,
+                    unique_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    now,
+                    (notification_type or "").strip(),
+                    (recipient_email or "").strip(),
+                    action_id,
+                    payload_json,
+                    unique_key,
+                ),
+            )
+            self.con.commit()
+        except sqlite3.IntegrityError:
+            # unique_key already exists -> treat as "already logged"
+            self.con.rollback()
+        except sqlite3.Error:
+            self.con.rollback()
+
+    def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "email_notifications_log"):
+            return []
+        try:
+            cur = self.con.execute(
+                """
+                SELECT id,
+                       created_at,
+                       notification_type,
+                       recipient_email,
+                       action_id,
+                       payload_json,
+                       unique_key
+                FROM email_notifications_log
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+            return [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
