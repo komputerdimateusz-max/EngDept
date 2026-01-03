@@ -22,6 +22,12 @@ from action_tracking.services.effectiveness import (
     parse_date,
     parse_work_centers,
 )
+from action_tracking.services.impact_aspects import (
+    IMPACT_ASPECT_LABELS,
+    IMPACT_ASPECTS,
+    normalize_impact_aspects,
+    parse_impact_aspects,
+)
 from action_tracking.services.normalize import normalize_key
 
 
@@ -37,6 +43,7 @@ FIELD_LABELS: dict[str, str] = {
     "closed_at": "Data zamknięcia",
     "impact_type": "Typ wpływu",
     "impact_value": "Wartość wpływu",
+    "impact_aspects": "Aspekty Work Center",
     "category": "Kategoria",
     "manual_savings_amount": "Oszczędności ręczne (kwota)",
     "manual_savings_currency": "Oszczędności ręczne (waluta)",
@@ -110,6 +117,13 @@ def _is_manual_required(savings_model_normalized: str) -> bool:
     if not savings_model_normalized:
         return False
     return savings_model_normalized in {"MANUAL_REQUIRED", "MANUAL"} or savings_model_normalized.startswith("MANUAL")
+
+
+def _default_aspects_from_rule(rule: dict[str, Any]) -> list[str]:
+    effect_model = str(rule.get("effectiveness_model") or rule.get("effect_model") or "").strip().upper()
+    if effect_model in IMPACT_ASPECTS:
+        return [effect_model]
+    return []
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -472,6 +486,16 @@ def render(con: sqlite3.Connection) -> None:
                 else 0,
             )
 
+            existing_aspects = parse_impact_aspects(selected.get("impact_aspects"))
+            default_aspects = list(existing_aspects)
+            impact_aspects = st.multiselect(
+                "Aspekty Work Center poprawiane przez akcję",
+                options=list(IMPACT_ASPECTS),
+                default=default_aspects,
+                format_func=lambda aspect: IMPACT_ASPECT_LABELS.get(aspect, aspect),
+                key="draft_action_impact_aspects",
+            )
+
             no_due_date = st.checkbox(
                 "Brak terminu",
                 value=due_date_value is None,
@@ -546,6 +570,12 @@ def render(con: sqlite3.Connection) -> None:
                 "owner_champion_id": None if owner_champion == "(brak)" else owner_champion,
                 "priority": priority,
                 "status": status,
+                "impact_aspects": json.dumps(
+                    normalize_impact_aspects(impact_aspects),
+                    ensure_ascii=False,
+                )
+                if impact_aspects
+                else None,
                 "due_date": None if no_due_date else due_date.isoformat(),
                 "manual_savings_amount": manual_amount if manual_required else None,
                 "manual_savings_currency": manual_currency if manual_required else None,
@@ -652,6 +682,20 @@ def render(con: sqlite3.Connection) -> None:
                 else 0,
             )
 
+            existing_aspects = parse_impact_aspects(selected.get("impact_aspects"))
+            default_aspects = (
+                list(existing_aspects)
+                if editing
+                else _default_aspects_from_rule(rule)
+            )
+            impact_aspects = st.multiselect(
+                "Aspekty Work Center poprawiane przez akcję",
+                options=list(IMPACT_ASPECTS),
+                default=default_aspects,
+                format_func=lambda aspect: IMPACT_ASPECT_LABELS.get(aspect, aspect),
+                key="action_impact_aspects",
+            )
+
             no_due_date = st.checkbox(
                 "Brak terminu",
                 value=due_date_value is None,
@@ -726,6 +770,12 @@ def render(con: sqlite3.Connection) -> None:
                 "owner_champion_id": None if owner_champion == "(brak)" else owner_champion,
                 "priority": priority,
                 "status": status,
+                "impact_aspects": json.dumps(
+                    normalize_impact_aspects(impact_aspects),
+                    ensure_ascii=False,
+                )
+                if impact_aspects
+                else None,
                 "due_date": None if no_due_date else due_date.isoformat(),
                 "manual_savings_amount": manual_amount if manual_required else None,
                 "manual_savings_currency": manual_currency if manual_required else None,

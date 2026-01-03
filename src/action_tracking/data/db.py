@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS actions (
   closed_at TEXT,
   impact_type TEXT,
   impact_value REAL,
+  impact_aspects TEXT,
   category TEXT,
   manual_savings_amount REAL,
   manual_savings_currency TEXT,
@@ -509,6 +510,32 @@ def _migrate_to_v12(con: sqlite3.Connection) -> None:
     _set_user_version(con, 12)
 
 
+def _migrate_to_v13(con: sqlite3.Connection) -> None:
+    if not _column_exists(con, "actions", "impact_aspects"):
+        con.execute("ALTER TABLE actions ADD COLUMN impact_aspects TEXT;")
+    if _table_exists(con, "category_rules"):
+        backfills = [
+            ("SCRAP", '["SCRAP"]'),
+            ("OEE", '["OEE"]'),
+            ("PERFORMANCE", '["PERFORMANCE"]'),
+        ]
+        for effect_model, payload in backfills:
+            con.execute(
+                """
+                UPDATE actions
+                SET impact_aspects = ?
+                WHERE impact_aspects IS NULL
+                  AND category IN (
+                    SELECT category
+                    FROM category_rules
+                    WHERE effect_model = ?
+                  )
+                """,
+                (payload, effect_model),
+            )
+    _set_user_version(con, 13)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "action_categories"):
         return
@@ -636,6 +663,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v11(con)
     if current_version < 12:
         _migrate_to_v12(con)
+    if current_version < 13:
+        _migrate_to_v13(con)
     _seed_action_categories(con)
     _seed_category_rules(con)
     con.commit()

@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from action_tracking.domain.constants import ACTION_CATEGORIES as DEFAULT_ACTION_CATEGORIES
+from action_tracking.services.impact_aspects import normalize_impact_aspects
 from action_tracking.services.normalize import normalize_key
 
 
@@ -20,6 +21,13 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
         (table,),
     )
     return cur.fetchone() is not None
+
+
+def _normalize_impact_aspects_payload(value: Any) -> str | None:
+    normalized = normalize_impact_aspects(value)
+    if not normalized:
+        return None
+    return json.dumps(normalized, ensure_ascii=False)
 
 
 DEFAULT_CATEGORY_RULES: dict[str, dict[str, Any]] = {
@@ -635,7 +643,8 @@ class ActionRepository:
                    status,
                    owner_champion_id,
                    category,
-                   project_id
+                   project_id,
+                   impact_aspects
             FROM actions
             WHERE is_draft = 0
         """
@@ -748,6 +757,7 @@ class ActionRepository:
                    a.created_at,
                    a.due_date,
                    a.closed_at,
+                   a.impact_aspects,
                    a.owner_champion_id,
                    CASE
                        WHEN TRIM(COALESCE(ch.first_name, '')) != ''
@@ -817,6 +827,7 @@ class ActionRepository:
             "closed_at",
             "impact_type",
             "impact_value",
+            "impact_aspects",
             "category",
             "manual_savings_amount",
             "manual_savings_currency",
@@ -840,6 +851,7 @@ class ActionRepository:
             payload["closed_at"],
             payload["impact_type"],
             payload["impact_value"],
+            payload["impact_aspects"],
             payload["category"],
             payload["manual_savings_amount"],
             payload["manual_savings_currency"],
@@ -887,6 +899,7 @@ class ActionRepository:
                 closed_at = ?,
                 impact_type = ?,
                 impact_value = ?,
+                impact_aspects = ?,
                 category = ?,
                 manual_savings_amount = ?,
                 manual_savings_currency = ?,
@@ -910,6 +923,7 @@ class ActionRepository:
                 payload["closed_at"],
                 payload["impact_type"],
                 payload["impact_value"],
+                payload["impact_aspects"],
                 payload["category"],
                 payload["manual_savings_amount"],
                 payload["manual_savings_currency"],
@@ -960,6 +974,7 @@ class ActionRepository:
                 closed_at,
                 impact_type,
                 impact_value,
+                impact_aspects,
                 category,
                 manual_savings_amount,
                 manual_savings_currency,
@@ -984,6 +999,7 @@ class ActionRepository:
                 payload["closed_at"],
                 payload["impact_type"],
                 payload["impact_value"],
+                payload["impact_aspects"],
                 payload["category"],
                 payload["manual_savings_amount"],
                 payload["manual_savings_currency"],
@@ -1030,6 +1046,7 @@ class ActionRepository:
             "closed_at",
             "impact_type",
             "impact_value",
+            "impact_aspects",
             "category",
             "manual_savings_amount",
             "manual_savings_currency",
@@ -1127,6 +1144,7 @@ class ActionRepository:
             "closed_at": closed_at,
             "impact_type": data.get("impact_type"),
             "impact_value": data.get("impact_value"),
+            "impact_aspects": _normalize_impact_aspects_payload(data.get("impact_aspects")),
             "category": category,
             "manual_savings_amount": manual_savings_amount,
             "manual_savings_currency": manual_savings_currency,
@@ -1181,6 +1199,7 @@ class ActionRepository:
             "closed_at": None,
             "impact_type": None,
             "impact_value": None,
+            "impact_aspects": _normalize_impact_aspects_payload(data.get("impact_aspects")),
             "category": category,
             "manual_savings_amount": None,
             "manual_savings_currency": None,
