@@ -26,38 +26,51 @@ class SettingsRepository:
         self.con = con
 
     def list_action_categories(self, active_only: bool = True) -> list[dict[str, Any]]:
-        if not _table_exists(self.con, "settings_action_categories"):
+        try:
+            if not _table_exists(self.con, "action_categories"):
+                raise sqlite3.OperationalError("action_categories table missing")
+            query = """
+                SELECT id, name, is_active, sort_order, created_at
+                FROM action_categories
+            """
+            params: list[Any] = []
+            if active_only:
+                query += " WHERE is_active = 1"
+            query += " ORDER BY sort_order ASC, name ASC"
+            cur = self.con.execute(query, params)
+            rows = [dict(r) for r in cur.fetchall()]
+            for row in rows:
+                row["is_active"] = bool(row.get("is_active"))
+            return rows
+        except sqlite3.Error:
             return [
                 {
                     "id": name,
                     "name": name,
                     "is_active": True,
-                    "sort_order": index + 1,
+                    "sort_order": (index + 1) * 10,
                 }
                 for index, name in enumerate(DEFAULT_ACTION_CATEGORIES)
             ]
-        query = """
-            SELECT id, name, is_active, sort_order, created_at
-            FROM settings_action_categories
-        """
-        params: list[Any] = []
-        if active_only:
-            query += " WHERE is_active = 1"
-        query += " ORDER BY sort_order ASC, name ASC"
-        cur = self.con.execute(query, params)
-        rows = [dict(r) for r in cur.fetchall()]
-        for row in rows:
-            row["is_active"] = bool(row.get("is_active"))
-        return rows
 
-    def create_action_category(self, name: str, sort_order: int) -> str:
+    def create_action_category(self, name: str, sort_order: int | None) -> str:
+        clean_name = (name or "").strip()
+        if not clean_name:
+            raise ValueError("Nazwa kategorii jest wymagana.")
+        if self._category_name_exists(clean_name):
+            raise ValueError("Kategoria o tej nazwie już istnieje.")
         category_id = str(uuid4())
         self.con.execute(
             """
-            INSERT INTO settings_action_categories (id, name, is_active, sort_order, created_at)
+            INSERT INTO action_categories (id, name, is_active, sort_order, created_at)
             VALUES (?, ?, 1, ?, ?)
             """,
-            (category_id, name.strip(), int(sort_order), datetime.now(timezone.utc).isoformat()),
+            (
+                category_id,
+                clean_name,
+                int(sort_order) if sort_order is not None else 100,
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
         self.con.commit()
         return category_id
@@ -69,26 +82,51 @@ class SettingsRepository:
         is_active: bool,
         sort_order: int,
     ) -> None:
+        clean_name = (name or "").strip()
+        if not clean_name:
+            raise ValueError("Nazwa kategorii jest wymagana.")
+        if self._category_name_exists(clean_name, exclude_id=category_id):
+            raise ValueError("Kategoria o tej nazwie już istnieje.")
         self.con.execute(
             """
-            UPDATE settings_action_categories
+            UPDATE action_categories
             SET name = ?, is_active = ?, sort_order = ?
             WHERE id = ?
             """,
-            (name.strip(), 1 if is_active else 0, int(sort_order), category_id),
+            (clean_name, 1 if is_active else 0, int(sort_order), category_id),
         )
         self.con.commit()
 
-    def delete_action_category(self, category_id: str) -> None:
+    def deactivate_action_category(self, category_id: str) -> None:
         self.con.execute(
             """
-            UPDATE settings_action_categories
+            UPDATE action_categories
             SET is_active = 0
             WHERE id = ?
             """,
             (category_id,),
         )
         self.con.commit()
+
+    def reactivate_action_category(self, category_id: str) -> None:
+        self.con.execute(
+            """
+            UPDATE action_categories
+            SET is_active = 1
+            WHERE id = ?
+            """,
+            (category_id,),
+        )
+        self.con.commit()
+
+    def _category_name_exists(self, name: str, exclude_id: str | None = None) -> bool:
+        query = "SELECT 1 FROM action_categories WHERE name = ?"
+        params: list[Any] = [name]
+        if exclude_id:
+            query += " AND id != ?"
+            params.append(exclude_id)
+        cur = self.con.execute(query, params)
+        return cur.fetchone() is not None
 
 
 class ActionRepository:
@@ -392,7 +430,10 @@ class ActionRepository:
         category = data.get("category")
         if not category:
             raise ValueError("Kategoria akcji jest wymagana.")
-        if category not in self._list_active_action_categories():
+        if (
+            category not in self._list_active_action_categories()
+            and (existing or {}).get("category") != category
+        ):
             raise ValueError("Wybrana kategoria akcji jest nieprawidłowa.")
 
         project_id = (data.get("project_id") or "").strip()
