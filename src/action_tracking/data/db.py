@@ -131,6 +131,22 @@ CREATE TABLE IF NOT EXISTS production_kpi_daily (
   UNIQUE(metric_date, work_center)
 );
 
+CREATE TABLE IF NOT EXISTS wc_inbox (
+  id TEXT PRIMARY KEY,
+  wc_raw TEXT NOT NULL,
+  wc_norm TEXT NOT NULL UNIQUE,
+  sources TEXT NOT NULL,
+  first_seen_date TEXT,
+  last_seen_date TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  linked_project_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_wc_inbox_status
+  ON wc_inbox (status);
+
 CREATE TABLE IF NOT EXISTS action_effectiveness (
   id TEXT PRIMARY KEY,
   action_id TEXT NOT NULL UNIQUE,
@@ -509,6 +525,32 @@ def _migrate_to_v12(con: sqlite3.Connection) -> None:
     _set_user_version(con, 12)
 
 
+def _migrate_to_v13(con: sqlite3.Connection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wc_inbox (
+          id TEXT PRIMARY KEY,
+          wc_raw TEXT NOT NULL,
+          wc_norm TEXT NOT NULL UNIQUE,
+          sources TEXT NOT NULL,
+          first_seen_date TEXT,
+          last_seen_date TEXT,
+          status TEXT NOT NULL DEFAULT 'open',
+          linked_project_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        """
+    )
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_wc_inbox_status
+        ON wc_inbox (status);
+        """
+    )
+    _set_user_version(con, 13)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "action_categories"):
         return
@@ -636,6 +678,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v11(con)
     if current_version < 12:
         _migrate_to_v12(con)
+    if current_version < 13:
+        _migrate_to_v13(con)
     _seed_action_categories(con)
     _seed_category_rules(con)
     con.commit()

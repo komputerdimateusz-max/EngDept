@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from action_tracking.domain.constants import ACTION_CATEGORIES as DEFAULT_ACTION_CATEGORIES
+from action_tracking.services.effectiveness import normalize_wc, parse_work_centers
 from action_tracking.services.normalize import normalize_key
 
 
@@ -1388,6 +1389,31 @@ class ProjectRepository:
                 row["pct_closed"] = round((closed / total) * 100, 1) if total else None
         return rows
 
+    def list_project_work_centers_norms(
+        self,
+        include_related: bool = True,
+    ) -> set[str]:
+        cur = self.con.execute(
+            """
+            SELECT work_center,
+                   related_work_center
+            FROM projects
+            """
+        )
+        norms: set[str] = set()
+        rows = [dict(r) for r in cur.fetchall()]
+        for row in rows:
+            primary_norm = normalize_wc(row.get("work_center"))
+            if primary_norm:
+                norms.add(primary_norm)
+            if include_related:
+                related = parse_work_centers(None, row.get("related_work_center"))
+                for token in related:
+                    related_norm = normalize_wc(token)
+                    if related_norm:
+                        norms.add(related_norm)
+        return norms
+
     def list_changelog(self, limit: int = 50) -> list[dict[str, Any]]:
         cur = self.con.execute(
             """
@@ -2009,8 +2035,252 @@ class ProductionDataRepository:
             "kpi_work_centers": kpi_work_centers,
         }
 
+    def list_production_work_centers_with_stats(self) -> list[dict[str, Any]]:
+        stats: dict[str, dict[str, Any]] = {}
+
+        if _table_exists(self.con, "scrap_daily"):
+            cur = self.con.execute(
+                """
+                SELECT work_center,
+                       MIN(metric_date) AS first_seen_date,
+                       MAX(metric_date) AS last_seen_date,
+                       COUNT(DISTINCT metric_date) AS count_days_present
+                FROM scrap_daily
+                GROUP BY work_center
+                """
+            )
+            for row in cur.fetchall():
+                wc_raw = row["work_center"]
+                wc_norm = normalize_wc(wc_raw)
+                if not wc_norm:
+                    continue
+                entry = stats.setdefault(
+                    wc_norm,
+                    {
+                        "wc_raw": wc_raw,
+                        "wc_norm": wc_norm,
+                        "has_scrap": False,
+                        "has_kpi": False,
+                        "first_seen_date": row["first_seen_date"],
+                        "last_seen_date": row["last_seen_date"],
+                        "count_days_present": 0,
+                    },
+                )
+                entry["has_scrap"] = True
+                entry["count_days_present"] += int(row["count_days_present"] or 0)
+                if entry.get("first_seen_date") is None or (
+                    row["first_seen_date"]
+                    and row["first_seen_date"] < entry["first_seen_date"]
+                ):
+                    entry["first_seen_date"] = row["first_seen_date"]
+                    entry["wc_raw"] = wc_raw
+                if entry.get("last_seen_date") is None or (
+                    row["last_seen_date"]
+                    and row["last_seen_date"] > entry["last_seen_date"]
+                ):
+                    entry["last_seen_date"] = row["last_seen_date"]
+
+        if _table_exists(self.con, "production_kpi_daily"):
+            cur = self.con.execute(
+                """
+                SELECT work_center,
+                       MIN(metric_date) AS first_seen_date,
+                       MAX(metric_date) AS last_seen_date,
+                       COUNT(DISTINCT metric_date) AS count_days_present
+                FROM production_kpi_daily
+                GROUP BY work_center
+                """
+            )
+            for row in cur.fetchall():
+                wc_raw = row["work_center"]
+                wc_norm = normalize_wc(wc_raw)
+                if not wc_norm:
+                    continue
+                entry = stats.setdefault(
+                    wc_norm,
+                    {
+                        "wc_raw": wc_raw,
+                        "wc_norm": wc_norm,
+                        "has_scrap": False,
+                        "has_kpi": False,
+                        "first_seen_date": row["first_seen_date"],
+                        "last_seen_date": row["last_seen_date"],
+                        "count_days_present": 0,
+                    },
+                )
+                entry["has_kpi"] = True
+                entry["count_days_present"] += int(row["count_days_present"] or 0)
+                if entry.get("first_seen_date") is None or (
+                    row["first_seen_date"]
+                    and row["first_seen_date"] < entry["first_seen_date"]
+                ):
+                    entry["first_seen_date"] = row["first_seen_date"]
+                    entry["wc_raw"] = wc_raw
+                if entry.get("last_seen_date") is None or (
+                    row["last_seen_date"]
+                    and row["last_seen_date"] > entry["last_seen_date"]
+                ):
+                    entry["last_seen_date"] = row["last_seen_date"]
+
+        return list(stats.values())
+
+
     @staticmethod
     def _normalize_date_filter(value: date | str) -> str:
         if isinstance(value, date):
             return value.isoformat()
         return value
+
+
+class WcInboxRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def upsert_from_production(
+        self,
+        work_centers_stats: list[dict[str, Any]],
+        existing_project_wc_norms: set[str],
+    ) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+        existing_rows: dict[str, dict[str, Any]] = {}
+        cur = self.con.execute(
+            """
+            SELECT wc_norm,
+                   wc_raw,
+                   sources,
+                   status,
+                   first_seen_date,
+                   last_seen_date
+            FROM wc_inbox
+            """
+        )
+        for row in cur.fetchall():
+            existing_rows[row["wc_norm"]] = dict(row)
+        now = datetime.now(timezone.utc).isoformat()
+        for row in work_centers_stats:
+            wc_norm = normalize_wc(row.get("wc_norm") or row.get("wc_raw"))
+            if not wc_norm:
+                continue
+            existing = existing_rows.get(wc_norm)
+            if wc_norm in existing_project_wc_norms:
+                if existing and existing.get("status") == "open":
+                    self._set_status(wc_norm, "linked", None)
+                continue
+            sources = []
+            if row.get("has_scrap"):
+                sources.append("scrap")
+            if row.get("has_kpi"):
+                sources.append("kpi")
+            if existing:
+                existing_sources = json.loads(existing.get("sources") or "[]")
+                sources = sorted(set(existing_sources) | set(sources))
+            if existing and existing.get("first_seen_date") and row.get("first_seen_date"):
+                if existing["first_seen_date"] <= row["first_seen_date"]:
+                    wc_raw_value = existing.get("wc_raw") or row.get("wc_raw") or ""
+                else:
+                    wc_raw_value = row.get("wc_raw") or existing.get("wc_raw") or ""
+            else:
+                wc_raw_value = (existing or {}).get("wc_raw") or row.get("wc_raw") or ""
+            payload = {
+                "id": str(uuid4()),
+                "wc_raw": wc_raw_value,
+                "wc_norm": wc_norm,
+                "sources": json.dumps(sources, ensure_ascii=False),
+                "first_seen_date": row.get("first_seen_date"),
+                "last_seen_date": row.get("last_seen_date"),
+                "status": "open",
+                "linked_project_id": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self.con.execute(
+                """
+                INSERT INTO wc_inbox (
+                    id,
+                    wc_raw,
+                    wc_norm,
+                    sources,
+                    first_seen_date,
+                    last_seen_date,
+                    status,
+                    linked_project_id,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(wc_norm) DO UPDATE SET
+                    wc_raw = excluded.wc_raw,
+                    sources = excluded.sources,
+                    first_seen_date = COALESCE(
+                        MIN(wc_inbox.first_seen_date, excluded.first_seen_date),
+                        excluded.first_seen_date,
+                        wc_inbox.first_seen_date
+                    ),
+                    last_seen_date = COALESCE(
+                        MAX(wc_inbox.last_seen_date, excluded.last_seen_date),
+                        excluded.last_seen_date,
+                        wc_inbox.last_seen_date
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    payload["id"],
+                    payload["wc_raw"],
+                    payload["wc_norm"],
+                    payload["sources"],
+                    payload["first_seen_date"],
+                    payload["last_seen_date"],
+                    payload["status"],
+                    payload["linked_project_id"],
+                    payload["created_at"],
+                    payload["updated_at"],
+                ),
+            )
+        self.con.commit()
+
+    def list_open(self, limit: int = 200) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "wc_inbox"):
+            return []
+        cur = self.con.execute(
+            """
+            SELECT *
+            FROM wc_inbox
+            WHERE status = 'open'
+            ORDER BY last_seen_date DESC, wc_raw ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        for row in rows:
+            row["sources"] = json.loads(row.get("sources") or "[]")
+        return rows
+
+    def ignore(self, wc_norm: str) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+        self._set_status(wc_norm, "ignored", None)
+
+    def link_to_project(self, wc_norm: str, project_id: str) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+        self._set_status(wc_norm, "linked", project_id)
+
+    def mark_created(self, wc_norm: str, project_id: str) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+        self._set_status(wc_norm, "created", project_id)
+
+    def _set_status(self, wc_norm: str, status: str, project_id: str | None) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.con.execute(
+            """
+            UPDATE wc_inbox
+            SET status = ?,
+                linked_project_id = ?,
+                updated_at = ?
+            WHERE wc_norm = ?
+            """,
+            (status, project_id, now, wc_norm),
+        )
+        self.con.commit()
