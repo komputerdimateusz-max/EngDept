@@ -22,6 +22,7 @@ from action_tracking.services.effectiveness import (
     parse_date,
     parse_work_centers,
 )
+from action_tracking.services.normalize import normalize_key
 
 
 FIELD_LABELS: dict[str, str] = {
@@ -108,11 +109,41 @@ def render(con: sqlite3.Connection) -> None:
     status_options = ["(Wszystkie)", "open", "in_progress", "blocked", "done", "cancelled"]
     project_options = ["Wszystkie"] + [p["id"] for p in projects]
     champion_options = ["(Wszyscy)"] + [c["id"] for c in champions]
-    active_rule_rows = rules_repo.list_category_rules(include_inactive=False)
-    active_categories = [row["category"] for row in active_rule_rows]
+    active_rule_rows = rules_repo.get_category_rules(only_active=True)
+    active_categories = [row["category_label"] for row in active_rule_rows]
     if not active_categories:
         active_categories = [c["name"] for c in settings_repo.list_action_categories(active_only=True)]
     category_options = ["(Wszystkie)"] + active_categories
+
+    def _fallback_rule(category: str) -> dict[str, Any]:
+        return {
+            "category_label": category,
+            "effectiveness_model": "NONE",
+            "savings_model": "MANUAL_REQUIRED",
+            "requires_scope_link": False,
+            "description": "Brak zdefiniowanej metodologii dla tej kategorii.",
+            "is_active": True,
+        }
+
+    def _resolve_rule(category: str, warn: bool = False) -> dict[str, Any]:
+        rule = rules_repo.resolve_category_rule(category)
+        if rule is not None:
+            return rule
+        if warn:
+            st.warning("Brak reguły dla kategorii. Użyto domyślnej: MANUAL_REQUIRED / NONE.")
+            st.caption(
+                f"Selected category raw: '{category}' | normalized: '{normalize_key(category)}'"
+            )
+            available_rules = rules_repo.get_category_rules(only_active=True)
+            available = [
+                f"{row['category_label']} -> {normalize_key(row['category_label'])}"
+                for row in available_rules
+            ]
+            if available:
+                st.caption("Available rules: " + ", ".join(available[:10]))
+            else:
+                st.caption("Available rules: (brak aktywnych reguł)")
+        return _fallback_rule(category)
 
     col1, col2, col3, col4, col5, col6, col7 = st.columns(
         [1.2, 1.6, 1.6, 1.6, 1.2, 1.1, 1.6]
@@ -177,8 +208,8 @@ def render(con: sqlite3.Connection) -> None:
         recomputed = 0
         skipped = 0
         for action in eligible_for_recompute:
-            rule = rules_repo.resolve_category_rule(action.get("category") or "")
-            effect_model = rule.get("effect_model")
+            rule = _resolve_rule(action.get("category") or "")
+            effect_model = rule.get("effectiveness_model")
             if effect_model == "NONE":
                 skipped += 1
                 continue
@@ -245,8 +276,8 @@ def render(con: sqlite3.Connection) -> None:
 
     def _format_effectiveness(action: dict[str, Any]) -> tuple[str, str]:
         category = action.get("category") or ""
-        rule = rules_repo.resolve_category_rule(category)
-        if rule.get("effect_model") == "NONE" or action.get("status") != "done":
+        rule = _resolve_rule(category)
+        if rule.get("effectiveness_model") == "NONE" or action.get("status") != "done":
             return "—", "—"
         if not action.get("closed_at"):
             return "—", "—"
@@ -353,11 +384,11 @@ def render(con: sqlite3.Connection) -> None:
                 else 0,
                 format_func=_format_category_option,
             )
-            rule = rules_repo.resolve_category_rule(category)
+            rule = _resolve_rule(category, warn=True)
             st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
             st.caption(
                 "Metoda obliczeń: "
-                f"Skuteczność = {rule.get('effect_model')}, "
+                f"Skuteczność = {rule.get('effectiveness_model')}, "
                 f"Oszczędności = {rule.get('savings_model')}, "
                 f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
             )
@@ -516,11 +547,11 @@ def render(con: sqlite3.Connection) -> None:
                 else 0,
                 format_func=_format_category_option,
             )
-            rule = rules_repo.resolve_category_rule(category)
+            rule = _resolve_rule(category, warn=True)
             st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
             st.caption(
                 "Metoda obliczeń: "
-                f"Skuteczność = {rule.get('effect_model')}, "
+                f"Skuteczność = {rule.get('effectiveness_model')}, "
                 f"Oszczędności = {rule.get('savings_model')}, "
                 f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
             )

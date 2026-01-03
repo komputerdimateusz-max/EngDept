@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from action_tracking.data.repositories import GlobalSettingsRepository, SettingsRepository
+from action_tracking.services.normalize import normalize_key
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -85,38 +86,57 @@ def render(con: sqlite3.Connection) -> None:
 
     st.divider()
     st.subheader("Reguły kategorii akcji (effectiveness + savings)")
-    rules = rules_repo.list_category_rules(include_inactive=True)
+    rules = rules_repo.get_category_rules(only_active=False)
     if not rules:
         st.info("Brak zdefiniowanych reguł kategorii.")
     else:
         rules_df = pd.DataFrame(rules)
         rules_df = rules_df[
-            ["category", "effect_model", "savings_model", "requires_scope_link", "is_active"]
+            [
+                "category_label",
+                "effectiveness_model",
+                "savings_model",
+                "requires_scope_link",
+                "is_active",
+            ]
         ].rename(
             columns={
-                "category": "Kategoria",
-                "effect_model": "Model skuteczności",
+                "category_label": "Kategoria",
+                "effectiveness_model": "Model skuteczności",
                 "savings_model": "Model oszczędności",
                 "requires_scope_link": "Wymaga WC",
                 "is_active": "Aktywna",
             }
         )
+        rules_df["Klucz (normalized)"] = rules_df["Kategoria"].map(normalize_key)
         st.dataframe(rules_df, use_container_width=True, hide_index=True)
 
     st.subheader("Edytor reguły kategorii")
-    category_names = sorted({row["name"] for row in categories} | {row["category"] for row in rules})
+    category_names = sorted(
+        {row["name"] for row in categories} | {row["category_label"] for row in rules}
+    )
     if not category_names:
         st.caption("Brak kategorii do konfiguracji.")
     else:
         selected_category = st.selectbox("Kategoria", category_names)
-        selected_rule = rules_repo.resolve_category_rule(selected_category)
+        selected_rule = rules_repo.resolve_category_rule(selected_category) or {
+            "category_label": selected_category,
+            "effectiveness_model": "NONE",
+            "savings_model": "NONE",
+            "requires_scope_link": False,
+            "is_active": True,
+            "description": None,
+        }
         effect_options = ["SCRAP", "OEE", "PERFORMANCE", "NONE"]
         savings_options = ["AUTO_SCRAP_COST", "MANUAL_REQUIRED", "AUTO_TIME_TO_PLN", "NONE"]
+        st.caption(
+            f"Zapisana etykieta: '{selected_category}' | normalized: '{normalize_key(selected_category)}'"
+        )
         with st.form("edit_category_rule"):
             effect_model = st.selectbox(
                 "Model skuteczności",
                 effect_options,
-                index=effect_options.index(selected_rule.get("effect_model") or "NONE"),
+                index=effect_options.index(selected_rule.get("effectiveness_model") or "NONE"),
             )
             savings_model = st.selectbox(
                 "Model oszczędności",
@@ -159,7 +179,9 @@ def render(con: sqlite3.Connection) -> None:
             st.caption("Brak opisów metodologii.")
         else:
             for rule in rules:
-                st.markdown(f"**{rule['category']}**: {rule.get('description') or 'Brak opisu.'}")
+                st.markdown(
+                    f"**{rule['category_label']}**: {rule.get('description') or 'Brak opisu.'}"
+                )
         st.markdown(
             """
 - Okno bazowe i po zmianie obejmuje ostatnie 14 dni przed/po zamknięciu akcji.
