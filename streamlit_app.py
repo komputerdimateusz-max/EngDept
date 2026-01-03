@@ -11,9 +11,9 @@ if SRC.exists() and str(SRC) not in sys.path:
 
 import streamlit as st
 
+import action_tracking
 from action_tracking.data.db import connect, init_db
 from action_tracking.app.pages import (
-    explorer,
     kpi,
     actions,
     champions,
@@ -34,21 +34,41 @@ con = connect(DB_PATH)
 init_db(con)
 
 # --- Sidebar navigation ---
-st.sidebar.title("engdept")
+st.sidebar.title("Magna PE Database")
+
+build_number = (
+    os.getenv("APP_BUILD")
+    or os.getenv("BUILD_NUMBER")
+    or action_tracking.__version__
+)
+st.sidebar.markdown(
+    f"""
+    <style>
+    [data-testid="stSidebar"] .build-info {{
+        position: fixed;
+        bottom: 0.5rem;
+        left: 1rem;
+        color: #6c757d;
+        font-size: 0.75rem;
+    }}
+    </style>
+    <div class="build-info">Build: {build_number}</div>
+    """,
+    unsafe_allow_html=True,
+)
 
 PAGES = {
-    "Explorer (Produkcja)": lambda: explorer.render(con),
     "Production Explorer": lambda: production_explorer.render(con),
-    "Import danych produkcyjnych": lambda: production_import.render(con),
     "KPI": lambda: kpi.render(con),
     "Akcje": lambda: actions.render(con),
     "Champions": lambda: champions.render(con),
     "Champion Ranking v2": lambda: champions_ranking.render(con),
     "Projekty": lambda: projects.render(con),
     "Ustawienia Globalne": lambda: settings.render(con),
+    "Import danych produkcyjnych": lambda: production_import.render(con),
 }
 
-selected = st.sidebar.radio("Strony", list(PAGES.keys()), index=2)
+selected = st.sidebar.radio("Strony", list(PAGES.keys()), index=0)
 
 # --- Render selected page ---
 PAGES[selected]()
