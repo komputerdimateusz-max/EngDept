@@ -92,6 +92,33 @@ except Exception:  # pragma: no cover
 # HELPERS
 # =====================================================
 
+_CONFIGURED_CONNECTIONS: set[int] = set()
+
+
+def _configure_sqlite_connection(con: sqlite3.Connection) -> None:
+    """
+    Apply SQLite settings once per connection to reduce lock contention.
+    WAL + busy_timeout are safe defaults for Streamlit reruns.
+    """
+    con_id = id(con)
+    if con_id in _CONFIGURED_CONNECTIONS:
+        return
+    try:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA busy_timeout = 5000;")
+    except sqlite3.Error:
+        # Defensive: do not block app startup if pragmas are unsupported.
+        return
+    _CONFIGURED_CONNECTIONS.add(con_id)
+
+
+def _rollback_safely(con: sqlite3.Connection) -> None:
+    try:
+        con.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+
+
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
     cur = con.execute(
         """
@@ -1584,6 +1611,7 @@ class ProjectRepository:
 class ChampionRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
+        _configure_sqlite_connection(self.con)
 
     def list_champions(self) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "champions"):
@@ -1665,6 +1693,7 @@ class ChampionRepository:
         first_name = (data.get("first_name") or "").strip() or None
         last_name = (data.get("last_name") or "").strip() or None
         email = (data.get("email") or "").strip() or None
+        display_name = (data.get("display_name") or "").strip() or None
         active = data.get("active")
         active_value = int(True if active is None else bool(active))
         hire_date = data.get("hire_date") or None
@@ -1685,6 +1714,11 @@ class ChampionRepository:
             "position": (data.get("position") or "").strip() or None,
             "team": (data.get("team") or "").strip() or None,
         }
+        if "name" in cols:
+            # Backfill NOT NULL name column using UI fields (display/first/last/email/id).
+            full_name = " ".join(part for part in [first_name, last_name] if part).strip()
+            derived_name = display_name or full_name or email or champion_id
+            payload["name"] = derived_name
 
         insert_cols = [c for c in payload.keys() if c in cols]
         if not insert_cols:
@@ -1692,11 +1726,18 @@ class ChampionRepository:
 
         placeholders = ", ".join(["?"] * len(insert_cols))
         values = [payload[c] for c in insert_cols]
-        self.con.execute(
-            f"INSERT INTO champions ({', '.join(insert_cols)}) VALUES ({placeholders})",
-            values,
-        )
-        self.con.commit()
+        _configure_sqlite_connection(self.con)
+        try:
+            # IMMEDIATE transaction reduces "database is locked" during concurrent writes.
+            self.con.execute("BEGIN IMMEDIATE")
+            self.con.execute(
+                f"INSERT INTO champions ({', '.join(insert_cols)}) VALUES ({placeholders})",
+                values,
+            )
+            self.con.execute("COMMIT")
+        except Exception:
+            _rollback_safely(self.con)
+            raise
         return champion_id
 
 
@@ -2030,6 +2071,7 @@ class ProductionDataRepository:
 class WcInboxRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
+        _configure_sqlite_connection(self.con)
 
     def upsert_from_production(
         self,
@@ -2057,73 +2099,79 @@ class WcInboxRepository:
 
         now = datetime.now(timezone.utc).isoformat()
 
-        for row in work_centers_stats or []:
-            wc_norm = normalize_wc(row.get("wc_norm") or row.get("wc_raw"))
-            if not wc_norm:
-                continue
+        _configure_sqlite_connection(self.con)
+        try:
+            # IMMEDIATE transaction avoids lock contention during batch upsert.
+            self.con.execute("BEGIN IMMEDIATE")
+            for row in work_centers_stats or []:
+                wc_norm = normalize_wc(row.get("wc_norm") or row.get("wc_raw"))
+                if not wc_norm:
+                    continue
 
-            existing = existing_rows.get(wc_norm)
+                existing = existing_rows.get(wc_norm)
 
-            if wc_norm in (existing_project_wc_norms or set()):
-                if existing and existing.get("status") == "open":
-                    self._set_status(wc_norm, "linked", None)
-                continue
+                if wc_norm in (existing_project_wc_norms or set()):
+                    if existing and existing.get("status") == "open":
+                        self._set_status(wc_norm, "linked", None, commit=False)
+                    continue
 
-            sources: list[str] = []
-            if row.get("has_scrap"):
-                sources.append("scrap")
-            if row.get("has_kpi"):
-                sources.append("kpi")
+                sources: list[str] = []
+                if row.get("has_scrap"):
+                    sources.append("scrap")
+                if row.get("has_kpi"):
+                    sources.append("kpi")
 
-            if existing:
-                try:
-                    prev_sources = json.loads(existing.get("sources") or "[]")
-                except json.JSONDecodeError:
-                    prev_sources = []
-                sources = sorted(set(prev_sources) | set(sources))
+                if existing:
+                    try:
+                        prev_sources = json.loads(existing.get("sources") or "[]")
+                    except json.JSONDecodeError:
+                        prev_sources = []
+                    sources = sorted(set(prev_sources) | set(sources))
 
-            wc_raw_value = (row.get("wc_raw") or "").strip()
-            if existing and existing.get("wc_raw"):
-                wc_raw_value = existing.get("wc_raw") or wc_raw_value
+                wc_raw_value = (row.get("wc_raw") or "").strip()
+                if existing and existing.get("wc_raw"):
+                    wc_raw_value = existing.get("wc_raw") or wc_raw_value
 
-            self.con.execute(
-                """
-                INSERT INTO wc_inbox (
-                    id, wc_raw, wc_norm, sources,
-                    first_seen_date, last_seen_date,
-                    status, linked_project_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(wc_norm) DO UPDATE SET
-                    wc_raw = excluded.wc_raw,
-                    sources = excluded.sources,
-                    first_seen_date = COALESCE(
-                        MIN(wc_inbox.first_seen_date, excluded.first_seen_date),
-                        excluded.first_seen_date,
-                        wc_inbox.first_seen_date
+                self.con.execute(
+                    """
+                    INSERT INTO wc_inbox (
+                        id, wc_raw, wc_norm, sources,
+                        first_seen_date, last_seen_date,
+                        status, linked_project_id,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(wc_norm) DO UPDATE SET
+                        wc_raw = excluded.wc_raw,
+                        sources = excluded.sources,
+                        first_seen_date = COALESCE(
+                            MIN(wc_inbox.first_seen_date, excluded.first_seen_date),
+                            excluded.first_seen_date,
+                            wc_inbox.first_seen_date
+                        ),
+                        last_seen_date = COALESCE(
+                            MAX(wc_inbox.last_seen_date, excluded.last_seen_date),
+                            excluded.last_seen_date,
+                            wc_inbox.last_seen_date
+                        ),
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(uuid4()),
+                        wc_raw_value,
+                        wc_norm,
+                        json.dumps(sources, ensure_ascii=False),
+                        row.get("first_seen_date"),
+                        row.get("last_seen_date"),
+                        "open",
+                        None,
+                        now,
+                        now,
                     ),
-                    last_seen_date = COALESCE(
-                        MAX(wc_inbox.last_seen_date, excluded.last_seen_date),
-                        excluded.last_seen_date,
-                        wc_inbox.last_seen_date
-                    ),
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    str(uuid4()),
-                    wc_raw_value,
-                    wc_norm,
-                    json.dumps(sources, ensure_ascii=False),
-                    row.get("first_seen_date"),
-                    row.get("last_seen_date"),
-                    "open",
-                    None,
-                    now,
-                    now,
-                ),
-            )
-
-        self.con.commit()
+                )
+            self.con.execute("COMMIT")
+        except Exception:
+            _rollback_safely(self.con)
+            raise
 
     def list_open(self, limit: int = 200) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "wc_inbox"):
@@ -2161,7 +2209,13 @@ class WcInboxRepository:
             return
         self._set_status(wc_norm, "created", project_id)
 
-    def _set_status(self, wc_norm: str, status: str, project_id: str | None) -> None:
+    def _set_status(
+        self,
+        wc_norm: str,
+        status: str,
+        project_id: str | None,
+        commit: bool = True,
+    ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         self.con.execute(
             """
@@ -2173,4 +2227,5 @@ class WcInboxRepository:
             """,
             (status, project_id, now, wc_norm),
         )
-        self.con.commit()
+        if commit:
+            self.con.commit()
