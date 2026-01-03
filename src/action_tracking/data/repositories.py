@@ -1,25 +1,14 @@
-# ============================
-# HOTFIX: ProjectRepository + __all__ exports (quick rescue)
-# ============================
-# Problem: ImportError: cannot import name 'ProjectRepository' ...
-# To oznacza, że w Twoim src/action_tracking/data/repositories.py
-# NIE MA już klasy ProjectRepository (albo została uszkodzona/wycięta podczas merge).
-#
-# NAJSZYBSZE rozwiązanie: dodaj minimalną, kompatybilną wersję ProjectRepository
-# do TEGO SAMEGO pliku repositories.py (najlepiej na samym końcu, POD ProductionDataRepository).
-#
-# UWAGA: Ta wersja wystarczy żeby Explorer/Projects startowały (list_projects, create/update/delete).
-# Jeśli masz w projekcie „pełniejszą” wersję ProjectRepository, możesz potem ją przywrócić,
-# ale teraz celem jest uruchomienie aplikacji.
-
 from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+# =====================================================
+# HELPERS
+# =====================================================
 
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
     cur = con.execute(
@@ -33,222 +22,365 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
     return cur.fetchone() is not None
 
 
+# =====================================================
+# SETTINGS / GLOBAL RULES
+# =====================================================
+
+class SettingsRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def list_action_categories(self, active_only: bool = True) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "action_categories"):
+            return []
+        query = """
+            SELECT id, name, is_active, sort_order, created_at
+            FROM action_categories
+        """
+        if active_only:
+            query += " WHERE is_active = 1"
+        query += " ORDER BY sort_order, name"
+        cur = self.con.execute(query)
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["is_active"] = bool(r["is_active"])
+        return rows
+
+
+class GlobalSettingsRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def get_category_rules(self, only_active: bool = True) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "category_rules"):
+            return []
+        query = """
+            SELECT category AS category_label,
+                   effect_model AS effectiveness_model,
+                   savings_model,
+                   requires_scope_link,
+                   description,
+                   is_active
+            FROM category_rules
+        """
+        if only_active:
+            query += " WHERE is_active = 1"
+        query += " ORDER BY category"
+        cur = self.con.execute(query)
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["requires_scope_link"] = bool(r["requires_scope_link"])
+            r["is_active"] = bool(r["is_active"])
+        return rows
+
+
+# =====================================================
+# ACTIONS
+# =====================================================
+
+class ActionRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def list_actions(self) -> list[dict[str, Any]]:
+        cur = self.con.execute(
+            """
+            SELECT a.*,
+                   p.name AS project_name
+            FROM actions a
+            LEFT JOIN projects p ON p.id = a.project_id
+            ORDER BY a.created_at DESC
+            """
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def create_action(self, payload: dict[str, Any]) -> str:
+        action_id = payload.get("id") or str(uuid4())
+        cols = [
+            "id","project_id","title","description","owner_champion_id",
+            "priority","status","is_draft","due_date","created_at","closed_at",
+            "impact_type","impact_value","impact_aspects","category",
+            "manual_savings_amount","manual_savings_currency","manual_savings_note",
+            "source","source_message_id","submitted_by_email","submitted_at"
+        ]
+        values = [payload.get(c) for c in cols]
+        placeholders = ", ".join(["?"] * len(cols))
+        self.con.execute(
+            f"INSERT INTO actions ({', '.join(cols)}) VALUES ({placeholders})",
+            values,
+        )
+        self.con.commit()
+        return action_id
+
+
+# =====================================================
+# EFFECTIVENESS
+# =====================================================
+
+class EffectivenessRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def upsert_effectiveness(self, action_id: str, payload: dict[str, Any]) -> None:
+        self.con.execute(
+            """
+            INSERT INTO action_effectiveness (
+                id, action_id, metric,
+                baseline_from, baseline_to,
+                after_from, after_to,
+                baseline_days, after_days,
+                baseline_avg, after_avg,
+                delta, pct_change,
+                classification, computed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(action_id) DO UPDATE SET
+                metric = excluded.metric,
+                delta = excluded.delta,
+                pct_change = excluded.pct_change,
+                classification = excluded.classification,
+                computed_at = excluded.computed_at
+            """,
+            (
+                payload.get("id") or str(uuid4()),
+                action_id,
+                payload["metric"],
+                payload["baseline_from"],
+                payload["baseline_to"],
+                payload["after_from"],
+                payload["after_to"],
+                payload["baseline_days"],
+                payload["after_days"],
+                payload["baseline_avg"],
+                payload["after_avg"],
+                payload["delta"],
+                payload["pct_change"],
+                payload["classification"],
+                payload["computed_at"],
+            ),
+        )
+        self.con.commit()
+
+
+# =====================================================
+# PROJECTS
+# =====================================================
+
 class ProjectRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
-    def list_projects(self, include_counts: bool = True) -> list[dict[str, Any]]:
-        if not _table_exists(self.con, "projects"):
-            return []
-
-        if include_counts and _table_exists(self.con, "actions"):
-            cur = self.con.execute(
-                """
-                SELECT p.id,
-                       p.name,
-                       p.type,
-                       p.owner_champion_id,
-                       p.status,
-                       p.created_at,
-                       p.closed_at,
-                       p.work_center,
-                       p.project_code,
-                       p.project_sop,
-                       p.project_eop,
-                       p.related_work_center,
-                       COUNT(a.id) AS actions_total,
-                       COALESCE(SUM(CASE WHEN a.status IN ('done','cancelled') THEN 1 ELSE 0 END),0) AS actions_closed,
-                       COALESCE(SUM(CASE WHEN a.status NOT IN ('done','cancelled') THEN 1 ELSE 0 END),0) AS actions_open
-                FROM projects p
-                LEFT JOIN actions a ON a.project_id = p.id AND COALESCE(a.is_draft,0) = 0
-                GROUP BY p.id
-                ORDER BY p.name
-                """
-            )
-        else:
-            cur = self.con.execute(
-                """
-                SELECT p.id,
-                       p.name,
-                       p.type,
-                       p.owner_champion_id,
-                       p.status,
-                       p.created_at,
-                       p.closed_at,
-                       p.work_center,
-                       p.project_code,
-                       p.project_sop,
-                       p.project_eop,
-                       p.related_work_center
-                FROM projects p
-                ORDER BY p.name
-                """
-            )
-
-        rows = [dict(r) for r in cur.fetchall()]
-        if include_counts:
-            for row in rows:
-                total = row.get("actions_total") or 0
-                closed = row.get("actions_closed") or 0
-                row["pct_closed"] = round((closed / total) * 100, 1) if total else None
-        return rows
+    def list_projects(self) -> list[dict[str, Any]]:
+        cur = self.con.execute(
+            """
+            SELECT p.*,
+                   COUNT(a.id) AS actions_total
+            FROM projects p
+            LEFT JOIN actions a ON a.project_id = p.id AND a.is_draft = 0
+            GROUP BY p.id
+            ORDER BY p.name
+            """
+        )
+        return [dict(r) for r in cur.fetchall()]
 
     def create_project(self, data: dict[str, Any]) -> str:
-        if not _table_exists(self.con, "projects"):
-            raise sqlite3.OperationalError("projects table missing; migration required")
-
-        project_id = (data.get("id") or "").strip() or str(uuid4())
-        now = datetime.now(timezone.utc).isoformat()
-
-        payload = {
-            "id": project_id,
-            "name": (data.get("name") or "").strip(),
-            "type": (data.get("type") or "custom").strip(),
-            "owner_champion_id": data.get("owner_champion_id"),
-            "status": (data.get("status") or "active").strip(),
-            "created_at": data.get("created_at") or now,
-            "closed_at": data.get("closed_at"),
-            "work_center": (data.get("work_center") or "").strip(),
-            "project_code": data.get("project_code"),
-            "project_sop": data.get("project_sop"),
-            "project_eop": data.get("project_eop"),
-            "related_work_center": data.get("related_work_center"),
-        }
-
-        if not payload["name"]:
-            raise ValueError("Nazwa projektu jest wymagana.")
-
+        project_id = data.get("id") or str(uuid4())
         self.con.execute(
             """
             INSERT INTO projects (
-                id, name, type, owner_champion_id, status,
-                created_at, closed_at, work_center,
-                project_code, project_sop, project_eop, related_work_center
+                id, name, type, owner_champion_id,
+                status, created_at, closed_at,
+                work_center, project_code,
+                project_sop, project_eop,
+                related_work_center
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                payload["id"],
-                payload["name"],
-                payload["type"],
-                payload["owner_champion_id"],
-                payload["status"],
-                payload["created_at"],
-                payload["closed_at"],
-                payload["work_center"],
-                payload["project_code"],
-                payload["project_sop"],
-                payload["project_eop"],
-                payload["related_work_center"],
+                project_id,
+                data["name"],
+                data.get("type", "custom"),
+                data.get("owner_champion_id"),
+                data.get("status", "active"),
+                data.get("created_at"),
+                data.get("closed_at"),
+                data.get("work_center", ""),
+                data.get("project_code"),
+                data.get("project_sop"),
+                data.get("project_eop"),
+                data.get("related_work_center"),
             ),
         )
-        self._log_changelog(project_id, "CREATE", payload)
         self.con.commit()
         return project_id
 
-    def update_project(self, project_id: str, data: dict[str, Any]) -> None:
-        before = self._get_project(project_id)
-        if not before:
-            raise ValueError("Project not found")
 
-        payload = dict(before)
-        for k in [
-            "name",
-            "type",
-            "owner_champion_id",
-            "status",
-            "created_at",
-            "closed_at",
-            "work_center",
-            "project_code",
-            "project_sop",
-            "project_eop",
-            "related_work_center",
-        ]:
-            if k in data:
-                payload[k] = data[k]
+# =====================================================
+# CHAMPIONS
+# =====================================================
 
-        payload["name"] = (payload.get("name") or "").strip()
-        payload["type"] = (payload.get("type") or "custom").strip()
-        payload["status"] = (payload.get("status") or "active").strip()
-        payload["work_center"] = (payload.get("work_center") or "").strip()
+class ChampionRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
 
-        if not payload["name"]:
-            raise ValueError("Nazwa projektu jest wymagana.")
-
-        self.con.execute(
+    def list_champions(self) -> list[dict[str, Any]]:
+        cur = self.con.execute(
             """
-            UPDATE projects
-            SET name = ?,
-                type = ?,
-                owner_champion_id = ?,
-                status = ?,
-                created_at = ?,
-                closed_at = ?,
-                work_center = ?,
-                project_code = ?,
-                project_sop = ?,
-                project_eop = ?,
-                related_work_center = ?
-            WHERE id = ?
-            """,
-            (
-                payload.get("name"),
-                payload.get("type"),
-                payload.get("owner_champion_id"),
-                payload.get("status"),
-                payload.get("created_at"),
-                payload.get("closed_at"),
-                payload.get("work_center"),
-                payload.get("project_code"),
-                payload.get("project_sop"),
-                payload.get("project_eop"),
-                payload.get("related_work_center"),
-                project_id,
-            ),
+            SELECT id, first_name, last_name, email, active
+            FROM champions
+            ORDER BY last_name, first_name
+            """
         )
-        self._log_changelog(project_id, "UPDATE", {"from": before, "to": payload})
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["display_name"] = f"{r.get('first_name','')} {r.get('last_name','')}".strip()
+        return rows
+
+
+# =====================================================
+# PRODUCTION DATA (SCRAP / KPI)
+# =====================================================
+
+class ProductionDataRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    # ---------- UPSERTS ----------
+
+    def upsert_scrap_daily(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        payload = [
+            (
+                r.get("id") or str(uuid4()),
+                r["metric_date"],
+                r["work_center"],
+                int(r["scrap_qty"]),
+                r.get("scrap_cost_amount"),
+                r.get("scrap_cost_currency", "PLN"),
+                r.get("created_at") or now,
+            )
+            for r in rows
+        ]
+        self.con.executemany(
+            """
+            INSERT INTO scrap_daily (
+                id, metric_date, work_center,
+                scrap_qty, scrap_cost_amount,
+                scrap_cost_currency, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(metric_date, work_center, scrap_cost_currency)
+            DO UPDATE SET
+                scrap_qty = excluded.scrap_qty,
+                scrap_cost_amount = excluded.scrap_cost_amount
+            """,
+            payload,
+        )
         self.con.commit()
 
-    def delete_project(self, project_id: str) -> bool:
-        before = self._get_project(project_id)
-        if not before:
-            return True
-
-        try:
-            self.con.execute("BEGIN")
-            self._log_changelog(project_id, "DELETE", before)
-            self.con.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-            self.con.commit()
-            return True
-        except sqlite3.IntegrityError:
-            self.con.rollback()
-            return False
-
-    # ---------
-    # internals
-    # ---------
-
-    def _get_project(self, project_id: str) -> dict[str, Any] | None:
-        cur = self.con.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-    def _log_changelog(self, project_id: str, event_type: str, payload: dict[str, Any]) -> None:
-        if not _table_exists(self.con, "project_changelog"):
-            # jak nie ma tabeli (stara baza) — nie blokuj działania
+    def upsert_production_kpi_daily(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
             return
-        event_at = datetime.now(timezone.utc).isoformat()
-        self.con.execute(
+        now = datetime.now(timezone.utc).isoformat()
+        payload = [
+            (
+                r.get("id") or str(uuid4()),
+                r["metric_date"],
+                r["work_center"],
+                r.get("worktime_min"),
+                r.get("oee_pct"),
+                r.get("performance_pct"),
+                r.get("availability_pct"),
+                r.get("quality_pct"),
+                r.get("source_file"),
+                r.get("imported_at") or now,
+                r.get("created_at") or now,
+            )
+            for r in rows
+        ]
+        self.con.executemany(
             """
-            INSERT INTO project_changelog (id, project_id, event_type, event_at, changes_json)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO production_kpi_daily (
+                id, metric_date, work_center,
+                worktime_min, oee_pct, performance_pct,
+                availability_pct, quality_pct,
+                source_file, imported_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(metric_date, work_center)
+            DO UPDATE SET
+                oee_pct = excluded.oee_pct,
+                performance_pct = excluded.performance_pct,
+                availability_pct = excluded.availability_pct,
+                quality_pct = excluded.quality_pct
             """,
-            (str(uuid4()), project_id, event_type, json.dumps(payload, ensure_ascii=False)),
+            payload,
         )
+        self.con.commit()
+
+    # ---------- QUERIES ----------
+
+    def list_scrap_daily(
+        self,
+        work_center: str | None,
+        date_from: date | str | None,
+        date_to: date | str | None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM scrap_daily WHERE 1=1"
+        params: list[Any] = []
+        if work_center:
+            query += " AND work_center = ?"
+            params.append(work_center)
+        if date_from:
+            query += " AND metric_date >= ?"
+            params.append(str(date_from))
+        if date_to:
+            query += " AND metric_date <= ?"
+            params.append(str(date_to))
+        query += " ORDER BY metric_date"
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_kpi_daily(
+        self,
+        work_center: str | None,
+        date_from: date | str | None,
+        date_to: date | str | None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM production_kpi_daily WHERE 1=1"
+        params: list[Any] = []
+        if work_center:
+            query += " AND work_center = ?"
+            params.append(work_center)
+        if date_from:
+            query += " AND metric_date >= ?"
+            params.append(str(date_from))
+        if date_to:
+            query += " AND metric_date <= ?"
+            params.append(str(date_to))
+        query += " ORDER BY metric_date"
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
 
 
-# (opcjonalnie) wymuś eksport nazw, jeśli gdzieś używasz: from ...repositories import *
-__all__ = [
-    "ProductionDataRepository",
-    "ProjectRepository",
-]
+# =====================================================
+# WC INBOX
+# =====================================================
+
+class WcInboxRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def list_open(self) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "wc_inbox"):
+            return []
+        cur = self.con.execute(
+            """
+            SELECT *
+            FROM wc_inbox
+            WHERE status = 'open'
+            ORDER BY last_seen_date DESC
+            """
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["sources"] = json.loads(r.get("sources") or "[]")
+        return rows
