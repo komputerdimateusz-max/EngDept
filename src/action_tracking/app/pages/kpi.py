@@ -14,6 +14,7 @@ from action_tracking.data.repositories import (
     ActionRepository,
     ChampionRepository,
     EffectivenessRepository,
+    GlobalSettingsRepository,
     ProjectRepository,
     SettingsRepository,
 )
@@ -28,10 +29,13 @@ class ParsedAction:
     action_id: str
     project_id: str | None
     champion_id: str | None
+    category: str | None
     status: str
     created: date
     closed: date | None
     due: date | None
+    manual_savings_amount: float | None
+    manual_savings_currency: str | None
 
 
 def _parse_date(value: Any) -> date | None:
@@ -95,10 +99,13 @@ def _prepare_actions(rows: list[dict[str, Any]]) -> tuple[list[ParsedAction], in
                 action_id=str(row.get("id", "")),
                 project_id=row.get("project_id"),
                 champion_id=row.get("owner_champion_id"),
+                category=row.get("category"),
                 status=str(row.get("status") or ""),
                 created=created,
                 closed=closed,
                 due=due,
+                manual_savings_amount=row.get("manual_savings_amount"),
+                manual_savings_currency=row.get("manual_savings_currency"),
             )
         )
     return parsed, issues
@@ -161,6 +168,7 @@ def render(con: sqlite3.Connection) -> None:
     champion_repo = ChampionRepository(con)
     effectiveness_repo = EffectivenessRepository(con)
     settings_repo = SettingsRepository(con)
+    rules_repo = GlobalSettingsRepository(con)
 
     projects = project_repo.list_projects(include_counts=False)
     champions = champion_repo.list_champions()
@@ -171,7 +179,10 @@ def render(con: sqlite3.Connection) -> None:
     # Filters (no lookback here; fixed 9-week axis)
     project_options = ["Wszystkie"] + [p["id"] for p in projects]
     champion_options = ["(Wszyscy)"] + [c["id"] for c in champions]
-    active_categories = [c["name"] for c in settings_repo.list_action_categories(active_only=True)]
+    active_rule_rows = rules_repo.list_category_rules(include_inactive=False)
+    active_categories = [row["category"] for row in active_rule_rows]
+    if not active_categories:
+        active_categories = [c["name"] for c in settings_repo.list_action_categories(active_only=True)]
     category_options = ["(Wszystkie)"] + active_categories
 
     st.subheader("Filtry")
@@ -521,6 +532,9 @@ def render(con: sqlite3.Connection) -> None:
             continue
         champion_key = action.champion_id or "unassigned"
         stats = _ensure_stats(champion_key)
+        rule = rules_repo.resolve_category_rule(action.category or "")
+        effect_model = rule.get("effect_model")
+        savings_model = rule.get("savings_model")
 
         if _open_at_cutoff(action, cutoff_date):
             stats["open_now"] += 1
@@ -536,13 +550,26 @@ def render(con: sqlite3.Connection) -> None:
             stats["durations"].append((action.closed - action.created).days)
 
             effect_row = ranking_effectiveness.get(action.action_id)
-            if effect_row:
+            metric_expected = None
+            if effect_model == "SCRAP":
+                metric_expected = "scrap_qty"
+            elif effect_model == "OEE":
+                metric_expected = "oee_pct"
+            elif effect_model == "PERFORMANCE":
+                metric_expected = "performance_pct"
+            if effect_row and metric_expected and effect_row.get("metric") == metric_expected:
                 stats["effectiveness_total"] += 1
                 if effect_row.get("classification") in effective_labels:
                     stats["effectiveness_effective"] += 1
+            if savings_model == "AUTO_SCRAP_COST":
                 impact_delta = _impact_delta_pln(effect_row)
                 if impact_delta is not None:
                     stats["impact_pln"] += max(0.0, -impact_delta)
+            elif savings_model == "MANUAL_REQUIRED":
+                manual_amount = action.manual_savings_amount
+                if isinstance(manual_amount, (int, float)):
+                    if (action.manual_savings_currency or "").upper() == "PLN":
+                        stats["impact_pln"] += max(0.0, float(manual_amount))
 
     if show_inactive:
         for champ in champions:
@@ -601,7 +628,7 @@ def render(con: sqlite3.Connection) -> None:
                 "On-time close rate": "—"
                 if on_time_rate is None
                 else f"{on_time_rate:.1%}",
-                "Effective close rate (scrap)": "—"
+                "Effective close rate (wg reguł)": "—"
                 if effectiveness_rate is None
                 else f"{effectiveness_rate:.1%}",
                 "Impact PLN": round(impact_pln, 2),
@@ -673,10 +700,10 @@ def render(con: sqlite3.Connection) -> None:
             f"""
 - Okno zamknięć: **{date_from.isoformat()} → {date_to.isoformat()}**.
 - Cutoff dla otwartych/opóźnionych: **{cutoff_date.isoformat()}**.
-- Impact PLN to suma **max(0, -Δ scrap)** z `action_effectiveness` (ujemna delta oznacza oszczędność).
+- Impact PLN: automatycznie z `action_effectiveness` (AUTO_SCRAP_COST) lub z oszczędności manualnych.
 - Składowe score:
   - Impact: `40 × clamp(impact / {IMPACT_TARGET_PLN})`
-  - Effectiveness: `25 × skuteczność scrap`
+  - Effectiveness: `25 × skuteczność wg reguł kategorii`
   - Timeliness: `20 × on-time close rate`
   - Delivery: `15 × clamp(closed / {CLOSE_TARGET})`
   - Overdue penalty: `15 × clamp(overdue / {OVERDUE_TOLERANCE})`

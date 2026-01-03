@@ -5,7 +5,7 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
-from action_tracking.data.repositories import SettingsRepository
+from action_tracking.data.repositories import GlobalSettingsRepository, SettingsRepository
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -13,6 +13,7 @@ def render(con: sqlite3.Connection) -> None:
     st.caption("Zarządzaj globalnymi słownikami dla aplikacji.")
 
     repo = SettingsRepository(con)
+    rules_repo = GlobalSettingsRepository(con)
 
     st.subheader("Kategorie akcji")
     categories = repo.list_action_categories(active_only=False)
@@ -81,3 +82,88 @@ def render(con: sqlite3.Connection) -> None:
             repo.deactivate_action_category(selected["id"])
             st.success("Kategoria została dezaktywowana.")
             st.rerun()
+
+    st.divider()
+    st.subheader("Reguły kategorii akcji (effectiveness + savings)")
+    rules = rules_repo.list_category_rules(include_inactive=True)
+    if not rules:
+        st.info("Brak zdefiniowanych reguł kategorii.")
+    else:
+        rules_df = pd.DataFrame(rules)
+        rules_df = rules_df[
+            ["category", "effect_model", "savings_model", "requires_scope_link", "is_active"]
+        ].rename(
+            columns={
+                "category": "Kategoria",
+                "effect_model": "Model skuteczności",
+                "savings_model": "Model oszczędności",
+                "requires_scope_link": "Wymaga WC",
+                "is_active": "Aktywna",
+            }
+        )
+        st.dataframe(rules_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Edytor reguły kategorii")
+    category_names = sorted({row["name"] for row in categories} | {row["category"] for row in rules})
+    if not category_names:
+        st.caption("Brak kategorii do konfiguracji.")
+    else:
+        selected_category = st.selectbox("Kategoria", category_names)
+        selected_rule = rules_repo.resolve_category_rule(selected_category)
+        effect_options = ["SCRAP", "OEE", "PERFORMANCE", "NONE"]
+        savings_options = ["AUTO_SCRAP_COST", "MANUAL_REQUIRED", "AUTO_TIME_TO_PLN", "NONE"]
+        with st.form("edit_category_rule"):
+            effect_model = st.selectbox(
+                "Model skuteczności",
+                effect_options,
+                index=effect_options.index(selected_rule.get("effect_model") or "NONE"),
+            )
+            savings_model = st.selectbox(
+                "Model oszczędności",
+                savings_options,
+                index=savings_options.index(selected_rule.get("savings_model") or "NONE"),
+            )
+            requires_scope_link = st.checkbox(
+                "Wymaga powiązania z projektem (WC)",
+                value=bool(selected_rule.get("requires_scope_link")),
+            )
+            is_active = st.checkbox(
+                "Aktywna",
+                value=bool(selected_rule.get("is_active")),
+            )
+            description = st.text_area(
+                "Opis metodologii",
+                value=selected_rule.get("description") or "",
+                max_chars=500,
+            )
+            submitted_rule = st.form_submit_button("Zapisz regułę")
+            if submitted_rule:
+                try:
+                    rules_repo.upsert_category_rule(
+                        selected_category,
+                        {
+                            "effect_model": effect_model,
+                            "savings_model": savings_model,
+                            "requires_scope_link": requires_scope_link,
+                            "is_active": is_active,
+                            "description": description,
+                        },
+                    )
+                    st.success("Zapisano regułę kategorii.")
+                    st.rerun()
+                except (ValueError, sqlite3.Error) as exc:
+                    st.error(str(exc))
+
+    with st.expander("Metodologia (dla użytkowników)", expanded=False):
+        if not rules:
+            st.caption("Brak opisów metodologii.")
+        else:
+            for rule in rules:
+                st.markdown(f"**{rule['category']}**: {rule.get('description') or 'Brak opisu.'}")
+        st.markdown(
+            """
+- Okno bazowe i po zmianie obejmuje ostatnie 14 dni przed/po zamknięciu akcji.
+- Brak powiązania z projektem lub work center może uniemożliwić automatyczną ocenę.
+- Wyceny oszczędności automatycznych w v1 są w PLN, a ręczne wprowadzamy jako PLN/EUR.
+"""
+        )

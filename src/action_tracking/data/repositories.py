@@ -21,6 +21,82 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
     return cur.fetchone() is not None
 
 
+DEFAULT_CATEGORY_RULES: dict[str, dict[str, Any]] = {
+    "Scrap reduction": {
+        "effect_model": "SCRAP",
+        "savings_model": "AUTO_SCRAP_COST",
+        "requires_scope_link": True,
+        "is_active": True,
+        "description": "Automatyczna ocena redukcji złomu i oszczędności kosztu scrapu.",
+    },
+    "OEE improvement": {
+        "effect_model": "OEE",
+        "savings_model": "NONE",
+        "requires_scope_link": True,
+        "is_active": True,
+        "description": "Ocena zmian OEE na podstawie danych produkcyjnych (bez wyceny PLN).",
+    },
+    "Cost savings": {
+        "effect_model": "NONE",
+        "savings_model": "MANUAL_REQUIRED",
+        "requires_scope_link": False,
+        "is_active": True,
+        "description": "Oszczędności wprowadzane ręcznie przez właściciela akcji.",
+    },
+    "Vave": {
+        "effect_model": "NONE",
+        "savings_model": "MANUAL_REQUIRED",
+        "requires_scope_link": False,
+        "is_active": True,
+        "description": "Oszczędności VAVE wprowadzane ręcznie przez właściciela akcji.",
+    },
+    "PDP": {
+        "effect_model": "NONE",
+        "savings_model": "NONE",
+        "requires_scope_link": False,
+        "is_active": True,
+        "description": "Brak automatycznych obliczeń; rezultat opisujemy w treści akcji.",
+    },
+    "Development": {
+        "effect_model": "NONE",
+        "savings_model": "NONE",
+        "requires_scope_link": False,
+        "is_active": True,
+        "description": "Akcja rozwojowa bez automatycznych KPI i wyceny oszczędności.",
+    },
+}
+
+
+def _default_category_rule(category: str) -> dict[str, Any]:
+    base = DEFAULT_CATEGORY_RULES.get(category)
+    if base:
+        return {
+            "category": category,
+            "effect_model": base["effect_model"],
+            "savings_model": base["savings_model"],
+            "requires_scope_link": bool(base["requires_scope_link"]),
+            "is_active": bool(base["is_active"]),
+            "description": base.get("description"),
+            "updated_at": None,
+        }
+    return {
+        "category": category,
+        "effect_model": "NONE",
+        "savings_model": "NONE",
+        "requires_scope_link": False,
+        "is_active": True,
+        "description": "Brak zdefiniowanej metodologii dla tej kategorii.",
+        "updated_at": None,
+    }
+
+
+def _default_category_rules_list(include_inactive: bool) -> list[dict[str, Any]]:
+    rules = [_default_category_rule(category) for category in DEFAULT_CATEGORY_RULES]
+    if include_inactive:
+        return rules
+    return [rule for rule in rules if rule.get("is_active")]
+
+
 class SettingsRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
@@ -127,6 +203,143 @@ class SettingsRepository:
             params.append(exclude_id)
         cur = self.con.execute(query, params)
         return cur.fetchone() is not None
+
+
+class GlobalSettingsRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def list_category_rules(self, include_inactive: bool = False) -> list[dict[str, Any]]:
+        try:
+            if not _table_exists(self.con, "category_rules"):
+                return _default_category_rules_list(include_inactive)
+            query = """
+                SELECT category,
+                       effect_model,
+                       savings_model,
+                       requires_scope_link,
+                       is_active,
+                       description,
+                       updated_at
+                FROM category_rules
+            """
+            params: list[Any] = []
+            if not include_inactive:
+                query += " WHERE is_active = 1"
+            query += " ORDER BY category ASC"
+            cur = self.con.execute(query, params)
+            rows = [self._normalize_rule_row(dict(row)) for row in cur.fetchall()]
+            if not rows:
+                return _default_category_rules_list(include_inactive)
+            return rows
+        except sqlite3.Error:
+            return _default_category_rules_list(include_inactive)
+
+    def get_category_rule(self, category: str) -> dict[str, Any] | None:
+        if not category:
+            return None
+        try:
+            if not _table_exists(self.con, "category_rules"):
+                return None
+            cur = self.con.execute(
+                """
+                SELECT category,
+                       effect_model,
+                       savings_model,
+                       requires_scope_link,
+                       is_active,
+                       description,
+                       updated_at
+                FROM category_rules
+                WHERE category = ?
+                """,
+                (category,),
+            )
+            row = cur.fetchone()
+            return self._normalize_rule_row(dict(row)) if row else None
+        except sqlite3.Error:
+            return None
+
+    def upsert_category_rule(self, category: str, payload: dict[str, Any]) -> None:
+        clean_category = (category or "").strip()
+        if not clean_category:
+            raise ValueError("Nazwa kategorii jest wymagana.")
+        rule = self._normalize_rule_payload(clean_category, payload)
+        self.con.execute(
+            """
+            INSERT INTO category_rules (
+                category,
+                effect_model,
+                savings_model,
+                requires_scope_link,
+                is_active,
+                description,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(category) DO UPDATE SET
+                effect_model = excluded.effect_model,
+                savings_model = excluded.savings_model,
+                requires_scope_link = excluded.requires_scope_link,
+                is_active = excluded.is_active,
+                description = excluded.description,
+                updated_at = excluded.updated_at
+            """,
+            (
+                rule["category"],
+                rule["effect_model"],
+                rule["savings_model"],
+                1 if rule["requires_scope_link"] else 0,
+                1 if rule["is_active"] else 0,
+                rule.get("description"),
+                rule["updated_at"],
+            ),
+        )
+        self.con.commit()
+
+    def set_category_active(self, category: str, is_active: bool) -> None:
+        clean_category = (category or "").strip()
+        if not clean_category:
+            return
+        rule = self.get_category_rule(clean_category)
+        if rule:
+            self.con.execute(
+                """
+                UPDATE category_rules
+                SET is_active = ?, updated_at = ?
+                WHERE category = ?
+                """,
+                (1 if is_active else 0, datetime.now(timezone.utc).isoformat(), clean_category),
+            )
+            self.con.commit()
+            return
+        default_rule = _default_category_rule(clean_category)
+        default_rule["is_active"] = bool(is_active)
+        self.upsert_category_rule(clean_category, default_rule)
+
+    def resolve_category_rule(self, category: str) -> dict[str, Any]:
+        rule = self.get_category_rule(category)
+        if rule:
+            return rule
+        return _default_category_rule(category)
+
+    def _normalize_rule_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        row["requires_scope_link"] = bool(row.get("requires_scope_link"))
+        row["is_active"] = bool(row.get("is_active"))
+        return row
+
+    def _normalize_rule_payload(self, category: str, payload: dict[str, Any]) -> dict[str, Any]:
+        description = (payload.get("description") or "").strip() or None
+        if description and len(description) > 500:
+            raise ValueError("Opis metodologii nie może przekraczać 500 znaków.")
+        return {
+            "category": category,
+            "effect_model": payload.get("effect_model") or "NONE",
+            "savings_model": payload.get("savings_model") or "NONE",
+            "requires_scope_link": bool(payload.get("requires_scope_link")),
+            "is_active": bool(payload.get("is_active", True)),
+            "description": description,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 class ActionRepository:
@@ -269,7 +482,10 @@ class ActionRepository:
                    status,
                    created_at,
                    due_date,
-                   closed_at
+                   closed_at,
+                   manual_savings_amount,
+                   manual_savings_currency,
+                   manual_savings_note
             FROM actions
             WHERE created_at IS NOT NULL
         """
@@ -377,8 +593,11 @@ class ActionRepository:
                 closed_at,
                 impact_type,
                 impact_value,
-                category
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                category,
+                manual_savings_amount,
+                manual_savings_currency,
+                manual_savings_note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["id"],
@@ -394,6 +613,9 @@ class ActionRepository:
                 payload["impact_type"],
                 payload["impact_value"],
                 payload["category"],
+                payload["manual_savings_amount"],
+                payload["manual_savings_currency"],
+                payload["manual_savings_note"],
             ),
         )
         self._log_changelog(
@@ -425,7 +647,10 @@ class ActionRepository:
                 closed_at = ?,
                 impact_type = ?,
                 impact_value = ?,
-                category = ?
+                category = ?,
+                manual_savings_amount = ?,
+                manual_savings_currency = ?,
+                manual_savings_note = ?
             WHERE id = ?
             """,
             (
@@ -441,6 +666,9 @@ class ActionRepository:
                 payload["impact_type"],
                 payload["impact_value"],
                 payload["category"],
+                payload["manual_savings_amount"],
+                payload["manual_savings_currency"],
+                payload["manual_savings_note"],
                 action_id,
             ),
         )
@@ -478,6 +706,9 @@ class ActionRepository:
             "impact_type",
             "impact_value",
             "category",
+            "manual_savings_amount",
+            "manual_savings_currency",
+            "manual_savings_note",
         ]
         merged: dict[str, Any] = {}
         for field in fields:
@@ -538,6 +769,20 @@ class ActionRepository:
         else:
             closed_at = None
 
+        manual_savings_amount = data.get("manual_savings_amount")
+        if manual_savings_amount in ("", None):
+            manual_savings_amount = None
+        else:
+            try:
+                manual_savings_amount = float(manual_savings_amount)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Nieprawidłowa wartość oszczędności manualnych.") from exc
+
+        manual_savings_currency = (data.get("manual_savings_currency") or "").strip() or None
+        manual_savings_note = (data.get("manual_savings_note") or "").strip() or None
+        if manual_savings_note and len(manual_savings_note) > 500:
+            raise ValueError("Uzasadnienie oszczędności nie może przekraczać 500 znaków.")
+
         return {
             "id": action_id,
             "project_id": project_id,
@@ -552,12 +797,15 @@ class ActionRepository:
             "impact_type": data.get("impact_type"),
             "impact_value": data.get("impact_value"),
             "category": category,
+            "manual_savings_amount": manual_savings_amount,
+            "manual_savings_currency": manual_savings_currency,
+            "manual_savings_note": manual_savings_note,
         }
 
     def _list_active_action_categories(self) -> list[str]:
-        settings_repo = SettingsRepository(self.con)
-        categories = settings_repo.list_action_categories(active_only=True)
-        return [row["name"] for row in categories]
+        rules_repo = GlobalSettingsRepository(self.con)
+        categories = rules_repo.list_category_rules(include_inactive=False)
+        return [row["category"] for row in categories]
 
     def _parse_date(self, value: Any, field_name: str) -> date:
         if isinstance(value, date) and not isinstance(value, datetime):

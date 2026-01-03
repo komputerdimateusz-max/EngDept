@@ -161,3 +161,98 @@ def compute_scrap_effectiveness(
         "pct_change": pct_change,
         "classification": classification,
     }
+
+
+def compute_kpi_effectiveness(
+    action: dict[str, Any],
+    work_centers: list[str],
+    kpi_rows: list[dict[str, Any]],
+    metric_key: str,
+    threshold: float = 0.05,
+) -> dict[str, Any] | None:
+    closed_date = parse_date(action.get("closed_at"))
+    if closed_date is None:
+        return None
+
+    baseline_from = closed_date - timedelta(days=14)
+    baseline_to = closed_date - timedelta(days=1)
+    after_from = closed_date + timedelta(days=1)
+    after_to = closed_date + timedelta(days=14)
+
+    computed_at = datetime.now(timezone.utc).isoformat()
+    base_payload = {
+        "metric": metric_key,
+        "baseline_from": baseline_from.isoformat(),
+        "baseline_to": baseline_to.isoformat(),
+        "after_from": after_from.isoformat(),
+        "after_to": after_to.isoformat(),
+        "baseline_days": 0,
+        "after_days": 0,
+        "baseline_avg": None,
+        "after_avg": None,
+        "delta": None,
+        "pct_change": None,
+        "classification": "unknown",
+        "computed_at": computed_at,
+    }
+
+    if not work_centers:
+        return base_payload
+
+    daily_values: dict[date, list[float]] = defaultdict(list)
+    for row in kpi_rows:
+        metric_date = parse_date(row.get("metric_date"))
+        if metric_date is None:
+            continue
+        value = row.get(metric_key)
+        if value is None:
+            continue
+        try:
+            daily_values[metric_date].append(float(value))
+        except (TypeError, ValueError):
+            continue
+
+    def _window_stats(start: date, end: date) -> tuple[int, float | None]:
+        dates = [d for d in daily_values if start <= d <= end]
+        if not dates:
+            return 0, None
+        averages = [sum(daily_values[d]) / len(daily_values[d]) for d in dates]
+        return len(averages), sum(averages) / len(averages)
+
+    baseline_days, baseline_avg = _window_stats(baseline_from, baseline_to)
+    after_days, after_avg = _window_stats(after_from, after_to)
+
+    delta = None
+    if baseline_avg is not None and after_avg is not None:
+        delta = after_avg - baseline_avg
+
+    pct_change = None
+    classification = "insufficient_data"
+    if baseline_days >= 5 and after_days >= 5:
+        if baseline_avg in (None, 0):
+            if after_avg in (None, 0):
+                classification = "no_change"
+            else:
+                classification = "effective"
+        else:
+            pct_change = (after_avg - baseline_avg) / baseline_avg
+            if pct_change >= threshold:
+                classification = "effective"
+            elif pct_change <= -threshold:
+                classification = "worse"
+            else:
+                classification = "no_change"
+
+    if pct_change is None and baseline_avg not in (None, 0) and after_avg is not None:
+        pct_change = (after_avg - baseline_avg) / baseline_avg
+
+    return {
+        **base_payload,
+        "baseline_days": baseline_days,
+        "after_days": after_days,
+        "baseline_avg": baseline_avg,
+        "after_avg": after_avg,
+        "delta": delta,
+        "pct_change": pct_change,
+        "classification": classification,
+    }
