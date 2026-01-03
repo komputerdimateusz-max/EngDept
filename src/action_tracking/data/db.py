@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS actions (
   owner_champion_id TEXT,
   priority TEXT NOT NULL DEFAULT 'med',
   status TEXT NOT NULL DEFAULT 'open',
+  is_draft INTEGER NOT NULL DEFAULT 0,
   due_date TEXT,
   created_at TEXT,
   closed_at TEXT,
@@ -53,6 +54,10 @@ CREATE TABLE IF NOT EXISTS actions (
   manual_savings_amount REAL,
   manual_savings_currency TEXT,
   manual_savings_note TEXT,
+  source TEXT,
+  source_message_id TEXT UNIQUE,
+  submitted_by_email TEXT,
+  submitted_at TEXT,
   FOREIGN KEY(project_id) REFERENCES projects(id),
   FOREIGN KEY(owner_champion_id) REFERENCES champions(id)
 );
@@ -457,6 +462,26 @@ def _migrate_to_v10(con: sqlite3.Connection) -> None:
     _set_user_version(con, 10)
 
 
+def _migrate_to_v11(con: sqlite3.Connection) -> None:
+    if not _column_exists(con, "actions", "is_draft"):
+        con.execute("ALTER TABLE actions ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0;")
+    if not _column_exists(con, "actions", "source"):
+        con.execute("ALTER TABLE actions ADD COLUMN source TEXT;")
+    if not _column_exists(con, "actions", "source_message_id"):
+        con.execute("ALTER TABLE actions ADD COLUMN source_message_id TEXT;")
+    if not _column_exists(con, "actions", "submitted_by_email"):
+        con.execute("ALTER TABLE actions ADD COLUMN submitted_by_email TEXT;")
+    if not _column_exists(con, "actions", "submitted_at"):
+        con.execute("ALTER TABLE actions ADD COLUMN submitted_at TEXT;")
+    con.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_source_message_id
+        ON actions (source_message_id);
+        """
+    )
+    _set_user_version(con, 11)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "action_categories"):
         return
@@ -580,6 +605,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v9(con)
     if current_version < 10:
         _migrate_to_v10(con)
+    if current_version < 11:
+        _migrate_to_v11(con)
     _seed_action_categories(con)
     _seed_category_rules(con)
     con.commit()

@@ -40,6 +40,7 @@ FIELD_LABELS: dict[str, str] = {
     "manual_savings_amount": "Oszczędności ręczne (kwota)",
     "manual_savings_currency": "Oszczędności ręczne (waluta)",
     "manual_savings_note": "Oszczędności ręczne (opis)",
+    "is_draft": "Szkic",
 }
 
 
@@ -113,7 +114,9 @@ def render(con: sqlite3.Connection) -> None:
         active_categories = [c["name"] for c in settings_repo.list_action_categories(active_only=True)]
     category_options = ["(Wszystkie)"] + active_categories
 
-    col1, col2, col3, col4, col5, col6 = st.columns([1.2, 1.6, 1.6, 1.6, 1.1, 1.6])
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(
+        [1.2, 1.6, 1.6, 1.6, 1.2, 1.1, 1.6]
+    )
     selected_status = col1.selectbox("Status", status_options, index=0)
     selected_project = col2.selectbox(
         "Projekt",
@@ -132,18 +135,27 @@ def render(con: sqlite3.Connection) -> None:
         else champion_names.get(cid, cid),
     )
     selected_category = col4.selectbox("Kategoria", category_options, index=0)
-    overdue_only = col5.checkbox("Tylko po terminie")
-    search_text = col6.text_input("Szukaj (tytuł)")
+    draft_options = ["Pokaż szkice", "Tylko szkice", "Ukryj szkice"]
+    selected_draft_filter = col5.selectbox("Szkice", draft_options, index=0)
+    overdue_only = col6.checkbox("Tylko po terminie")
+    search_text = col7.text_input("Szukaj (tytuł)")
 
     status_filter = None if selected_status == "(Wszystkie)" else selected_status
     project_filter = None if selected_project == "Wszystkie" else selected_project
     champion_filter = None if selected_champion == "(Wszyscy)" else selected_champion
     category_filter = None if selected_category == "(Wszystkie)" else selected_category
+    if selected_draft_filter == "Tylko szkice":
+        draft_filter = True
+    elif selected_draft_filter == "Ukryj szkice":
+        draft_filter = False
+    else:
+        draft_filter = None
 
     rows = repo.list_actions(
         status=status_filter,
         project_id=project_filter,
         champion_id=champion_filter,
+        is_draft=draft_filter,
         overdue_only=overdue_only,
         search_text=search_text or None,
     )
@@ -264,6 +276,7 @@ def render(con: sqlite3.Connection) -> None:
         table_rows.append(
             {
                 "Krótka nazwa": row.get("title"),
+                "Szkic": "tak" if row.get("is_draft") else "nie",
                 "Kategoria": row.get("category"),
                 "Projekt": project_names.get(row.get("project_id"), row.get("project_name")),
                 "Owner": owner or "—",
@@ -298,6 +311,7 @@ def render(con: sqlite3.Connection) -> None:
 
     editing = selected_action != "(nowa)"
     selected = actions_by_id.get(selected_action, {}) if editing else {}
+    is_draft = bool(selected.get("is_draft"))
 
     due_date_value = None
     if selected.get("due_date"):
@@ -306,171 +320,336 @@ def render(con: sqlite3.Connection) -> None:
         except ValueError:
             due_date_value = None
 
-    with st.form("action_form"):
-        title = st.text_input(
-            "Krótka nazwa",
-            value=selected.get("title", ""),
-            max_chars=20,
-        )
-        description = st.text_area(
-            "Opis",
-            value=selected.get("description", "") or "",
-            max_chars=500,
-        )
-        selected_category = selected.get("category")
-        category_options_form = list(active_categories)
-        legacy_category = None
-        if selected_category and selected_category not in active_categories:
-            legacy_category = selected_category
-            category_options_form.append(selected_category)
-
-        def _format_category_option(option: str) -> str:
-            if legacy_category and option == legacy_category:
-                return f"(legacy: {option})"
-            return option
-
-        category = st.selectbox(
-            "Kategoria",
-            category_options_form,
-            index=category_options_form.index(selected_category)
-            if selected_category in category_options_form
-            else 0,
-            format_func=_format_category_option,
-        )
-        rule = rules_repo.resolve_category_rule(category)
-        st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
-        st.caption(
-            "Metoda obliczeń: "
-            f"Skuteczność = {rule.get('effect_model')}, "
-            f"Oszczędności = {rule.get('savings_model')}, "
-            f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
-        )
-
-        project_ids = [p["id"] for p in projects]
-        project_id = st.selectbox(
-            "Projekt",
-            project_ids,
-            index=project_ids.index(selected.get("project_id"))
-            if selected.get("project_id") in project_ids
-            else 0,
-            format_func=lambda pid: project_names.get(pid, pid),
-        )
-
-        owner_options = ["(brak)"] + [c["id"] for c in champions]
-        owner_default = (
-            owner_options.index(selected.get("owner_champion_id"))
-            if selected.get("owner_champion_id") in owner_options
-            else 0
-        )
-        owner_champion = st.selectbox(
-            "Owner champion",
-            owner_options,
-            index=owner_default,
-            format_func=lambda cid: cid
-            if cid == "(brak)"
-            else champion_names.get(cid, cid),
-        )
-
-        priority_options = ["low", "med", "high"]
-        priority = st.selectbox(
-            "Priorytet",
-            priority_options,
-            index=priority_options.index(selected.get("priority"))
-            if selected.get("priority") in priority_options
-            else 1,
-        )
-
-        status_options_form = ["open", "in_progress", "blocked", "done", "cancelled"]
-        status = st.selectbox(
-            "Status",
-            status_options_form,
-            index=status_options_form.index(selected.get("status"))
-            if selected.get("status") in status_options_form
-            else 0,
-        )
-
-        no_due_date = st.checkbox(
-            "Brak terminu",
-            value=due_date_value is None,
-        )
-        due_date = st.date_input(
-            "Termin",
-            value=due_date_value or date.today(),
-            disabled=no_due_date,
-        )
-
-        manual_required = rule.get("savings_model") == "MANUAL_REQUIRED"
-        manual_amount = None
-        manual_currency = None
-        manual_note = ""
-        if manual_required:
-            st.subheader("Oszczędności manualne")
-            manual_amount = st.number_input(
-                "Kwota oszczędności",
-                min_value=0.0,
-                value=float(selected.get("manual_savings_amount") or 0.0),
-                step=100.0,
+    if editing and is_draft:
+        st.info("Wybrana akcja jest szkicem. Uzupełnij wymagane pola, aby ją zakończyć.")
+        with st.form("complete_draft_form"):
+            title = st.text_input(
+                "Krótka nazwa",
+                value=selected.get("title", ""),
+                max_chars=20,
             )
-            manual_currency = st.selectbox(
-                "Waluta",
-                ["PLN", "EUR"],
-                index=0
-                if (selected.get("manual_savings_currency") or "PLN") == "PLN"
-                else 1,
-            )
-            manual_note = st.text_area(
-                "Uzasadnienie oszczędności",
-                value=selected.get("manual_savings_note") or "",
+            description = st.text_area(
+                "Opis",
+                value=selected.get("description", "") or "",
                 max_chars=500,
             )
+            selected_category = selected.get("category")
+            category_options_form = list(active_categories)
+            legacy_category = None
+            if selected_category and selected_category not in active_categories:
+                legacy_category = selected_category
+                category_options_form.append(selected_category)
 
-        st.caption("Zmiana statusu na inny niż 'done' czyści datę zamknięcia.")
-        submitted = st.form_submit_button("Zapisz")
+            def _format_category_option(option: str) -> str:
+                if legacy_category and option == legacy_category:
+                    return f"(legacy: {option})"
+                return option
 
-    if submitted:
-        if category not in active_categories and category != selected.get("category"):
-            st.error("Wybierz aktywną kategorię akcji.")
-            return
-        if rule.get("requires_scope_link"):
-            project = projects_by_id.get(project_id)
-            if not project or not str(project.get("work_center") or "").strip():
-                st.error(
-                    "Ta kategoria wymaga powiązania z projektem posiadającym work center."
+            category = st.selectbox(
+                "Kategoria",
+                category_options_form,
+                index=category_options_form.index(selected_category)
+                if selected_category in category_options_form
+                else 0,
+                format_func=_format_category_option,
+            )
+            rule = rules_repo.resolve_category_rule(category)
+            st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
+            st.caption(
+                "Metoda obliczeń: "
+                f"Skuteczność = {rule.get('effect_model')}, "
+                f"Oszczędności = {rule.get('savings_model')}, "
+                f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
+            )
+
+            project_ids = [p["id"] for p in projects]
+            project_id = st.selectbox(
+                "Projekt",
+                project_ids,
+                index=project_ids.index(selected.get("project_id"))
+                if selected.get("project_id") in project_ids
+                else 0,
+                format_func=lambda pid: project_names.get(pid, pid),
+            )
+
+            owner_options = ["(brak)"] + [c["id"] for c in champions]
+            owner_default = (
+                owner_options.index(selected.get("owner_champion_id"))
+                if selected.get("owner_champion_id") in owner_options
+                else 0
+            )
+            owner_champion = st.selectbox(
+                "Owner champion",
+                owner_options,
+                index=owner_default,
+                format_func=lambda cid: cid
+                if cid == "(brak)"
+                else champion_names.get(cid, cid),
+            )
+
+            priority_options = ["low", "med", "high"]
+            priority = st.selectbox(
+                "Priorytet",
+                priority_options,
+                index=priority_options.index(selected.get("priority"))
+                if selected.get("priority") in priority_options
+                else 1,
+            )
+
+            status_options_form = ["open", "in_progress", "blocked", "done", "cancelled"]
+            status = st.selectbox(
+                "Status",
+                status_options_form,
+                index=status_options_form.index(selected.get("status"))
+                if selected.get("status") in status_options_form
+                else 0,
+            )
+
+            no_due_date = st.checkbox(
+                "Brak terminu",
+                value=due_date_value is None,
+            )
+            due_date = st.date_input(
+                "Termin",
+                value=due_date_value or date.today(),
+                disabled=no_due_date,
+            )
+
+            manual_required = rule.get("savings_model") == "MANUAL_REQUIRED"
+            manual_amount = None
+            manual_currency = None
+            manual_note = ""
+            if manual_required:
+                st.subheader("Oszczędności manualne")
+                manual_amount = st.number_input(
+                    "Kwota oszczędności",
+                    min_value=0.0,
+                    value=float(selected.get("manual_savings_amount") or 0.0),
+                    step=100.0,
                 )
+                manual_currency = st.selectbox(
+                    "Waluta",
+                    ["PLN", "EUR"],
+                    index=0
+                    if (selected.get("manual_savings_currency") or "PLN") == "PLN"
+                    else 1,
+                )
+                manual_note = st.text_area(
+                    "Uzasadnienie oszczędności",
+                    value=selected.get("manual_savings_note") or "",
+                    max_chars=500,
+                )
+
+            st.caption("Zmiana statusu na inny niż 'done' czyści datę zamknięcia.")
+            submitted = st.form_submit_button("Zakończ draft")
+
+        if submitted:
+            if category not in active_categories and category != selected.get("category"):
+                st.error("Wybierz aktywną kategorię akcji.")
                 return
-        if manual_required:
-            if manual_amount is None:
-                st.error("Podaj kwotę oszczędności manualnych.")
-                return
-            if not manual_currency:
-                st.error("Wybierz walutę oszczędności manualnych.")
-                return
-            if not (manual_note or "").strip():
-                st.error("Uzupełnij uzasadnienie oszczędności manualnych.")
-                return
-        payload = {
-            "title": title,
-            "description": description,
-            "category": category,
-            "project_id": project_id,
-            "owner_champion_id": None if owner_champion == "(brak)" else owner_champion,
-            "priority": priority,
-            "status": status,
-            "due_date": None if no_due_date else due_date.isoformat(),
-            "manual_savings_amount": manual_amount if manual_required else None,
-            "manual_savings_currency": manual_currency if manual_required else None,
-            "manual_savings_note": manual_note if manual_required else None,
-        }
-        try:
-            if editing:
+            if rule.get("requires_scope_link"):
+                project = projects_by_id.get(project_id)
+                if not project or not str(project.get("work_center") or "").strip():
+                    st.error(
+                        "Ta kategoria wymaga powiązania z projektem posiadającym work center."
+                    )
+                    return
+            if manual_required:
+                if manual_amount is None:
+                    st.error("Podaj kwotę oszczędności manualnych.")
+                    return
+                if not manual_currency:
+                    st.error("Wybierz walutę oszczędności manualnych.")
+                    return
+                if not (manual_note or "").strip():
+                    st.error("Uzupełnij uzasadnienie oszczędności manualnych.")
+                    return
+            payload = {
+                "title": title,
+                "description": description,
+                "category": category,
+                "project_id": project_id,
+                "owner_champion_id": None if owner_champion == "(brak)" else owner_champion,
+                "priority": priority,
+                "status": status,
+                "due_date": None if no_due_date else due_date.isoformat(),
+                "manual_savings_amount": manual_amount if manual_required else None,
+                "manual_savings_currency": manual_currency if manual_required else None,
+                "manual_savings_note": manual_note if manual_required else None,
+                "is_draft": 0,
+            }
+            try:
                 repo.update_action(selected_action, payload)
-                st.success("Akcja zaktualizowana.")
-            else:
-                repo.create_action(payload)
-                st.success("Akcja dodana.")
-            st.rerun()
-        except ValueError as exc:
-            st.error(str(exc))
+                st.success("Draft uzupełniony.")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+    else:
+        with st.form("action_form"):
+            title = st.text_input(
+                "Krótka nazwa",
+                value=selected.get("title", ""),
+                max_chars=20,
+            )
+            description = st.text_area(
+                "Opis",
+                value=selected.get("description", "") or "",
+                max_chars=500,
+            )
+            selected_category = selected.get("category")
+            category_options_form = list(active_categories)
+            legacy_category = None
+            if selected_category and selected_category not in active_categories:
+                legacy_category = selected_category
+                category_options_form.append(selected_category)
+
+            def _format_category_option(option: str) -> str:
+                if legacy_category and option == legacy_category:
+                    return f"(legacy: {option})"
+                return option
+
+            category = st.selectbox(
+                "Kategoria",
+                category_options_form,
+                index=category_options_form.index(selected_category)
+                if selected_category in category_options_form
+                else 0,
+                format_func=_format_category_option,
+            )
+            rule = rules_repo.resolve_category_rule(category)
+            st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
+            st.caption(
+                "Metoda obliczeń: "
+                f"Skuteczność = {rule.get('effect_model')}, "
+                f"Oszczędności = {rule.get('savings_model')}, "
+                f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
+            )
+
+            project_ids = [p["id"] for p in projects]
+            project_id = st.selectbox(
+                "Projekt",
+                project_ids,
+                index=project_ids.index(selected.get("project_id"))
+                if selected.get("project_id") in project_ids
+                else 0,
+                format_func=lambda pid: project_names.get(pid, pid),
+            )
+
+            owner_options = ["(brak)"] + [c["id"] for c in champions]
+            owner_default = (
+                owner_options.index(selected.get("owner_champion_id"))
+                if selected.get("owner_champion_id") in owner_options
+                else 0
+            )
+            owner_champion = st.selectbox(
+                "Owner champion",
+                owner_options,
+                index=owner_default,
+                format_func=lambda cid: cid
+                if cid == "(brak)"
+                else champion_names.get(cid, cid),
+            )
+
+            priority_options = ["low", "med", "high"]
+            priority = st.selectbox(
+                "Priorytet",
+                priority_options,
+                index=priority_options.index(selected.get("priority"))
+                if selected.get("priority") in priority_options
+                else 1,
+            )
+
+            status_options_form = ["open", "in_progress", "blocked", "done", "cancelled"]
+            status = st.selectbox(
+                "Status",
+                status_options_form,
+                index=status_options_form.index(selected.get("status"))
+                if selected.get("status") in status_options_form
+                else 0,
+            )
+
+            no_due_date = st.checkbox(
+                "Brak terminu",
+                value=due_date_value is None,
+            )
+            due_date = st.date_input(
+                "Termin",
+                value=due_date_value or date.today(),
+                disabled=no_due_date,
+            )
+
+            manual_required = rule.get("savings_model") == "MANUAL_REQUIRED"
+            manual_amount = None
+            manual_currency = None
+            manual_note = ""
+            if manual_required:
+                st.subheader("Oszczędności manualne")
+                manual_amount = st.number_input(
+                    "Kwota oszczędności",
+                    min_value=0.0,
+                    value=float(selected.get("manual_savings_amount") or 0.0),
+                    step=100.0,
+                )
+                manual_currency = st.selectbox(
+                    "Waluta",
+                    ["PLN", "EUR"],
+                    index=0
+                    if (selected.get("manual_savings_currency") or "PLN") == "PLN"
+                    else 1,
+                )
+                manual_note = st.text_area(
+                    "Uzasadnienie oszczędności",
+                    value=selected.get("manual_savings_note") or "",
+                    max_chars=500,
+                )
+
+            st.caption("Zmiana statusu na inny niż 'done' czyści datę zamknięcia.")
+            submitted = st.form_submit_button("Zapisz")
+
+        if submitted:
+            if category not in active_categories and category != selected.get("category"):
+                st.error("Wybierz aktywną kategorię akcji.")
+                return
+            if rule.get("requires_scope_link"):
+                project = projects_by_id.get(project_id)
+                if not project or not str(project.get("work_center") or "").strip():
+                    st.error(
+                        "Ta kategoria wymaga powiązania z projektem posiadającym work center."
+                    )
+                    return
+            if manual_required:
+                if manual_amount is None:
+                    st.error("Podaj kwotę oszczędności manualnych.")
+                    return
+                if not manual_currency:
+                    st.error("Wybierz walutę oszczędności manualnych.")
+                    return
+                if not (manual_note or "").strip():
+                    st.error("Uzupełnij uzasadnienie oszczędności manualnych.")
+                    return
+            payload = {
+                "title": title,
+                "description": description,
+                "category": category,
+                "project_id": project_id,
+                "owner_champion_id": None if owner_champion == "(brak)" else owner_champion,
+                "priority": priority,
+                "status": status,
+                "due_date": None if no_due_date else due_date.isoformat(),
+                "manual_savings_amount": manual_amount if manual_required else None,
+                "manual_savings_currency": manual_currency if manual_required else None,
+                "manual_savings_note": manual_note if manual_required else None,
+            }
+            try:
+                if editing:
+                    repo.update_action(selected_action, payload)
+                    st.success("Akcja zaktualizowana.")
+                else:
+                    repo.create_action(payload)
+                    st.success("Akcja dodana.")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
 
     st.subheader("Usuń akcję")
     delete_options = ["(brak)"] + [a["id"] for a in all_actions]
