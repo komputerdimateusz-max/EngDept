@@ -86,6 +86,32 @@ def _format_action_label(action: dict[str, Any], project_names: dict[str, str]) 
     return f"{title} · {project_name} · #{suffix}"
 
 
+def _normalize_savings_model(raw_value: Any) -> str:
+    """
+    Normalize savings model values coming from DB / rules:
+    - strip
+    - upper
+    - replace spaces/dashes with underscore
+    """
+    return (
+        str(raw_value or "")
+        .strip()
+        .upper()
+        .replace(" ", "_")
+        .replace("-", "_")
+    )
+
+
+def _is_manual_required(savings_model_normalized: str) -> bool:
+    """
+    Treat all MANUAL-like variants as manual required:
+    MANUAL_REQUIRED, MANUAL, MANUAL_REQUIRED_X, etc.
+    """
+    if not savings_model_normalized:
+        return False
+    return savings_model_normalized in {"MANUAL_REQUIRED", "MANUAL"} or savings_model_normalized.startswith("MANUAL")
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Akcje")
 
@@ -376,9 +402,9 @@ def render(con: sqlite3.Connection) -> None:
         )
         raw_rule = rules_repo.resolve_category_rule(category) or {}
         rule = raw_rule or _resolve_rule(category, warn=False)
-        savings_model = (
-            rule.get("savings_model") or rule.get("savings_method") or "NONE"
-        ).strip().upper()
+        savings_model = _normalize_savings_model(
+            rule.get("savings_model") or rule.get("savings_method") or rule.get("savings") or rule.get("savings_type")
+        )
         if raw_rule:
             st.info(
                 "Metoda liczenia: "
@@ -456,7 +482,7 @@ def render(con: sqlite3.Connection) -> None:
                 disabled=no_due_date,
             )
 
-            manual_required = savings_model == "MANUAL_REQUIRED"
+            manual_required = _is_manual_required(savings_model)
             if not manual_required:
                 st.session_state.pop("draft_manual_savings_amount", None)
                 st.session_state.pop("draft_manual_savings_currency", None)
@@ -556,9 +582,9 @@ def render(con: sqlite3.Connection) -> None:
         )
         raw_rule = rules_repo.resolve_category_rule(category) or {}
         rule = raw_rule or _resolve_rule(category, warn=False)
-        savings_model = (
-            rule.get("savings_model") or rule.get("savings_method") or "NONE"
-        ).strip().upper()
+        savings_model = _normalize_savings_model(
+            rule.get("savings_model") or rule.get("savings_method") or rule.get("savings") or rule.get("savings_type")
+        )
         if raw_rule:
             st.info(
                 "Metoda liczenia: "
@@ -636,7 +662,7 @@ def render(con: sqlite3.Connection) -> None:
                 disabled=no_due_date,
             )
 
-            manual_required = savings_model == "MANUAL_REQUIRED"
+            manual_required = _is_manual_required(savings_model)
             if not manual_required:
                 st.session_state.pop("action_manual_savings_amount", None)
                 st.session_state.pop("action_manual_savings_currency", None)
