@@ -1001,6 +1001,42 @@ class ChampionRepository:
         self.con.execute("DELETE FROM champions WHERE id = ?", (champion_id,))
         self.con.commit()
 
+    def _get_champion(self, champion_id: str) -> dict[str, Any] | None:
+        cur = self.con.execute(
+            """
+            SELECT *
+            FROM champions
+            WHERE id = ?
+            """,
+            (champion_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def _log_changelog(self, champion_id: str, event_type: str, changes_json: str) -> None:
+        if not _table_exists(self.con, "champion_changelog"):
+            raise sqlite3.OperationalError(
+                "champion_changelog table missing; database migration required"
+            )
+        event_at = datetime.now(timezone.utc).isoformat()
+        self.con.execute(
+            """
+            INSERT INTO champion_changelog (id, champion_id, event_type, event_at, changes_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (str(uuid4()), champion_id, event_type, event_at, changes_json),
+        )
+
+    def _serialize_changes(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _diff_changes(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+        diffs: dict[str, Any] = {}
+        for key, value in after.items():
+            if before.get(key) != value:
+                diffs[key] = {"from": before.get(key), "to": value}
+        return diffs
+
     def set_assigned_projects(self, champion_id: str, project_ids: list[str]) -> None:
         self.con.execute(
             "DELETE FROM champion_projects WHERE champion_id = ?",
@@ -1188,35 +1224,3 @@ class ProductionDataRepository:
         if isinstance(value, date):
             return value.isoformat()
         return value
-
-    def _get_champion(self, champion_id: str) -> dict[str, Any] | None:
-        cur = self.con.execute(
-            """
-            SELECT *
-            FROM champions
-            WHERE id = ?
-            """,
-            (champion_id,),
-        )
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-    def _log_changelog(self, champion_id: str, event_type: str, changes_json: str) -> None:
-        event_at = datetime.now(timezone.utc).isoformat()
-        self.con.execute(
-            """
-            INSERT INTO champion_changelog (id, champion_id, event_type, event_at, changes_json)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (str(uuid4()), champion_id, event_type, event_at, changes_json),
-        )
-
-    def _serialize_changes(self, payload: dict[str, Any]) -> str:
-        return json.dumps(payload, ensure_ascii=False)
-
-    def _diff_changes(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-        diffs: dict[str, Any] = {}
-        for key, value in after.items():
-            if before.get(key) != value:
-                diffs[key] = {"from": before.get(key), "to": value}
-        return diffs
