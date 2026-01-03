@@ -6,6 +6,12 @@ import re
 from typing import Any
 
 
+def normalize_wc(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", value.replace("\u00a0", " ")).strip()
+
+
 def parse_date(value: Any) -> date | None:
     if value in (None, ""):
         return None
@@ -25,21 +31,49 @@ def parse_date(value: Any) -> date | None:
 def parse_work_centers(primary: str | None, related: str | None) -> list[str]:
     centers: list[str] = []
 
-    def _normalize(value: str) -> str:
-        return " ".join(value.replace("\u00a0", " ").split())
-
-    primary_value = _normalize(primary or "")
+    primary_value = normalize_wc(primary)
     if primary_value:
         centers.append(primary_value)
 
     if related:
         tokens = re.split(r"[,;|\n]+", related)
         for token in tokens:
-            center = _normalize(token)
+            center = normalize_wc(token)
             if center and center not in centers:
                 centers.append(center)
 
     return centers
+
+
+def suggest_work_centers(
+    target: str,
+    candidates: list[str],
+    limit: int = 8,
+) -> list[str]:
+    normalized_target = normalize_wc(target)
+    if not normalized_target:
+        return []
+
+    scored: list[tuple[int, int, str]] = []
+    for candidate in candidates:
+        normalized_candidate = normalize_wc(candidate)
+        if not normalized_candidate:
+            continue
+        if normalized_candidate == normalized_target:
+            return [candidate]
+        if normalized_candidate.startswith(normalized_target) or normalized_target.startswith(
+            normalized_candidate
+        ):
+            score = 1
+        elif normalized_target in normalized_candidate:
+            score = 2
+        else:
+            score = 3 + abs(len(normalized_candidate) - len(normalized_target))
+        length_diff = abs(len(normalized_candidate) - len(normalized_target))
+        scored.append((score, length_diff, candidate))
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [candidate for _, _, candidate in scored[:limit]]
 
 
 def compute_scrap_effectiveness(

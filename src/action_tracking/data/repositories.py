@@ -1258,6 +1258,40 @@ class ProductionDataRepository:
         )
         return [row["work_center"] for row in cur.fetchall()]
 
+    def list_distinct_work_centers(self) -> dict[str, list[str]]:
+        scrap_work_centers: list[str] = []
+        kpi_work_centers: list[str] = []
+        try:
+            if _table_exists(self.con, "scrap_daily"):
+                cur = self.con.execute(
+                    """
+                    SELECT DISTINCT work_center
+                    FROM scrap_daily
+                    ORDER BY work_center
+                    """
+                )
+                scrap_work_centers = [row["work_center"] for row in cur.fetchall()]
+        except sqlite3.Error:
+            scrap_work_centers = []
+
+        try:
+            if _table_exists(self.con, "production_kpi_daily"):
+                cur = self.con.execute(
+                    """
+                    SELECT DISTINCT work_center
+                    FROM production_kpi_daily
+                    ORDER BY work_center
+                    """
+                )
+                kpi_work_centers = [row["work_center"] for row in cur.fetchall()]
+        except sqlite3.Error:
+            kpi_work_centers = []
+
+        return {
+            "scrap_work_centers": scrap_work_centers,
+            "kpi_work_centers": kpi_work_centers,
+        }
+
     @staticmethod
     def _normalize_date_filter(value: date | str) -> str:
         if isinstance(value, date):
