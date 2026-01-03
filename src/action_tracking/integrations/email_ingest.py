@@ -19,6 +19,7 @@ from action_tracking.data.repositories import (
     GlobalSettingsRepository,
     SettingsRepository,
 )
+from action_tracking.services.normalize import normalize_key
 
 
 def parse_email_to_draft(message: Message) -> tuple[dict[str, Any] | None, list[str]]:
@@ -78,12 +79,12 @@ def process_inbox(con) -> dict[str, int]:
     settings_repo = SettingsRepository(con)
     rules_repo = GlobalSettingsRepository(con)
 
-    active_categories = [row["category"] for row in rules_repo.list_category_rules()]
+    active_categories = [row["category_label"] for row in rules_repo.get_category_rules()]
     if not active_categories:
         active_categories = [
             row["name"] for row in settings_repo.list_action_categories(active_only=True)
         ]
-    category_map = {name.lower(): name for name in active_categories}
+    category_map = {normalize_key(name): name for name in active_categories}
 
     champions = champion_repo.list_champions()
 
@@ -143,7 +144,7 @@ def process_inbox(con) -> dict[str, int]:
             category = None
             if payload and payload.get("category"):
                 raw_category = payload["category"]
-                category = category_map.get(raw_category.strip().lower())
+                category = category_map.get(normalize_key(raw_category))
                 if not category:
                     errors.append("Nieprawidłowa kategoria akcji.")
 

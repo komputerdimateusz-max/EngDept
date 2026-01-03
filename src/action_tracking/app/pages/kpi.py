@@ -179,8 +179,8 @@ def render(con: sqlite3.Connection) -> None:
     # Filters (no lookback here; fixed 9-week axis)
     project_options = ["Wszystkie"] + [p["id"] for p in projects]
     champion_options = ["(Wszyscy)"] + [c["id"] for c in champions]
-    active_rule_rows = rules_repo.list_category_rules(include_inactive=False)
-    active_categories = [row["category"] for row in active_rule_rows]
+    active_rule_rows = rules_repo.get_category_rules(only_active=True)
+    active_categories = [row["category_label"] for row in active_rule_rows]
     if not active_categories:
         active_categories = [c["name"] for c in settings_repo.list_action_categories(active_only=True)]
     category_options = ["(Wszystkie)"] + active_categories
@@ -533,8 +533,8 @@ def render(con: sqlite3.Connection) -> None:
         champion_key = action.champion_id or "unassigned"
         stats = _ensure_stats(champion_key)
         rule = rules_repo.resolve_category_rule(action.category or "")
-        effect_model = rule.get("effect_model")
-        savings_model = rule.get("savings_model")
+        effect_model = (rule or {}).get("effectiveness_model", "NONE")
+        savings_model = (rule or {}).get("savings_model", "NONE")
 
         if _open_at_cutoff(action, cutoff_date):
             stats["open_now"] += 1

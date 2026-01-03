@@ -181,8 +181,8 @@ def render(con: sqlite3.Connection) -> None:
     project_names = {p["id"]: (p.get("name") or p.get("project_name") or p["id"]) for p in projects}
     champion_names = {c["id"]: (c.get("display_name") or c.get("name") or c["id"]) for c in champions}
 
-    active_rule_rows = rules_repo.list_category_rules(include_inactive=False)
-    active_categories = [row["category"] for row in active_rule_rows]
+    active_rule_rows = rules_repo.get_category_rules(only_active=True)
+    active_categories = [row["category_label"] for row in active_rule_rows]
     if not active_categories:
         active_categories = [c["name"] for c in settings_repo.list_action_categories(active_only=True)]
 
@@ -248,8 +248,8 @@ def render(con: sqlite3.Connection) -> None:
         stats = _ensure_stats(champion_key)
 
         rule = rules_repo.resolve_category_rule(action.category or "")
-        savings_model = rule.get("savings_model")
-        requires_scope = bool(rule.get("requires_scope_link"))
+        savings_model = (rule or {}).get("savings_model", "NONE")
+        requires_scope = bool((rule or {}).get("requires_scope_link"))
 
         if requires_scope and not action.project_id:
             stats["missing_scope"] += 1
