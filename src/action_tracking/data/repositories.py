@@ -919,6 +919,101 @@ class ActionRepository:
         self.con.commit()
         return action_id
 
+    # ============================
+    # ✅ MISSING METHODS (FIX)
+    # ============================
+
+    def update_action(self, action_id: str, data: dict[str, Any]) -> None:
+        """
+        Update action row in DB.
+        Keeps created_at stable unless explicitly provided.
+        Enforces closed_at logic consistent with _normalize_action_payload:
+          - status == 'done' => closed_at set (default today)
+          - else => closed_at cleared
+        """
+        if not action_id:
+            raise ValueError("action_id is required")
+        if not _table_exists(self.con, "actions"):
+            raise ValueError("actions table missing")
+
+        cur = self.con.execute("SELECT * FROM actions WHERE id = ?", (action_id,))
+        existing_row = cur.fetchone()
+        if not existing_row:
+            raise ValueError("Action not found")
+
+        existing = dict(existing_row)
+
+        # Preserve created_at unless user explicitly passes it
+        merged: dict[str, Any] = dict(existing)
+        merged.update(data or {})
+        if "created_at" not in (data or {}) or not (data or {}).get("created_at"):
+            merged["created_at"] = existing.get("created_at") or date.today().isoformat()
+
+        payload = self._normalize_action_payload(action_id, merged)
+
+        # Build UPDATE dynamically
+        allowed_cols = [
+            "project_id",
+            "title",
+            "description",
+            "owner_champion_id",
+            "priority",
+            "status",
+            "is_draft",
+            "due_date",
+            "created_at",
+            "closed_at",
+            "impact_type",
+            "impact_value",
+            "impact_aspects",
+            "category",
+            "manual_savings_amount",
+            "manual_savings_currency",
+            "manual_savings_note",
+            "source",
+            "source_message_id",
+            "submitted_by_email",
+            "submitted_at",
+        ]
+
+        sets: list[str] = []
+        params: list[Any] = []
+        for col in allowed_cols:
+            if col in payload:
+                sets.append(f"{col} = ?")
+                params.append(payload.get(col))
+
+        if not sets:
+            return
+
+        params.append(action_id)
+        sql = f"UPDATE actions SET {', '.join(sets)} WHERE id = ?"
+        self.con.execute(sql, params)
+        self.con.commit()
+
+    def delete_action(self, action_id: str) -> None:
+        if not action_id:
+            return
+        if not _table_exists(self.con, "actions"):
+            return
+        self.con.execute("DELETE FROM actions WHERE id = ?", (action_id,))
+        self.con.commit()
+
+    def list_action_changelog(
+        self, limit: int = 50, project_id: str | None = None, action_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """
+        UI in actions.py calls list_action_changelog(...).
+        Under the hood we use generic reader.
+        Note: project_id filter is ignored here unless your changelog schema supports it.
+        """
+        _ = project_id  # reserved for future filtering
+        return self.list_changelog(limit=limit, action_id=action_id)
+
+    # ============================
+    # Existing logic
+    # ============================
+
     def _normalize_action_payload(self, action_id: str, data: dict[str, Any]) -> dict[str, Any]:
         created_at = data.get("created_at") or date.today().isoformat()
         created_date = self._parse_date(created_at, "created_at")
