@@ -15,7 +15,11 @@ from action_tracking.data.repositories import (
     ProjectRepository,
 )
 from action_tracking.domain.constants import PROJECT_TYPES
-from action_tracking.services.effectiveness import parse_work_centers
+from action_tracking.services.effectiveness import (
+    normalize_wc,
+    parse_work_centers,
+    suggest_work_centers,
+)
 
 
 FIELD_LABELS = {
@@ -114,6 +118,31 @@ def _mean_or_none(series: pd.Series | None) -> float | None:
     return float(value)
 
 
+def _build_work_center_map(work_centers: list[str]) -> dict[str, list[str]]:
+    mapping: dict[str, list[str]] = {}
+    for work_center in work_centers:
+        normalized = normalize_wc(work_center)
+        if not normalized:
+            continue
+        mapping.setdefault(normalized, [])
+        if work_center not in mapping[normalized]:
+            mapping[normalized].append(work_center)
+    return mapping
+
+
+def _resolve_work_center_default(
+    current_value: str,
+    work_center_map: dict[str, list[str]],
+    options: list[str],
+) -> str:
+    normalized = normalize_wc(current_value)
+    if normalized in work_center_map:
+        candidate = work_center_map[normalized][0]
+        if candidate in options:
+            return candidate
+    return options[0] if options else ""
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Projekty")
 
@@ -129,6 +158,12 @@ def render(con: sqlite3.Connection) -> None:
 
     projects = project_repo.list_projects(include_counts=True)
     projects_by_id = {project["id"]: project for project in projects}
+    wc_lists = production_repo.list_distinct_work_centers()
+    all_prod_wcs = sorted(
+        set(wc_lists.get("scrap_work_centers", []) + wc_lists.get("kpi_work_centers", []))
+    )
+    prod_work_center_map = _build_work_center_map(all_prod_wcs)
+    prod_work_center_keys = set(prod_work_center_map)
 
     st.subheader("Lista projektów")
     st.caption(f"Liczba projektów: {len(projects)}")
@@ -183,10 +218,31 @@ def render(con: sqlite3.Connection) -> None:
             "Nazwa projektu",
             value=selected.get("name", "") or "",
         )
-        work_center = st.text_input(
-            "Work center",
-            value=selected.get("work_center", "") or "",
+        use_wc_picker = st.checkbox(
+            "Wybierz Work Center z danych produkcyjnych",
+            value=False,
+            disabled=not all_prod_wcs,
+            help="Opcjonalny wybór z listy WC dostępnych w danych produkcyjnych.",
         )
+        if use_wc_picker and all_prod_wcs:
+            default_work_center = _resolve_work_center_default(
+                selected.get("work_center", "") or "",
+                prod_work_center_map,
+                all_prod_wcs,
+            )
+            work_center_index = (
+                all_prod_wcs.index(default_work_center) if default_work_center else 0
+            )
+            work_center = st.selectbox(
+                "Work center",
+                all_prod_wcs,
+                index=work_center_index,
+            )
+        else:
+            work_center = st.text_input(
+                "Work center",
+                value=selected.get("work_center", "") or "",
+            )
         project_code = st.text_input(
             "Project Code",
             value=selected.get("project_code", "") or "",
@@ -203,10 +259,57 @@ def render(con: sqlite3.Connection) -> None:
             value=eop_value or date.today(),
             disabled=no_eop,
         )
-        related_work_center = st.text_input(
-            "Powiązane Work Center",
-            value=selected.get("related_work_center", "") or "",
-        )
+        if use_wc_picker and all_prod_wcs:
+            related_defaults = []
+            related_tokens = parse_work_centers(
+                None,
+                selected.get("related_work_center", "") or "",
+            )
+            for token in related_tokens:
+                normalized = normalize_wc(token)
+                if normalized in prod_work_center_map:
+                    related_defaults.append(prod_work_center_map[normalized][0])
+            related_selection = st.multiselect(
+                "Powiązane Work Center",
+                all_prod_wcs,
+                default=related_defaults,
+            )
+            related_work_center = "; ".join(related_selection)
+        else:
+            related_work_center = st.text_input(
+                "Powiązane Work Center",
+                value=selected.get("related_work_center", "") or "",
+            )
+
+        st.markdown("**Walidacja Work Center**")
+        if not all_prod_wcs:
+            st.info(
+                "Brak danych produkcyjnych w bazie – nie można zweryfikować WC."
+            )
+        else:
+            primary_label = work_center.strip() or "—"
+            related_list = parse_work_centers(None, related_work_center)
+            related_label = ", ".join(related_list) if related_list else "—"
+            st.write(f"Project WC (primary): {primary_label}")
+            st.write(f"Related WC: {related_label}")
+
+            def _render_wc_status(label: str, value: str) -> None:
+                normalized = normalize_wc(value)
+                if not normalized:
+                    st.caption(f"{label}: brak wartości do sprawdzenia.")
+                    return
+                if normalized in prod_work_center_keys:
+                    st.success(f"{label}: ✅ Found in production data.")
+                    return
+                suggestions = suggest_work_centers(value, all_prod_wcs)
+                message = f"{label}: ⚠ Nie znaleziono w danych produkcyjnych."
+                if suggestions:
+                    message += f" Sugestie: {', '.join(suggestions)}."
+                st.warning(message)
+
+            _render_wc_status("Project WC (primary)", work_center)
+            for related in related_list:
+                _render_wc_status(f"Related WC ({related})", related)
         selected_category = selected.get("type")
         if editing and selected_category and selected_category not in PROJECT_TYPES:
             st.caption(f"Legacy type: {selected_category}")
