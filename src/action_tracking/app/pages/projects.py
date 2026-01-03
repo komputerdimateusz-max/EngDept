@@ -15,6 +15,7 @@ from action_tracking.data.repositories import (
     EffectivenessRepository,
     ProductionDataRepository,
     ProjectRepository,
+    WcInboxRepository,
 )
 from action_tracking.domain.constants import PROJECT_TYPES
 from action_tracking.services.effectiveness import (
@@ -374,6 +375,7 @@ def render(con: sqlite3.Connection) -> None:
     action_repo = ActionRepository(con)
     effectiveness_repo = EffectivenessRepository(con)
     production_repo = ProductionDataRepository(con)
+    wc_inbox_repo = WcInboxRepository(con)
 
     champions = champion_repo.list_champions()
     champion_names = {
@@ -383,12 +385,20 @@ def render(con: sqlite3.Connection) -> None:
 
     projects = project_repo.list_projects(include_counts=True)
     projects_by_id = {project["id"]: project for project in projects}
+    project_wc_norms = project_repo.list_project_work_centers_norms(
+        include_related=True
+    )
     wc_lists = production_repo.list_distinct_work_centers()
     all_prod_wcs = sorted(
         set(wc_lists.get("scrap_work_centers", []) + wc_lists.get("kpi_work_centers", []))
     )
     prod_work_center_map = _build_work_center_map(all_prod_wcs)
     prod_work_center_keys = set(prod_work_center_map)
+    production_stats = production_repo.list_production_work_centers_with_stats()
+    production_stats_by_norm = {
+        row["wc_norm"]: row for row in production_stats if row.get("wc_norm")
+    }
+    wc_inbox_repo.upsert_from_production(production_stats, project_wc_norms)
 
     st.subheader("Outcome projektu (produkcja)")
     outcome_available = True
@@ -1082,6 +1092,131 @@ def render(con: sqlite3.Connection) -> None:
                 st.rerun()
             else:
                 st.error("Nie można usunąć projektu powiązanego z akcjami.")
+
+    st.subheader("Wykryte Work Center z produkcji (nowe / niepowiązane)")
+    with st.expander("Pokaż wykryte Work Center", expanded=False):
+        if st.button("Odśwież wykrywanie (scan DB)", key="wc_inbox_refresh"):
+            refreshed_stats = production_repo.list_production_work_centers_with_stats()
+            wc_inbox_repo.upsert_from_production(refreshed_stats, project_wc_norms)
+            st.rerun()
+
+        open_items = wc_inbox_repo.list_open()
+        if not production_stats:
+            st.caption("Brak danych produkcyjnych.")
+        elif not open_items:
+            st.success("Brak nowych WC — wszystko pokryte projektami.")
+        else:
+            table_rows = []
+            for item in open_items:
+                stats = production_stats_by_norm.get(item.get("wc_norm") or "", {})
+                sources = item.get("sources") or []
+                sources_label = ", ".join(sources) if sources else "—"
+                table_rows.append(
+                    {
+                        "WC": item.get("wc_raw") or "—",
+                        "Źródła": sources_label,
+                        "First seen": item.get("first_seen_date") or "—",
+                        "Last seen": item.get("last_seen_date") or "—",
+                        "Days": stats.get("count_days_present") or "—",
+                    }
+                )
+            st.dataframe(table_rows, use_container_width=True)
+
+            project_link_options = ["(wybierz)"] + [project["id"] for project in projects]
+            for item in open_items:
+                wc_norm = item.get("wc_norm") or ""
+                wc_raw = item.get("wc_raw") or ""
+                wc_key = wc_norm or item.get("id") or wc_raw
+                with st.expander(f"Akcje: {wc_raw}", expanded=False):
+                    st.caption(f"Normalized WC: {wc_norm}")
+
+                    with st.form(f"wc_inbox_create_{wc_key}"):
+                        project_name = st.text_input(
+                            "Nazwa projektu",
+                            value=wc_raw,
+                            key=f"wc_inbox_name_{wc_key}",
+                        )
+                        st.text_input(
+                            "Work center",
+                            value=wc_raw,
+                            disabled=True,
+                            key=f"wc_inbox_wc_{wc_key}",
+                        )
+                        project_type = st.selectbox(
+                            "Typ",
+                            PROJECT_TYPES,
+                            index=PROJECT_TYPES.index("Others"),
+                            key=f"wc_inbox_type_{wc_key}",
+                        )
+                        owner_champion_id = st.selectbox(
+                            "Champion (opcjonalnie)",
+                            champion_options,
+                            index=0,
+                            format_func=lambda cid: "(brak)"
+                            if cid == "(brak)"
+                            else champion_names.get(cid, cid),
+                            key=f"wc_inbox_owner_{wc_key}",
+                        )
+                        related_wc = st.text_input(
+                            "Powiązane Work Center (opcjonalnie)",
+                            value="",
+                            key=f"wc_inbox_related_{wc_key}",
+                        )
+                        created = st.form_submit_button("Utwórz projekt")
+                    if created:
+                        if not project_name.strip() or not wc_raw.strip():
+                            st.error("Nazwa projektu i Work center są wymagane.")
+                        else:
+                            payload = {
+                                "name": project_name.strip(),
+                                "work_center": wc_raw.strip(),
+                                "type": project_type,
+                                "owner_champion_id": None
+                                if owner_champion_id == "(brak)"
+                                else owner_champion_id,
+                                "status": "active",
+                                "related_work_center": related_wc.strip() or None,
+                            }
+                            new_project_id = project_repo.create_project(payload)
+                            wc_inbox_repo.mark_created(wc_norm, new_project_id)
+                            st.success("Projekt utworzony.")
+                            st.rerun()
+
+                    if projects:
+                        with st.form(f"wc_inbox_link_{wc_key}"):
+                            link_project_id = st.selectbox(
+                                "Powiąż z istniejącym projektem",
+                                project_link_options,
+                                index=0,
+                                format_func=lambda pid: "(wybierz)"
+                                if pid == "(wybierz)"
+                                else projects_by_id.get(pid, {}).get("name", pid),
+                                key=f"wc_inbox_link_select_{wc_key}",
+                            )
+                            linked = st.form_submit_button("Powiąż")
+                        if linked:
+                            if link_project_id == "(wybierz)":
+                                st.error("Wybierz projekt do powiązania.")
+                            else:
+                                wc_inbox_repo.link_to_project(wc_norm, link_project_id)
+                                st.success("Work Center powiązany.")
+                                st.rerun()
+                    else:
+                        st.info("Brak projektów do powiązania.")
+
+                    with st.form(f"wc_inbox_ignore_{wc_key}"):
+                        confirm_ignore = st.checkbox(
+                            "Potwierdzam ignorowanie",
+                            key=f"wc_inbox_ignore_confirm_{wc_key}",
+                        )
+                        ignored = st.form_submit_button(
+                            "Ignoruj",
+                            disabled=not confirm_ignore,
+                        )
+                    if ignored:
+                        wc_inbox_repo.ignore(wc_norm)
+                        st.success("Work Center oznaczony jako ignorowany.")
+                        st.rerun()
 
     with st.expander("🧾 Changelog projektów", expanded=False):
         changelog_entries = project_repo.list_changelog(limit=50)
