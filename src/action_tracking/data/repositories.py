@@ -68,6 +68,102 @@ def _normalize_impact_aspects_payload(value: Any) -> str | None:
         return None
 
 
+def _list_changelog_generic(
+    con: sqlite3.Connection,
+    table_candidates: list[str],
+    limit: int = 50,
+    entity_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Uniwersalny reader changelogów.
+    Obsługuje różne nazwy tabel (w zależności od wersji bazy).
+    Jeśli tabela/kolumny nie istnieją -> zwraca [] (bez crasha UI).
+
+    Dodatkowo próbuje filtrować po entity_id, jeśli tabela ma taką kolumnę.
+    """
+    if not table_candidates:
+        return []
+
+    table: str | None = None
+    for t in table_candidates:
+        if _table_exists(con, t):
+            table = t
+            break
+    if not table:
+        return []
+
+    try:
+        cur = con.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in cur.fetchall()]  # (cid, name, type, notnull, dflt, pk)
+    except sqlite3.Error:
+        cols = []
+
+    if not cols:
+        return []
+
+    time_col: str | None = None
+    for c in ("changed_at", "created_at", "timestamp", "ts", "event_at"):
+        if c in cols:
+            time_col = c
+            break
+
+    entity_col: str | None = None
+    for c in ("entity_id", "object_id", "record_id", "champion_id", "project_id", "action_id"):
+        if c in cols:
+            entity_col = c
+            break
+
+    preferred = [
+        "id",
+        "entity_type",
+        "entity_id",
+        "change_type",
+        "field",
+        "old_value",
+        "new_value",
+        "summary",
+        "message",
+        "payload_json",
+        "user_email",
+        "changed_by",
+        "created_by",
+        "source",
+        "changed_at",
+        "created_at",
+    ]
+    selected_cols = [c for c in preferred if c in cols]
+    select_sql = ", ".join(selected_cols) if selected_cols else "*"
+
+    query = f"SELECT {select_sql} FROM {table}"
+    params: list[Any] = []
+
+    if entity_id and entity_col:
+        query += f" WHERE {entity_col} = ?"
+        params.append(entity_id)
+
+    if time_col:
+        query += f" ORDER BY {time_col} DESC"
+    else:
+        query += " ORDER BY rowid DESC"
+
+    query += " LIMIT ?"
+    params.append(int(limit))
+
+    try:
+        cur = con.execute(query, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    except sqlite3.Error:
+        return []
+
+    for r in rows:
+        if "payload_json" in r and r.get("payload_json") and "payload" not in r:
+            try:
+                r["payload"] = json.loads(r["payload_json"])
+            except Exception:
+                r["payload"] = None
+    return rows
+
+
 # =====================================================
 # SETTINGS / GLOBAL RULES
 # =====================================================
@@ -528,9 +624,7 @@ class ActionRepository:
         """
         params: list[Any] = [project_id]
 
-        # If no dates provided -> return all project actions (still filtered by is_draft=0).
         if df or dt:
-            # default open bounds if only one side provided
             df = df or "0001-01-01"
             dt = dt or "9999-12-31"
             query += """
@@ -546,16 +640,32 @@ class ActionRepository:
 
         cur = self.con.execute(query, params)
         rows = [dict(r) for r in cur.fetchall()]
-
-        # Ensure keys expected by UI exist (even if NULL in DB)
         for r in rows:
             r.setdefault("owner_name", None)
             r.setdefault("impact_aspects", None)
             r.setdefault("manual_savings_amount", None)
             r.setdefault("manual_savings_currency", None)
             r.setdefault("manual_savings_note", None)
-
         return rows
+
+    # =====================================================
+    # HOTFIX: CHANGELOG (used by Actions page)
+    # Fixes: AttributeError: 'ActionRepository' object has no attribute 'list_changelog'
+    # =====================================================
+    def list_changelog(self, limit: int = 50, action_id: str | None = None) -> list[dict[str, Any]]:
+        return _list_changelog_generic(
+            self.con,
+            table_candidates=[
+                "action_changelog",
+                "actions_changelog",
+                "changelog_actions",
+                "changelog",
+                "change_log",
+                "audit_log",
+            ],
+            limit=limit,
+            entity_id=action_id,
+        )
 
 
 # =====================================================
@@ -714,6 +824,25 @@ class ProjectRepository:
                         norms.add(n)
         return norms
 
+    # =====================================================
+    # HOTFIX: CHANGELOG (used by Projects page)
+    # Fixes: AttributeError: 'ProjectRepository' object has no attribute 'list_changelog'
+    # =====================================================
+    def list_changelog(self, limit: int = 50, project_id: str | None = None) -> list[dict[str, Any]]:
+        return _list_changelog_generic(
+            self.con,
+            table_candidates=[
+                "project_changelog",
+                "projects_changelog",
+                "changelog_projects",
+                "changelog",
+                "change_log",
+                "audit_log",
+            ],
+            limit=limit,
+            entity_id=project_id,
+        )
+
 
 # =====================================================
 # CHAMPIONS
@@ -727,7 +856,6 @@ class ChampionRepository:
         if not _table_exists(self.con, "champions"):
             return []
 
-        # discover columns
         cols: set[str] = set()
         try:
             cur = self.con.execute("PRAGMA table_info(champions)")
@@ -777,6 +905,25 @@ class ChampionRepository:
         )
         return [row["project_id"] for row in cur.fetchall()]
 
+    # =====================================================
+    # HOTFIX: CHANGELOG (used by Champions page)
+    # Fixes: AttributeError: 'ChampionRepository' object has no attribute 'list_changelog'
+    # =====================================================
+    def list_changelog(self, limit: int = 50, champion_id: str | None = None) -> list[dict[str, Any]]:
+        return _list_changelog_generic(
+            self.con,
+            table_candidates=[
+                "champion_changelog",
+                "champions_changelog",
+                "changelog_champions",
+                "changelog",
+                "change_log",
+                "audit_log",
+            ],
+            limit=limit,
+            entity_id=champion_id,
+        )
+
 
 # =====================================================
 # PRODUCTION DATA (SCRAP / KPI)
@@ -792,8 +939,6 @@ class ProductionDataRepository:
 
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
-
-    # ---------- UPSERTS ----------
 
     def upsert_scrap_daily(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -872,8 +1017,6 @@ class ProductionDataRepository:
             payload,
         )
         self.con.commit()
-
-    # ---------- QUERIES ----------
 
     def list_scrap_daily(
         self,
