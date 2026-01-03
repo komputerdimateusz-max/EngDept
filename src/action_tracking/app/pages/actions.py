@@ -356,7 +356,7 @@ def render(con: sqlite3.Connection) -> None:
         submitted = st.form_submit_button("Zapisz")
 
     if submitted:
-        if category not in active_categories:
+        if category not in active_categories and category != selected.get("category"):
             st.error("Wybierz aktywną kategorię akcji.")
             return
         payload = {

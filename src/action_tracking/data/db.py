@@ -86,13 +86,16 @@ CREATE TABLE IF NOT EXISTS action_changelog (
   changes_json TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS settings_action_categories (
+CREATE TABLE IF NOT EXISTS action_categories (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
   is_active INTEGER NOT NULL DEFAULT 1,
-  sort_order INTEGER NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 100,
   created_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_action_categories_active_order
+  ON action_categories (is_active, sort_order);
 
 CREATE TABLE IF NOT EXISTS scrap_daily (
   id TEXT PRIMARY KEY,
@@ -279,11 +282,11 @@ def _migrate_to_v4(con: sqlite3.Connection) -> None:
 def _migrate_to_v5(con: sqlite3.Connection) -> None:
     con.execute(
         """
-        CREATE TABLE IF NOT EXISTS settings_action_categories (
+        CREATE TABLE IF NOT EXISTS action_categories (
           id TEXT PRIMARY KEY,
           name TEXT NOT NULL UNIQUE,
           is_active INTEGER NOT NULL DEFAULT 1,
-          sort_order INTEGER NOT NULL,
+          sort_order INTEGER NOT NULL DEFAULT 100,
           created_at TEXT NOT NULL
         );
         """
@@ -348,10 +351,41 @@ def _migrate_to_v7(con: sqlite3.Connection) -> None:
     _set_user_version(con, 7)
 
 
+def _migrate_to_v8(con: sqlite3.Connection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS action_categories (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          sort_order INTEGER NOT NULL DEFAULT 100,
+          created_at TEXT NOT NULL
+        );
+        """
+    )
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_action_categories_active_order
+        ON action_categories (is_active, sort_order);
+        """
+    )
+    if _table_exists(con, "settings_action_categories"):
+        row = con.execute("SELECT COUNT(1) AS n FROM action_categories").fetchone()
+        if not row or int(row["n"]) == 0:
+            con.execute(
+                """
+                INSERT INTO action_categories (id, name, is_active, sort_order, created_at)
+                SELECT id, name, is_active, sort_order, created_at
+                FROM settings_action_categories
+                """
+            )
+    _set_user_version(con, 8)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
-    if not _table_exists(con, "settings_action_categories"):
+    if not _table_exists(con, "action_categories"):
         return
-    row = con.execute("SELECT COUNT(1) AS n FROM settings_action_categories").fetchone()
+    row = con.execute("SELECT COUNT(1) AS n FROM action_categories").fetchone()
     if row and int(row["n"]) > 0:
         return
     defaults = [
@@ -364,12 +398,12 @@ def _seed_action_categories(con: sqlite3.Connection) -> None:
     ]
     created_at = datetime.now(timezone.utc).isoformat()
     payload = [
-        (str(uuid4()), name, 1, index + 1, created_at)
+        (str(uuid4()), name, 1, (index + 1) * 10, created_at)
         for index, name in enumerate(defaults)
     ]
     con.executemany(
         """
-        INSERT INTO settings_action_categories (id, name, is_active, sort_order, created_at)
+        INSERT INTO action_categories (id, name, is_active, sort_order, created_at)
         VALUES (?, ?, ?, ?, ?)
         """,
         payload,
@@ -391,6 +425,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v6(con)
     if current_version < 7:
         _migrate_to_v7(con)
+    if current_version < 8:
+        _migrate_to_v8(con)
     _seed_action_categories(con)
     con.commit()
 
