@@ -49,6 +49,7 @@ def _normalize_impact_aspects_payload(value: Any) -> str | None:
     """
     try:
         from action_tracking.services.impact_aspects import normalize_impact_aspects
+
         normalized = normalize_impact_aspects(value)
         if not normalized:
             return None
@@ -67,10 +68,6 @@ def _normalize_impact_aspects_payload(value: Any) -> str | None:
         return None
 
 
-def _safe_get(row: dict[str, Any], key: str, default: Any = None) -> Any:
-    return row[key] if key in row else default
-
-
 # =====================================================
 # SETTINGS / GLOBAL RULES
 # =====================================================
@@ -80,6 +77,7 @@ class SettingsRepository:
         self.con = con
 
     def list_action_categories(self, active_only: bool = True) -> list[dict[str, Any]]:
+        # fallback to defaults if table not present
         if not _table_exists(self.con, "action_categories"):
             return [
                 {"id": name, "name": name, "is_active": True, "sort_order": (i + 1) * 10, "created_at": None}
@@ -164,6 +162,69 @@ class NotificationRepository:
         except sqlite3.Error:
             return False
 
+    def log_sent(
+        self,
+        notification_type: str,
+        recipient_email: str,
+        action_id: str | None,
+        payload: dict[str, Any] | None,
+        unique_key: str,
+    ) -> None:
+        if not unique_key:
+            return
+        if not _table_exists(self.con, "email_notifications_log"):
+            return
+        payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
+        try:
+            self.con.execute(
+                """
+                INSERT INTO email_notifications_log (
+                    id,
+                    created_at,
+                    notification_type,
+                    recipient_email,
+                    action_id,
+                    payload_json,
+                    unique_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    datetime.now(timezone.utc).isoformat(),
+                    notification_type,
+                    recipient_email,
+                    action_id,
+                    payload_json,
+                    unique_key,
+                ),
+            )
+            self.con.commit()
+        except sqlite3.Error:
+            return
+
+    def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "email_notifications_log"):
+            return []
+        try:
+            cur = self.con.execute(
+                """
+                SELECT id,
+                       created_at,
+                       notification_type,
+                       recipient_email,
+                       action_id,
+                       payload_json,
+                       unique_key
+                FROM email_notifications_log
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+            return [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
 
 # =====================================================
 # ACTIONS
@@ -234,6 +295,99 @@ class ActionRepository:
         cur = self.con.execute(base_query, params)
         return [dict(r) for r in cur.fetchall()]
 
+    def create_action(self, data: dict[str, Any]) -> str:
+        action_id = data.get("id") or str(uuid4())
+        payload = self._normalize_action_payload(action_id, data)
+
+        cols = [
+            "id",
+            "project_id",
+            "title",
+            "description",
+            "owner_champion_id",
+            "priority",
+            "status",
+            "is_draft",
+            "due_date",
+            "created_at",
+            "closed_at",
+            "impact_type",
+            "impact_value",
+            "impact_aspects",
+            "category",
+            "manual_savings_amount",
+            "manual_savings_currency",
+            "manual_savings_note",
+            "source",
+            "source_message_id",
+            "submitted_by_email",
+            "submitted_at",
+        ]
+        vals = [payload.get(c) for c in cols]
+        placeholders = ", ".join(["?"] * len(cols))
+        self.con.execute(
+            f"INSERT INTO actions ({', '.join(cols)}) VALUES ({placeholders})",
+            vals,
+        )
+        self.con.commit()
+        return action_id
+
+    def _normalize_action_payload(self, action_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        created_at = data.get("created_at") or date.today().isoformat()
+        created_date = self._parse_date(created_at, "created_at")
+        status = data.get("status") or "open"
+        closed_at = data.get("closed_at") or None
+        if status == "done":
+            closed_at = closed_at or date.today().isoformat()
+            closed_date = self._parse_date(closed_at, "closed_at")
+            if closed_date < created_date:
+                raise ValueError("closed_at < created_at")
+        else:
+            closed_at = None
+
+        due_date = data.get("due_date") or None
+        if due_date:
+            due_date = self._parse_date(due_date, "due_date").isoformat()
+
+        return {
+            "id": action_id,
+            "project_id": (data.get("project_id") or "").strip() or None,
+            "title": (data.get("title") or "").strip(),
+            "description": (data.get("description") or "").strip() or None,
+            "owner_champion_id": (data.get("owner_champion_id") or "").strip() or None,
+            "priority": data.get("priority") or "med",
+            "status": status,
+            "is_draft": 1 if bool(data.get("is_draft")) else 0,
+            "due_date": due_date,
+            "created_at": created_date.isoformat(),
+            "closed_at": closed_at,
+            "impact_type": data.get("impact_type"),
+            "impact_value": data.get("impact_value"),
+            "impact_aspects": _normalize_impact_aspects_payload(data.get("impact_aspects")),
+            "category": data.get("category"),
+            "manual_savings_amount": data.get("manual_savings_amount"),
+            "manual_savings_currency": data.get("manual_savings_currency"),
+            "manual_savings_note": data.get("manual_savings_note"),
+            "source": data.get("source"),
+            "source_message_id": data.get("source_message_id"),
+            "submitted_by_email": data.get("submitted_by_email"),
+            "submitted_at": data.get("submitted_at"),
+        }
+
+    @staticmethod
+    def _parse_date(value: Any, field_name: str) -> date:
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError:
+            try:
+                return datetime.fromisoformat(str(value)).date()
+            except ValueError as exc_two:
+                raise ValueError(f"Invalid date for {field_name}") from exc_two
+
     # ---- REQUIRED BY KPI PAGE ----
     def list_actions_for_kpi(
         self,
@@ -241,9 +395,6 @@ class ActionRepository:
         champion_id: str | None = None,
         category: str | None = None,
     ) -> list[dict[str, Any]]:
-        """
-        Minimal schema used by KPI page.
-        """
         query = """
             SELECT id,
                    title,
@@ -333,6 +484,84 @@ class EffectivenessRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
+    def upsert_effectiveness(self, action_id: str, payload: dict[str, Any]) -> None:
+        if not _table_exists(self.con, "action_effectiveness"):
+            return
+        record_id = payload.get("id") or str(uuid4())
+        self.con.execute(
+            """
+            INSERT INTO action_effectiveness (
+                id,
+                action_id,
+                metric,
+                baseline_from,
+                baseline_to,
+                after_from,
+                after_to,
+                baseline_days,
+                after_days,
+                baseline_avg,
+                after_avg,
+                delta,
+                pct_change,
+                classification,
+                computed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(action_id) DO UPDATE SET
+                metric = excluded.metric,
+                baseline_from = excluded.baseline_from,
+                baseline_to = excluded.baseline_to,
+                after_from = excluded.after_from,
+                after_to = excluded.after_to,
+                baseline_days = excluded.baseline_days,
+                after_days = excluded.after_days,
+                baseline_avg = excluded.baseline_avg,
+                after_avg = excluded.after_avg,
+                delta = excluded.delta,
+                pct_change = excluded.pct_change,
+                classification = excluded.classification,
+                computed_at = excluded.computed_at
+            """,
+            (
+                record_id,
+                action_id,
+                payload.get("metric"),
+                payload.get("baseline_from"),
+                payload.get("baseline_to"),
+                payload.get("after_from"),
+                payload.get("after_to"),
+                int(payload.get("baseline_days") or 0),
+                int(payload.get("after_days") or 0),
+                payload.get("baseline_avg"),
+                payload.get("after_avg"),
+                payload.get("delta"),
+                payload.get("pct_change"),
+                payload.get("classification"),
+                payload.get("computed_at") or datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        self.con.commit()
+
+    def get_effectiveness_for_actions(self, action_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if not action_ids:
+            return {}
+        if not _table_exists(self.con, "action_effectiveness"):
+            return {}
+        placeholders = ", ".join(["?"] * len(action_ids))
+        cur = self.con.execute(
+            f"""
+            SELECT *
+            FROM action_effectiveness
+            WHERE action_id IN ({placeholders})
+            """,
+            action_ids,
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        return {row["action_id"]: row for row in rows}
+
+    def list_effectiveness_for_actions(self, action_ids: list[str]) -> dict[str, dict[str, Any]]:
+        return self.get_effectiveness_for_actions(action_ids)
+
 
 # =====================================================
 # PROJECTS
@@ -343,7 +572,9 @@ class ProjectRepository:
         self.con = con
 
     def list_projects(self, include_counts: bool = True) -> list[dict[str, Any]]:
-        if include_counts:
+        if not _table_exists(self.con, "projects"):
+            return []
+        if include_counts and _table_exists(self.con, "actions"):
             cur = self.con.execute(
                 """
                 SELECT p.id,
@@ -372,11 +603,7 @@ class ProjectRepository:
         cur = self.con.execute("SELECT * FROM projects ORDER BY name")
         return [dict(r) for r in cur.fetchall()]
 
-    # ---- REQUIRED BY projects.py (wc inbox) ----
     def list_project_work_centers_norms(self, include_related: bool = True) -> set[str]:
-        """
-        Returns set of normalized work centers used by existing projects.
-        """
         try:
             from action_tracking.services.effectiveness import normalize_wc, parse_work_centers
         except Exception:
@@ -415,36 +642,43 @@ class ChampionRepository:
         self.con = con
 
     def list_champions(self) -> list[dict[str, Any]]:
-        """
-        Must include hire_date to avoid KeyError in champions page.
-        If DB doesn't have the column yet, return None.
-        """
-        # check if hire_date exists
-        hire_date_exists = False
+        if not _table_exists(self.con, "champions"):
+            return []
+
+        # discover columns
+        cols: set[str] = set()
         try:
             cur = self.con.execute("PRAGMA table_info(champions)")
-            cols = [r[1] for r in cur.fetchall()]  # (cid, name, type, notnull, dflt_value, pk)
-            hire_date_exists = "hire_date" in cols
+            cols = {r[1] for r in cur.fetchall()}  # (cid, name, type, notnull, dflt, pk)
         except sqlite3.Error:
-            hire_date_exists = False
+            cols = set()
 
-        fields = "id, first_name, last_name, email, team, active"
-        if hire_date_exists:
-            fields += ", hire_date"
+        select_cols = ["id", "first_name", "last_name", "email", "active"]
+        if "hire_date" in cols:
+            select_cols.append("hire_date")
+        if "position" in cols:
+            select_cols.append("position")
+        if "team" in cols:
+            select_cols.append("team")
 
         cur = self.con.execute(
             f"""
-            SELECT {fields}
+            SELECT {", ".join(select_cols)}
             FROM champions
             ORDER BY last_name, first_name
             """
         )
         rows = [dict(r) for r in cur.fetchall()]
         for r in rows:
-            r["display_name"] = f"{r.get('first_name','')} {r.get('last_name','')}".strip() or r.get("id")
+            r["display_name"] = (
+                f"{(r.get('first_name') or '').strip()} {(r.get('last_name') or '').strip()}".strip()
+                or r.get("email")
+                or r.get("id")
+            )
             r["active"] = bool(r.get("active"))
-            if "hire_date" not in r:
-                r["hire_date"] = None
+            r.setdefault("hire_date", None)
+            r.setdefault("position", None)
+            r.setdefault("team", None)
         return rows
 
     def get_assigned_projects(self, champion_id: str) -> list[str]:
@@ -463,520 +697,8 @@ class ChampionRepository:
 
 
 # =====================================================
-# PRODUCTION DATA (placeholder; you already have it working)
+# PRODUCTION DATA (SCRAP / KPI)
 # =====================================================
-
-class ProductionDataRepository:
-    def __init__(self, con: sqlite3.Connection) -> None:
-        self.con = con
-
-# =====================================================
-# WC INBOX (required by projects.py)
-# Fix: ImportError: cannot import name 'WcInboxRepository'
-# Wklej CAŁY ten blok do: src/action_tracking/data/repositories.py
-# (najlepiej na sam koniec pliku)
-# =====================================================
-
-class WcInboxRepository:
-    def __init__(self, con: sqlite3.Connection) -> None:
-        self.con = con
-
-    def upsert_from_production(
-        self,
-        work_centers_stats: list[dict[str, Any]],
-        existing_project_wc_norms: set[str],
-    ) -> None:
-        """
-        work_centers_stats: list of dicts produced by ProductionDataRepository.list_production_work_centers_with_stats()
-        Expected keys (best effort):
-          - wc_raw, wc_norm
-          - has_scrap (bool), has_kpi (bool)
-          - first_seen_date, last_seen_date
-        """
-        if not _table_exists(self.con, "wc_inbox"):
-            return
-
-        # normalize helpers (avoid crash if module path changed)
-        try:
-            from action_tracking.services.effectiveness import normalize_wc
-        except Exception:
-            def normalize_wc(v: Any) -> str:
-                return normalize_key(str(v or ""))
-
-        # read existing inbox rows
-        existing_rows: dict[str, dict[str, Any]] = {}
-        cur = self.con.execute(
-            """
-            SELECT wc_norm, wc_raw, sources, status, first_seen_date, last_seen_date
-            FROM wc_inbox
-            """
-        )
-        for r in cur.fetchall():
-            existing_rows[r["wc_norm"]] = dict(r)
-
-        now = datetime.now(timezone.utc).isoformat()
-
-        for row in work_centers_stats or []:
-            wc_norm = normalize_wc(row.get("wc_norm") or row.get("wc_raw"))
-            if not wc_norm:
-                continue
-
-            existing = existing_rows.get(wc_norm)
-
-            # if already linked to project WC -> mark linked (optional)
-            if wc_norm in (existing_project_wc_norms or set()):
-                if existing and existing.get("status") == "open":
-                    self._set_status(wc_norm, "linked", None)
-                continue
-
-            sources: list[str] = []
-            if row.get("has_scrap"):
-                sources.append("scrap")
-            if row.get("has_kpi"):
-                sources.append("kpi")
-
-            if existing:
-                try:
-                    prev_sources = json.loads(existing.get("sources") or "[]")
-                except json.JSONDecodeError:
-                    prev_sources = []
-                sources = sorted(set(prev_sources) | set(sources))
-
-            # choose wc_raw (prefer earlier first_seen)
-            wc_raw_value = (row.get("wc_raw") or "").strip()
-            if existing and existing.get("wc_raw"):
-                if existing.get("first_seen_date") and row.get("first_seen_date"):
-                    if str(existing["first_seen_date"]) <= str(row["first_seen_date"]):
-                        wc_raw_value = existing.get("wc_raw") or wc_raw_value
-                else:
-                    wc_raw_value = existing.get("wc_raw") or wc_raw_value
-
-            payload = {
-                "id": str(uuid4()),
-                "wc_raw": wc_raw_value,
-                "wc_norm": wc_norm,
-                "sources": json.dumps(sources, ensure_ascii=False),
-                "first_seen_date": row.get("first_seen_date"),
-                "last_seen_date": row.get("last_seen_date"),
-                "status": "open",
-                "linked_project_id": None,
-                "created_at": now,
-                "updated_at": now,
-            }
-
-            self.con.execute(
-                """
-                INSERT INTO wc_inbox (
-                    id, wc_raw, wc_norm, sources,
-                    first_seen_date, last_seen_date,
-                    status, linked_project_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(wc_norm) DO UPDATE SET
-                    wc_raw = excluded.wc_raw,
-                    sources = excluded.sources,
-                    first_seen_date = COALESCE(
-                        MIN(wc_inbox.first_seen_date, excluded.first_seen_date),
-                        excluded.first_seen_date,
-                        wc_inbox.first_seen_date
-                    ),
-                    last_seen_date = COALESCE(
-                        MAX(wc_inbox.last_seen_date, excluded.last_seen_date),
-                        excluded.last_seen_date,
-                        wc_inbox.last_seen_date
-                    ),
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    payload["id"],
-                    payload["wc_raw"],
-                    payload["wc_norm"],
-                    payload["sources"],
-                    payload["first_seen_date"],
-                    payload["last_seen_date"],
-                    payload["status"],
-                    payload["linked_project_id"],
-                    payload["created_at"],
-                    payload["updated_at"],
-                ),
-            )
-
-        self.con.commit()
-
-    def list_open(self, limit: int = 200) -> list[dict[str, Any]]:
-        if not _table_exists(self.con, "wc_inbox"):
-            return []
-        cur = self.con.execute(
-            """
-            SELECT *
-            FROM wc_inbox
-            WHERE status = 'open'
-            ORDER BY last_seen_date DESC, wc_raw ASC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-        for r in rows:
-            try:
-                r["sources"] = json.loads(r.get("sources") or "[]")
-            except json.JSONDecodeError:
-                r["sources"] = []
-        return rows
-
-    def ignore(self, wc_norm: str) -> None:
-        if not _table_exists(self.con, "wc_inbox"):
-            return
-        self._set_status(wc_norm, "ignored", None)
-
-    def link_to_project(self, wc_norm: str, project_id: str) -> None:
-        if not _table_exists(self.con, "wc_inbox"):
-            return
-        self._set_status(wc_norm, "linked", project_id)
-
-    def mark_created(self, wc_norm: str, project_id: str) -> None:
-        if not _table_exists(self.con, "wc_inbox"):
-            return
-        self._set_status(wc_norm, "created", project_id)
-
-    def _set_status(self, wc_norm: str, status: str, project_id: str | None) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        self.con.execute(
-            """
-            UPDATE wc_inbox
-            SET status = ?,
-                linked_project_id = ?,
-                updated_at = ?
-            WHERE wc_norm = ?
-            """,
-            (status, project_id, now, wc_norm),
-        )
-        self.con.commit()
-
-# ============================================================
-# HOTFIX PACK v1 — brakujące metody dla działających zakładek
-# Wklej TEN CAŁY BLOK na SAM KONIEC pliku:
-#   src/action_tracking/data/repositories.py
-# (niczego nie usuwaj — to dopisuje brakujące metody/klucze)
-# Następnie zrestartuj streamlit.
-# ============================================================
-
-
-
-import sqlite3
-import json
-from datetime import date, datetime, timezone
-from typing import Any
-from uuid import uuid4
-
-
-# -------------------------
-# Helper (safe)
-# -------------------------
-def _hotfix__table_exists(con: sqlite3.Connection, table: str) -> bool:
-    try:
-        cur = con.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table' AND name = ?
-            """,
-            (table,),
-        )
-        return cur.fetchone() is not None
-    except sqlite3.Error:
-        return False
-
-
-# ============================================================
-# 1) ProductionDataRepository.list_distinct_work_centers()
-# ============================================================
-if "ProductionDataRepository" in globals() and not hasattr(
-    ProductionDataRepository, "list_distinct_work_centers"
-):
-
-    def _pdr_list_distinct_work_centers(self) -> dict[str, list[str]]:
-        scrap_work_centers: list[str] = []
-        kpi_work_centers: list[str] = []
-
-        if _hotfix__table_exists(self.con, "scrap_daily"):
-            try:
-                cur = self.con.execute(
-                    """
-                    SELECT DISTINCT work_center
-                    FROM scrap_daily
-                    ORDER BY work_center
-                    """
-                )
-                scrap_work_centers = [row["work_center"] for row in cur.fetchall()]
-            except sqlite3.Error:
-                scrap_work_centers = []
-
-        if _hotfix__table_exists(self.con, "production_kpi_daily"):
-            try:
-                cur = self.con.execute(
-                    """
-                    SELECT DISTINCT work_center
-                    FROM production_kpi_daily
-                    ORDER BY work_center
-                    """
-                )
-                kpi_work_centers = [row["work_center"] for row in cur.fetchall()]
-            except sqlite3.Error:
-                kpi_work_centers = []
-
-        return {
-            "scrap_work_centers": scrap_work_centers,
-            "kpi_work_centers": kpi_work_centers,
-        }
-
-    ProductionDataRepository.list_distinct_work_centers = _pdr_list_distinct_work_centers  # type: ignore[attr-defined]
-
-
-# ============================================================
-# 2) EffectivenessRepository.get_effectiveness_for_actions()
-# ============================================================
-if "EffectivenessRepository" in globals() and not hasattr(
-    EffectivenessRepository, "get_effectiveness_for_actions"
-):
-
-    def _eff_get_effectiveness_for_actions(
-        self, action_ids: list[str]
-    ) -> dict[str, dict[str, Any]]:
-        if not action_ids:
-            return {}
-        if not _hotfix__table_exists(self.con, "action_effectiveness"):
-            return {}
-
-        placeholders = ", ".join(["?"] * len(action_ids))
-        try:
-            cur = self.con.execute(
-                f"""
-                SELECT *
-                FROM action_effectiveness
-                WHERE action_id IN ({placeholders})
-                """,
-                action_ids,
-            )
-            rows = [dict(r) for r in cur.fetchall()]
-            return {row["action_id"]: row for row in rows if row.get("action_id")}
-        except sqlite3.Error:
-            return {}
-
-    EffectivenessRepository.get_effectiveness_for_actions = _eff_get_effectiveness_for_actions  # type: ignore[attr-defined]
-
-    # (opcjonalnie) alias, żeby inne miejsca też działały
-    if not hasattr(EffectivenessRepository, "list_effectiveness_for_actions"):
-        EffectivenessRepository.list_effectiveness_for_actions = _eff_get_effectiveness_for_actions  # type: ignore[attr-defined]
-
-
-# ============================================================
-# 3) ChampionRepository.list_champions() — dodaj brakujące klucze
-#    Fix: KeyError 'position' / 'hire_date'
-# ============================================================
-if "ChampionRepository" in globals():
-
-    _orig_list_champions = getattr(ChampionRepository, "list_champions", None)
-
-    def _ch_list_champions_safe(self) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        if callable(_orig_list_champions):
-            try:
-                rows = _orig_list_champions(self)  # type: ignore[misc]
-            except Exception:
-                rows = []
-
-        # jeżeli stara wersja repo zwraca okrojone dict-y, dołóż brakujące klucze
-        for r in rows:
-            r.setdefault("hire_date", None)
-            r.setdefault("position", None)
-            # display_name bywa wymagane w UI
-            if "display_name" not in r:
-                r["display_name"] = (
-                    f"{(r.get('first_name') or '').strip()} {(r.get('last_name') or '').strip()}".strip()
-                    or r.get("name")
-                    or r.get("email")
-                    or r.get("id")
-                )
-        return rows
-
-    ChampionRepository.list_champions = _ch_list_champions_safe  # type: ignore[assignment]
-
-
-# ============================================================
-# 4) NotificationRepository.list_recent() (+ minimalne metody)
-# ============================================================
-# Jeśli klasa istnieje, ale nie ma list_recent -> dopisz.
-if "NotificationRepository" in globals() and not hasattr(NotificationRepository, "list_recent"):
-
-    def _nr_list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
-        if not _hotfix__table_exists(self.con, "email_notifications_log"):
-            return []
-        try:
-            cur = self.con.execute(
-                """
-                SELECT id,
-                       created_at,
-                       notification_type,
-                       recipient_email,
-                       action_id,
-                       payload_json,
-                       unique_key
-                FROM email_notifications_log
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (int(limit),),
-            )
-            return [dict(r) for r in cur.fetchall()]
-        except sqlite3.Error:
-            return []
-
-    def _nr_was_sent(self, unique_key: str) -> bool:
-        if not unique_key or not _hotfix__table_exists(self.con, "email_notifications_log"):
-            return False
-        try:
-            cur = self.con.execute(
-                "SELECT 1 FROM email_notifications_log WHERE unique_key = ?",
-                (unique_key,),
-            )
-            return cur.fetchone() is not None
-        except sqlite3.Error:
-            return False
-
-    def _nr_log_sent(
-        self,
-        notification_type: str,
-        recipient_email: str,
-        action_id: str | None,
-        payload: dict[str, Any] | None,
-        unique_key: str,
-    ) -> None:
-        if not unique_key or not _hotfix__table_exists(self.con, "email_notifications_log"):
-            return
-        try:
-            payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
-            self.con.execute(
-                """
-                INSERT OR IGNORE INTO email_notifications_log (
-                    id, created_at, notification_type, recipient_email,
-                    action_id, payload_json, unique_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid4()),
-                    datetime.now(timezone.utc).isoformat(),
-                    notification_type,
-                    recipient_email,
-                    action_id,
-                    payload_json,
-                    unique_key,
-                ),
-            )
-            self.con.commit()
-        except sqlite3.Error:
-            return
-
-    NotificationRepository.list_recent = _nr_list_recent  # type: ignore[attr-defined]
-    NotificationRepository.was_sent = _nr_was_sent  # type: ignore[attr-defined]
-    NotificationRepository.log_sent = _nr_log_sent  # type: ignore[attr-defined]
-
-
-# Jeśli NotificationRepository W OGÓLE nie istnieje (czasem po konfliktach),
-# utwórz minimalną wersję, żeby settings.py działał.
-if "NotificationRepository" not in globals():
-
-    class NotificationRepository:
-        def __init__(self, con: sqlite3.Connection) -> None:
-            self.con = con
-
-        def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
-            if not _hotfix__table_exists(self.con, "email_notifications_log"):
-                return []
-            try:
-                cur = self.con.execute(
-                    """
-                    SELECT id,
-                           created_at,
-                           notification_type,
-                           recipient_email,
-                           action_id,
-                           payload_json,
-                           unique_key
-                    FROM email_notifications_log
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                    """,
-                    (int(limit),),
-                )
-                return [dict(r) for r in cur.fetchall()]
-            except sqlite3.Error:
-                return []
-
-        def was_sent(self, unique_key: str) -> bool:
-            if not unique_key or not _hotfix__table_exists(self.con, "email_notifications_log"):
-                return False
-            try:
-                cur = self.con.execute(
-                    "SELECT 1 FROM email_notifications_log WHERE unique_key = ?",
-                    (unique_key,),
-                )
-                return cur.fetchone() is not None
-            except sqlite3.Error:
-                return False
-
-        def log_sent(
-            self,
-            notification_type: str,
-            recipient_email: str,
-            action_id: str | None,
-            payload: dict[str, Any] | None,
-            unique_key: str,
-        ) -> None:
-            if not unique_key or not _hotfix__table_exists(self.con, "email_notifications_log"):
-                return
-            try:
-                payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
-                self.con.execute(
-                    """
-                    INSERT OR IGNORE INTO email_notifications_log (
-                        id, created_at, notification_type, recipient_email,
-                        action_id, payload_json, unique_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(uuid4()),
-                        datetime.now(timezone.utc).isoformat(),
-                        notification_type,
-                        recipient_email,
-                        action_id,
-                        payload_json,
-                        unique_key,
-                    ),
-                )
-
-                # === HOTFIX: restore full ProductionDataRepository API expected by UI ===
-# Wklej TEN BLOK do: src/action_tracking/data/repositories.py
-# ✅ Wklej na SAM KONIEC pliku (lub ZAMIEŃ istniejącą klasę ProductionDataRepository)
-# ❗ WAŻNE: NIE dodawaj tu "from __future__ import annotations" (masz już na górze pliku)
-
-import sqlite3
-from datetime import date, datetime, timezone
-from typing import Any
-from uuid import uuid4
-
-
-def _table_exists(con: sqlite3.Connection, table: str) -> bool:
-    cur = con.execute(
-        """
-        SELECT name
-        FROM sqlite_master
-        WHERE type = 'table' AND name = ?
-        """,
-        (table,),
-    )
-    return cur.fetchone() is not None
-
 
 class ProductionDataRepository:
     """
@@ -989,49 +711,32 @@ class ProductionDataRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
-    # ---------------------------
-    # UPSERTS (used by import UI)
-    # ---------------------------
+    # ---------- UPSERTS ----------
 
     def upsert_scrap_daily(self, rows: list[dict[str, Any]]) -> None:
-        """
-        Expected row keys:
-        - metric_date (YYYY-MM-DD)
-        - work_center (str)
-        - scrap_qty (int)
-        - scrap_cost_amount (float|None)
-        - scrap_cost_currency (str, default 'PLN')
-        """
         if not rows:
             return
         if not _table_exists(self.con, "scrap_daily"):
             raise sqlite3.OperationalError("scrap_daily table missing; migration required")
-
         now = datetime.now(timezone.utc).isoformat()
-        payload = []
-        for r in rows:
-            payload.append(
-                (
-                    r.get("id") or str(uuid4()),
-                    str(r["metric_date"]),
-                    str(r["work_center"]),
-                    int(r.get("scrap_qty") or 0),
-                    r.get("scrap_cost_amount"),
-                    (r.get("scrap_cost_currency") or "PLN"),
-                    r.get("created_at") or now,
-                )
+        payload = [
+            (
+                r.get("id") or str(uuid4()),
+                str(r["metric_date"]),
+                str(r["work_center"]),
+                int(r.get("scrap_qty") or 0),
+                r.get("scrap_cost_amount"),
+                (r.get("scrap_cost_currency") or "PLN"),
+                r.get("created_at") or now,
             )
-
+            for r in rows
+        ]
         self.con.executemany(
             """
             INSERT INTO scrap_daily (
-                id,
-                metric_date,
-                work_center,
-                scrap_qty,
-                scrap_cost_amount,
-                scrap_cost_currency,
-                created_at
+                id, metric_date, work_center,
+                scrap_qty, scrap_cost_amount,
+                scrap_cost_currency, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(metric_date, work_center, scrap_cost_currency) DO UPDATE SET
                 scrap_qty = excluded.scrap_qty,
@@ -1043,50 +748,34 @@ class ProductionDataRepository:
         self.con.commit()
 
     def upsert_production_kpi_daily(self, rows: list[dict[str, Any]]) -> None:
-        """
-        Expected row keys:
-        - metric_date, work_center
-        - worktime_min, performance_pct, oee_pct, availability_pct, quality_pct
-        - source_file, imported_at, created_at
-        """
         if not rows:
             return
         if not _table_exists(self.con, "production_kpi_daily"):
             raise sqlite3.OperationalError("production_kpi_daily table missing; migration required")
-
         now = datetime.now(timezone.utc).isoformat()
-        payload = []
-        for r in rows:
-            payload.append(
-                (
-                    r.get("id") or str(uuid4()),
-                    str(r["metric_date"]),
-                    str(r["work_center"]),
-                    r.get("worktime_min"),
-                    r.get("performance_pct"),
-                    r.get("oee_pct"),
-                    r.get("availability_pct"),
-                    r.get("quality_pct"),
-                    r.get("source_file"),
-                    r.get("imported_at") or now,
-                    r.get("created_at") or r.get("imported_at") or now,
-                )
+        payload = [
+            (
+                r.get("id") or str(uuid4()),
+                str(r["metric_date"]),
+                str(r["work_center"]),
+                r.get("worktime_min"),
+                r.get("performance_pct"),
+                r.get("oee_pct"),
+                r.get("availability_pct"),
+                r.get("quality_pct"),
+                r.get("source_file"),
+                r.get("imported_at") or now,
+                r.get("created_at") or r.get("imported_at") or now,
             )
-
+            for r in rows
+        ]
         self.con.executemany(
             """
             INSERT INTO production_kpi_daily (
-                id,
-                metric_date,
-                work_center,
-                worktime_min,
-                performance_pct,
-                oee_pct,
-                availability_pct,
-                quality_pct,
-                source_file,
-                imported_at,
-                created_at
+                id, metric_date, work_center,
+                worktime_min, performance_pct, oee_pct,
+                availability_pct, quality_pct,
+                source_file, imported_at, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(metric_date, work_center) DO UPDATE SET
                 worktime_min = excluded.worktime_min,
@@ -1102,9 +791,7 @@ class ProductionDataRepository:
         )
         self.con.commit()
 
-    # ---------------------------
-    # QUERIES (used by Explorer/Projects)
-    # ---------------------------
+    # ---------- QUERIES ----------
 
     def list_scrap_daily(
         self,
@@ -1115,7 +802,6 @@ class ProductionDataRepository:
     ) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "scrap_daily"):
             return []
-
         query = """
             SELECT metric_date,
                    work_center,
@@ -1166,7 +852,6 @@ class ProductionDataRepository:
     ) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "production_kpi_daily"):
             return []
-
         query = """
             SELECT metric_date,
                    work_center,
@@ -1207,15 +892,6 @@ class ProductionDataRepository:
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
-    def list_production_kpi_daily(
-        self,
-        work_center: str | None,
-        date_from: date | str | None,
-        date_to: date | str | None,
-    ) -> list[dict[str, Any]]:
-        # backward-compat alias used in some places
-        return self.list_kpi_daily(work_center, date_from, date_to)
-
     def list_distinct_work_centers(self) -> dict[str, list[str]]:
         scrap_work_centers: list[str] = []
         kpi_work_centers: list[str] = []
@@ -1240,10 +916,7 @@ class ProductionDataRepository:
             )
             kpi_work_centers = [row["work_center"] for row in cur.fetchall()]
 
-        return {
-            "scrap_work_centers": scrap_work_centers,
-            "kpi_work_centers": kpi_work_centers,
-        }
+        return {"scrap_work_centers": scrap_work_centers, "kpi_work_centers": kpi_work_centers}
 
     def list_work_centers(self) -> list[str]:
         if not _table_exists(self.con, "scrap_daily") and not _table_exists(self.con, "production_kpi_daily"):
@@ -1259,11 +932,6 @@ class ProductionDataRepository:
         return [row["work_center"] for row in cur.fetchall()]
 
     def list_production_work_centers_with_stats(self) -> list[dict[str, Any]]:
-        """
-        Used by WC inbox feature (Projects page).
-        Aggregates per normalized WC and indicates data presence.
-        """
-        # local import to avoid cycles
         from action_tracking.services.effectiveness import normalize_wc
 
         stats: dict[str, dict[str, Any]] = {}
@@ -1298,7 +966,6 @@ class ProductionDataRepository:
                 )
                 entry["has_scrap"] = True
                 entry["count_days_present"] += int(row["count_days_present"] or 0)
-                # maintain min/max across sources
                 if entry.get("first_seen_date") is None or (
                     row["first_seen_date"] and row["first_seen_date"] < entry["first_seen_date"]
                 ):
@@ -1353,10 +1020,157 @@ class ProductionDataRepository:
 
     @staticmethod
     def _normalize_date_filter(value: date | str) -> str:
-        if isinstance(value, date):
-            return value.isoformat()
-        return str(value)
+        return value.isoformat() if isinstance(value, date) else str(value)
 
-                self.con.commit()
-            except sqlite3.Error:
-                return
+
+# =====================================================
+# WC INBOX
+# =====================================================
+
+class WcInboxRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def upsert_from_production(
+        self,
+        work_centers_stats: list[dict[str, Any]],
+        existing_project_wc_norms: set[str],
+    ) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+
+        try:
+            from action_tracking.services.effectiveness import normalize_wc
+        except Exception:
+            def normalize_wc(v: Any) -> str:
+                return normalize_key(str(v or ""))
+
+        existing_rows: dict[str, dict[str, Any]] = {}
+        cur = self.con.execute(
+            """
+            SELECT wc_norm, wc_raw, sources, status, first_seen_date, last_seen_date
+            FROM wc_inbox
+            """
+        )
+        for r in cur.fetchall():
+            existing_rows[r["wc_norm"]] = dict(r)
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        for row in work_centers_stats or []:
+            wc_norm = normalize_wc(row.get("wc_norm") or row.get("wc_raw"))
+            if not wc_norm:
+                continue
+
+            existing = existing_rows.get(wc_norm)
+
+            if wc_norm in (existing_project_wc_norms or set()):
+                if existing and existing.get("status") == "open":
+                    self._set_status(wc_norm, "linked", None)
+                continue
+
+            sources: list[str] = []
+            if row.get("has_scrap"):
+                sources.append("scrap")
+            if row.get("has_kpi"):
+                sources.append("kpi")
+
+            if existing:
+                try:
+                    prev_sources = json.loads(existing.get("sources") or "[]")
+                except json.JSONDecodeError:
+                    prev_sources = []
+                sources = sorted(set(prev_sources) | set(sources))
+
+            wc_raw_value = (row.get("wc_raw") or "").strip()
+            if existing and existing.get("wc_raw"):
+                wc_raw_value = existing.get("wc_raw") or wc_raw_value
+
+            self.con.execute(
+                """
+                INSERT INTO wc_inbox (
+                    id, wc_raw, wc_norm, sources,
+                    first_seen_date, last_seen_date,
+                    status, linked_project_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(wc_norm) DO UPDATE SET
+                    wc_raw = excluded.wc_raw,
+                    sources = excluded.sources,
+                    first_seen_date = COALESCE(
+                        MIN(wc_inbox.first_seen_date, excluded.first_seen_date),
+                        excluded.first_seen_date,
+                        wc_inbox.first_seen_date
+                    ),
+                    last_seen_date = COALESCE(
+                        MAX(wc_inbox.last_seen_date, excluded.last_seen_date),
+                        excluded.last_seen_date,
+                        wc_inbox.last_seen_date
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(uuid4()),
+                    wc_raw_value,
+                    wc_norm,
+                    json.dumps(sources, ensure_ascii=False),
+                    row.get("first_seen_date"),
+                    row.get("last_seen_date"),
+                    "open",
+                    None,
+                    now,
+                    now,
+                ),
+            )
+
+        self.con.commit()
+
+    def list_open(self, limit: int = 200) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "wc_inbox"):
+            return []
+        cur = self.con.execute(
+            """
+            SELECT *
+            FROM wc_inbox
+            WHERE status = 'open'
+            ORDER BY last_seen_date DESC, wc_raw ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            try:
+                r["sources"] = json.loads(r.get("sources") or "[]")
+            except json.JSONDecodeError:
+                r["sources"] = []
+        return rows
+
+    def ignore(self, wc_norm: str) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+        self._set_status(wc_norm, "ignored", None)
+
+    def link_to_project(self, wc_norm: str, project_id: str) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+        self._set_status(wc_norm, "linked", project_id)
+
+    def mark_created(self, wc_norm: str, project_id: str) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+        self._set_status(wc_norm, "created", project_id)
+
+    def _set_status(self, wc_norm: str, status: str, project_id: str | None) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.con.execute(
+            """
+            UPDATE wc_inbox
+            SET status = ?,
+                linked_project_id = ?,
+                updated_at = ?
+            WHERE wc_norm = ?
+            """,
+            (status, project_id, now, wc_norm),
+        )
+        self.con.commit()
