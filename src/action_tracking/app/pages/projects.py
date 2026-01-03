@@ -354,11 +354,15 @@ def render(con: sqlite3.Connection) -> None:
         default_from = today - timedelta(days=90)
 
         selector_col1, selector_col2, selector_col3, selector_col4 = st.columns(4)
+        project_ids = [project["id"] for project in projects]
         selected_project_id = selector_col1.selectbox(
             "Projekt",
-            [project["id"] for project in projects],
+            project_ids,
             format_func=lambda pid: projects_by_id[pid].get("name", pid),
         )
+        if selected_project_id not in projects_by_id and project_ids:
+            selected_project_id = project_ids[0]
+            st.info("Wybrany projekt nie istnieje — pokazuję pierwszy dostępny.")
         selected_from = selector_col2.date_input("Data od", value=default_from)
         selected_to = selector_col3.date_input("Data do", value=today)
         include_related = selector_col4.checkbox(
@@ -422,7 +426,10 @@ def render(con: sqlite3.Connection) -> None:
 
             scrap_df = pd.DataFrame(scrap_rows)
             if not scrap_df.empty:
-                scrap_df["metric_date"] = pd.to_datetime(scrap_df["metric_date"])
+                scrap_df["metric_date"] = pd.to_datetime(
+                    scrap_df["metric_date"], errors="coerce"
+                )
+                scrap_df = scrap_df.dropna(subset=["metric_date"])
                 scrap_daily = (
                     scrap_df.groupby("metric_date", as_index=False)
                     .agg(
@@ -438,7 +445,10 @@ def render(con: sqlite3.Connection) -> None:
 
             kpi_df = pd.DataFrame(kpi_rows)
             if not kpi_df.empty:
-                kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"])
+                kpi_df["metric_date"] = pd.to_datetime(
+                    kpi_df["metric_date"], errors="coerce"
+                )
+                kpi_df = kpi_df.dropna(subset=["metric_date"])
                 kpi_daily = (
                     kpi_df.groupby("metric_date")
                     .apply(
@@ -517,6 +527,20 @@ def render(con: sqlite3.Connection) -> None:
             merged_daily = pd.merge(
                 scrap_daily, kpi_daily, on="metric_date", how="outer"
             ).sort_values("metric_date")
+
+            if "metric_date" not in merged_daily.columns:
+                st.info("Brak danych produkcyjnych dla wybranego zakresu.")
+                return
+
+            merged_daily["metric_date"] = pd.to_datetime(
+                merged_daily["metric_date"], errors="coerce"
+            )
+            merged_daily = merged_daily.dropna(subset=["metric_date"]).sort_values(
+                "metric_date"
+            )
+            if merged_daily.empty:
+                st.info("Brak poprawnych danych produkcyjnych dla wybranego zakresu.")
+                return
 
             baseline_from, baseline_to, after_from, after_to, used_halves = (
                 _window_bounds(
