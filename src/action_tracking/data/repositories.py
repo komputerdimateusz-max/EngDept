@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from action_tracking.domain.constants import ACTION_CATEGORIES as DEFAULT_ACTION_CATEGORIES
+from action_tracking.services.normalize import normalize_key
 
 
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
@@ -209,6 +210,40 @@ class GlobalSettingsRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
+    def get_category_rules(self, only_active: bool = True) -> list[dict[str, Any]]:
+        try:
+            if not _table_exists(self.con, "category_rules"):
+                return [
+                    self._normalize_category_rule_row(rule)
+                    for rule in _default_category_rules_list(include_inactive=not only_active)
+                ]
+            query = """
+                SELECT category AS category_label,
+                       effect_model AS effectiveness_model,
+                       savings_model,
+                       requires_scope_link,
+                       description,
+                       is_active
+                FROM category_rules
+            """
+            params: list[Any] = []
+            if only_active:
+                query += " WHERE is_active = 1"
+            query += " ORDER BY category ASC"
+            cur = self.con.execute(query, params)
+            rows = [self._normalize_category_rule_row(dict(row)) for row in cur.fetchall()]
+            if not rows:
+                return [
+                    self._normalize_category_rule_row(rule)
+                    for rule in _default_category_rules_list(include_inactive=not only_active)
+                ]
+            return rows
+        except sqlite3.Error:
+            return [
+                self._normalize_category_rule_row(rule)
+                for rule in _default_category_rules_list(include_inactive=not only_active)
+            ]
+
     def list_category_rules(self, include_inactive: bool = False) -> list[dict[str, Any]]:
         try:
             if not _table_exists(self.con, "category_rules"):
@@ -316,16 +351,32 @@ class GlobalSettingsRepository:
         default_rule["is_active"] = bool(is_active)
         self.upsert_category_rule(clean_category, default_rule)
 
-    def resolve_category_rule(self, category: str) -> dict[str, Any]:
-        rule = self.get_category_rule(category)
-        if rule:
-            return rule
-        return _default_category_rule(category)
+    def resolve_category_rule(self, category_label: str) -> dict[str, Any] | None:
+        if not category_label:
+            return None
+        rules = self.get_category_rules(only_active=True)
+        rules_map = {
+            normalize_key(rule.get("category_label") or ""): rule for rule in rules
+        }
+        return rules_map.get(normalize_key(category_label))
 
     def _normalize_rule_row(self, row: dict[str, Any]) -> dict[str, Any]:
         row["requires_scope_link"] = bool(row.get("requires_scope_link"))
         row["is_active"] = bool(row.get("is_active"))
         return row
+
+    def _normalize_category_rule_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        category_label = row.get("category_label") or row.get("category") or ""
+        return {
+            "category_label": category_label,
+            "effectiveness_model": row.get("effectiveness_model")
+            or row.get("effect_model")
+            or "NONE",
+            "savings_model": row.get("savings_model") or "NONE",
+            "requires_scope_link": bool(row.get("requires_scope_link")),
+            "description": row.get("description"),
+            "is_active": bool(row.get("is_active", True)),
+        }
 
     def _normalize_rule_payload(self, category: str, payload: dict[str, Any]) -> dict[str, Any]:
         description = (payload.get("description") or "").strip() or None
@@ -1138,8 +1189,8 @@ class ActionRepository:
 
     def _list_active_action_categories(self) -> list[str]:
         rules_repo = GlobalSettingsRepository(self.con)
-        categories = rules_repo.list_category_rules(include_inactive=False)
-        return [row["category"] for row in categories]
+        categories = rules_repo.get_category_rules(only_active=True)
+        return [row["category_label"] for row in categories]
 
     def _parse_date(self, value: Any, field_name: str) -> date:
         if isinstance(value, date) and not isinstance(value, datetime):
