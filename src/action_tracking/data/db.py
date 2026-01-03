@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS actions (
   impact_type TEXT,
   impact_value REAL,
   category TEXT,
+  manual_savings_amount REAL,
+  manual_savings_currency TEXT,
+  manual_savings_note TEXT,
   FOREIGN KEY(project_id) REFERENCES projects(id),
   FOREIGN KEY(owner_champion_id) REFERENCES champions(id)
 );
@@ -140,6 +143,16 @@ CREATE TABLE IF NOT EXISTS action_effectiveness (
   classification TEXT NOT NULL,
   computed_at TEXT NOT NULL,
   FOREIGN KEY(action_id) REFERENCES actions(id)
+);
+
+CREATE TABLE IF NOT EXISTS category_rules (
+  category TEXT PRIMARY KEY,
+  effect_model TEXT NOT NULL,
+  savings_model TEXT NOT NULL,
+  requires_scope_link INTEGER NOT NULL,
+  is_active INTEGER NOT NULL,
+  description TEXT,
+  updated_at TEXT NOT NULL
 );
 """
 
@@ -421,6 +434,29 @@ def _migrate_to_v9(con: sqlite3.Connection) -> None:
     _set_user_version(con, 9)
 
 
+def _migrate_to_v10(con: sqlite3.Connection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS category_rules (
+          category TEXT PRIMARY KEY,
+          effect_model TEXT NOT NULL,
+          savings_model TEXT NOT NULL,
+          requires_scope_link INTEGER NOT NULL,
+          is_active INTEGER NOT NULL,
+          description TEXT,
+          updated_at TEXT NOT NULL
+        );
+        """
+    )
+    if not _column_exists(con, "actions", "manual_savings_amount"):
+        con.execute("ALTER TABLE actions ADD COLUMN manual_savings_amount REAL;")
+    if not _column_exists(con, "actions", "manual_savings_currency"):
+        con.execute("ALTER TABLE actions ADD COLUMN manual_savings_currency TEXT;")
+    if not _column_exists(con, "actions", "manual_savings_note"):
+        con.execute("ALTER TABLE actions ADD COLUMN manual_savings_note TEXT;")
+    _set_user_version(con, 10)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "action_categories"):
         return
@@ -449,6 +485,80 @@ def _seed_action_categories(con: sqlite3.Connection) -> None:
     )
 
 
+def _seed_category_rules(con: sqlite3.Connection) -> None:
+    if not _table_exists(con, "category_rules"):
+        return
+    row = con.execute("SELECT COUNT(1) AS n FROM category_rules").fetchone()
+    if row and int(row["n"]) > 0:
+        return
+    defaults = [
+        (
+            "Scrap reduction",
+            "SCRAP",
+            "AUTO_SCRAP_COST",
+            1,
+            1,
+            "Automatyczna ocena redukcji złomu i oszczędności kosztu scrapu.",
+        ),
+        (
+            "OEE improvement",
+            "OEE",
+            "NONE",
+            1,
+            1,
+            "Ocena zmian OEE na podstawie danych produkcyjnych (bez wyceny PLN).",
+        ),
+        (
+            "Cost savings",
+            "NONE",
+            "MANUAL_REQUIRED",
+            0,
+            1,
+            "Oszczędności wprowadzane ręcznie przez właściciela akcji.",
+        ),
+        (
+            "Vave",
+            "NONE",
+            "MANUAL_REQUIRED",
+            0,
+            1,
+            "Oszczędności VAVE wprowadzane ręcznie przez właściciela akcji.",
+        ),
+        (
+            "PDP",
+            "NONE",
+            "NONE",
+            0,
+            1,
+            "Brak automatycznych obliczeń; opisujemy rezultat w treści akcji.",
+        ),
+        (
+            "Development",
+            "NONE",
+            "NONE",
+            0,
+            1,
+            "Akcja rozwojowa bez automatycznych KPI i wyceny oszczędności.",
+        ),
+    ]
+    updated_at = datetime.now(timezone.utc).isoformat()
+    payload = [(*row, updated_at) for row in defaults]
+    con.executemany(
+        """
+        INSERT INTO category_rules (
+          category,
+          effect_model,
+          savings_model,
+          requires_scope_link,
+          is_active,
+          description,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        payload,
+    )
+
+
 def init_db(con: sqlite3.Connection) -> None:
     con.executescript(SCHEMA_SQL)
     current_version = _get_user_version(con)
@@ -468,7 +578,10 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v8(con)
     if current_version < 9:
         _migrate_to_v9(con)
+    if current_version < 10:
+        _migrate_to_v10(con)
     _seed_action_categories(con)
+    _seed_category_rules(con)
     con.commit()
 
 def table_count(con: sqlite3.Connection, table: str) -> int:

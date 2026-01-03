@@ -11,11 +11,13 @@ from action_tracking.data.repositories import (
     ActionRepository,
     ChampionRepository,
     EffectivenessRepository,
+    GlobalSettingsRepository,
     ProductionDataRepository,
     ProjectRepository,
     SettingsRepository,
 )
 from action_tracking.services.effectiveness import (
+    compute_kpi_effectiveness,
     compute_scrap_effectiveness,
     parse_date,
     parse_work_centers,
@@ -35,6 +37,9 @@ FIELD_LABELS: dict[str, str] = {
     "impact_type": "Typ wpływu",
     "impact_value": "Wartość wpływu",
     "category": "Kategoria",
+    "manual_savings_amount": "Oszczędności ręczne (kwota)",
+    "manual_savings_currency": "Oszczędności ręczne (waluta)",
+    "manual_savings_note": "Oszczędności ręczne (opis)",
 }
 
 
@@ -88,6 +93,7 @@ def render(con: sqlite3.Connection) -> None:
     effectiveness_repo = EffectivenessRepository(con)
     champion_repo = ChampionRepository(con)
     settings_repo = SettingsRepository(con)
+    rules_repo = GlobalSettingsRepository(con)
 
     projects = project_repo.list_projects(include_counts=True)
     project_names = {
@@ -101,7 +107,10 @@ def render(con: sqlite3.Connection) -> None:
     status_options = ["(Wszystkie)", "open", "in_progress", "blocked", "done", "cancelled"]
     project_options = ["Wszystkie"] + [p["id"] for p in projects]
     champion_options = ["(Wszyscy)"] + [c["id"] for c in champions]
-    active_categories = [c["name"] for c in settings_repo.list_action_categories(active_only=True)]
+    active_rule_rows = rules_repo.list_category_rules(include_inactive=False)
+    active_categories = [row["category"] for row in active_rule_rows]
+    if not active_categories:
+        active_categories = [c["name"] for c in settings_repo.list_action_categories(active_only=True)]
     category_options = ["(Wszystkie)"] + active_categories
 
     col1, col2, col3, col4, col5, col6 = st.columns([1.2, 1.6, 1.6, 1.6, 1.1, 1.6])
@@ -149,15 +158,18 @@ def render(con: sqlite3.Connection) -> None:
     eligible_for_recompute = [
         row
         for row in rows
-        if row.get("category") == "Scrap reduction"
-        and row.get("status") == "done"
-        and row.get("closed_at")
+        if row.get("status") == "done" and row.get("closed_at") and row.get("category")
     ]
 
-    if st.button("Przelicz skuteczność (scrap)"):
+    if st.button("Przelicz skuteczność (wg reguł)"):
         recomputed = 0
         skipped = 0
         for action in eligible_for_recompute:
+            rule = rules_repo.resolve_category_rule(action.get("category") or "")
+            effect_model = rule.get("effect_model")
+            if effect_model == "NONE":
+                skipped += 1
+                continue
             closed_date = parse_date(action.get("closed_at"))
             if closed_date is None:
                 skipped += 1
@@ -168,19 +180,43 @@ def render(con: sqlite3.Connection) -> None:
                 project.get("work_center"), project.get("related_work_center")
             )
 
+            if rule.get("requires_scope_link") and not work_centers:
+                skipped += 1
+                continue
+
             if work_centers:
                 date_from = closed_date - timedelta(days=14)
                 date_to = closed_date + timedelta(days=14)
-                scrap_rows = production_repo.list_scrap_daily(
-                    work_centers,
-                    date_from,
-                    date_to,
-                    currency=None,
-                )
             else:
-                scrap_rows = []
+                date_from = None
+                date_to = None
 
-            payload = compute_scrap_effectiveness(action, work_centers, scrap_rows)
+            payload = None
+            if effect_model == "SCRAP":
+                scrap_rows = (
+                    production_repo.list_scrap_daily(
+                        work_centers,
+                        date_from,
+                        date_to,
+                        currency=None,
+                    )
+                    if work_centers
+                    else []
+                )
+                payload = compute_scrap_effectiveness(action, work_centers, scrap_rows)
+            elif effect_model in {"OEE", "PERFORMANCE"}:
+                kpi_rows = (
+                    production_repo.list_kpi_daily(
+                        work_centers,
+                        date_from,
+                        date_to,
+                    )
+                    if work_centers
+                    else []
+                )
+                metric_key = "oee_pct" if effect_model == "OEE" else "performance_pct"
+                payload = compute_kpi_effectiveness(action, work_centers, kpi_rows, metric_key)
+
             if payload is None:
                 skipped += 1
                 continue
@@ -196,7 +232,9 @@ def render(con: sqlite3.Connection) -> None:
     effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(action_ids)
 
     def _format_effectiveness(action: dict[str, Any]) -> tuple[str, str]:
-        if action.get("category") != "Scrap reduction" or action.get("status") != "done":
+        category = action.get("category") or ""
+        rule = rules_repo.resolve_category_rule(category)
+        if rule.get("effect_model") == "NONE" or action.get("status") != "done":
             return "—", "—"
         if not action.get("closed_at"):
             return "—", "—"
@@ -299,6 +337,14 @@ def render(con: sqlite3.Connection) -> None:
             else 0,
             format_func=_format_category_option,
         )
+        rule = rules_repo.resolve_category_rule(category)
+        st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
+        st.caption(
+            "Metoda obliczeń: "
+            f"Skuteczność = {rule.get('effect_model')}, "
+            f"Oszczędności = {rule.get('savings_model')}, "
+            f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
+        )
 
         project_ids = [p["id"] for p in projects]
         project_id = st.selectbox(
@@ -353,6 +399,31 @@ def render(con: sqlite3.Connection) -> None:
             disabled=no_due_date,
         )
 
+        manual_required = rule.get("savings_model") == "MANUAL_REQUIRED"
+        manual_amount = None
+        manual_currency = None
+        manual_note = ""
+        if manual_required:
+            st.subheader("Oszczędności manualne")
+            manual_amount = st.number_input(
+                "Kwota oszczędności",
+                min_value=0.0,
+                value=float(selected.get("manual_savings_amount") or 0.0),
+                step=100.0,
+            )
+            manual_currency = st.selectbox(
+                "Waluta",
+                ["PLN", "EUR"],
+                index=0
+                if (selected.get("manual_savings_currency") or "PLN") == "PLN"
+                else 1,
+            )
+            manual_note = st.text_area(
+                "Uzasadnienie oszczędności",
+                value=selected.get("manual_savings_note") or "",
+                max_chars=500,
+            )
+
         st.caption("Zmiana statusu na inny niż 'done' czyści datę zamknięcia.")
         submitted = st.form_submit_button("Zapisz")
 
@@ -360,6 +431,23 @@ def render(con: sqlite3.Connection) -> None:
         if category not in active_categories and category != selected.get("category"):
             st.error("Wybierz aktywną kategorię akcji.")
             return
+        if rule.get("requires_scope_link"):
+            project = projects_by_id.get(project_id)
+            if not project or not str(project.get("work_center") or "").strip():
+                st.error(
+                    "Ta kategoria wymaga powiązania z projektem posiadającym work center."
+                )
+                return
+        if manual_required:
+            if manual_amount is None:
+                st.error("Podaj kwotę oszczędności manualnych.")
+                return
+            if not manual_currency:
+                st.error("Wybierz walutę oszczędności manualnych.")
+                return
+            if not (manual_note or "").strip():
+                st.error("Uzupełnij uzasadnienie oszczędności manualnych.")
+                return
         payload = {
             "title": title,
             "description": description,
@@ -369,6 +457,9 @@ def render(con: sqlite3.Connection) -> None:
             "priority": priority,
             "status": status,
             "due_date": None if no_due_date else due_date.isoformat(),
+            "manual_savings_amount": manual_amount if manual_required else None,
+            "manual_savings_currency": manual_currency if manual_required else None,
+            "manual_savings_note": manual_note if manual_required else None,
         }
         try:
             if editing:
