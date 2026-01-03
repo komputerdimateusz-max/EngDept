@@ -152,6 +152,36 @@ def _normalize_impact_aspects_payload(value: Any) -> str | None:
     return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
 
 
+def _normalize_percent(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= number <= 1:
+        return number * 100
+    return number
+
+
+def _normalize_int(value: Any, default: int | None = None) -> int | None:
+    if value in (None, ""):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_float(value: Any, default: float | None = None) -> float | None:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # =====================================================
 # DEFAULT CATEGORY RULES (fallback if category_rules missing)
 # =====================================================
@@ -450,19 +480,128 @@ class SettingsRepository:
                 for i, name in enumerate(DEFAULT_ACTION_CATEGORIES)
             ]
 
-        query = """
-            SELECT id, name, is_active, sort_order, created_at
+        cols = _table_columns(self.con, "action_categories")
+        if not cols:
+            return []
+
+        select_cols = [c for c in ("id", "name", "is_active", "sort_order", "created_at") if c in cols]
+        if not select_cols:
+            return []
+
+        query = f"""
+            SELECT {", ".join(select_cols)}
             FROM action_categories
         """
         params: list[Any] = []
         if active_only:
-            query += " WHERE is_active = 1"
-        query += " ORDER BY sort_order ASC, name ASC"
+            if "is_active" in cols:
+                query += " WHERE is_active = 1"
+        if "sort_order" in cols and "name" in cols:
+            query += " ORDER BY sort_order ASC, name ASC"
+        elif "name" in cols:
+            query += " ORDER BY name ASC"
         cur = self.con.execute(query, params)
         rows = [dict(r) for r in cur.fetchall()]
         for r in rows:
-            r["is_active"] = bool(r.get("is_active"))
+            r.setdefault("id", r.get("name"))
+            r.setdefault("name", r.get("id"))
+            r["is_active"] = bool(r.get("is_active", True))
+            r.setdefault("sort_order", None)
+            r.setdefault("created_at", None)
         return rows
+
+    def create_action_category(self, name: str, sort_order: int | None = None) -> str | None:
+        if not name:
+            return None
+        if not _table_exists(self.con, "action_categories"):
+            return None
+
+        cols = _table_columns(self.con, "action_categories")
+        if not cols:
+            return None
+
+        category_id = str(uuid4()) if "id" in cols else name
+        now = datetime.now(timezone.utc).isoformat()
+        payload: dict[str, Any] = {}
+        if "id" in cols:
+            payload["id"] = category_id
+        if "name" in cols:
+            payload["name"] = name
+        if "is_active" in cols:
+            payload["is_active"] = 1
+        if "sort_order" in cols and sort_order is not None:
+            payload["sort_order"] = int(sort_order)
+        if "created_at" in cols:
+            payload["created_at"] = now
+
+        if not payload:
+            return None
+
+        insert_cols = list(payload.keys())
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        self.con.execute(
+            f"INSERT INTO action_categories ({', '.join(insert_cols)}) VALUES ({placeholders})",
+            [payload[c] for c in insert_cols],
+        )
+        self.con.commit()
+        return category_id
+
+    def update_action_category(
+        self,
+        category_id: str,
+        name: str | None = None,
+        sort_order: int | None = None,
+        is_active: bool | None = None,
+    ) -> None:
+        if not category_id:
+            return
+        if not _table_exists(self.con, "action_categories"):
+            return
+
+        cols = _table_columns(self.con, "action_categories")
+        if not cols:
+            return
+
+        payload: dict[str, Any] = {}
+        if name is not None and "name" in cols:
+            payload["name"] = name
+        if sort_order is not None and "sort_order" in cols:
+            payload["sort_order"] = int(sort_order)
+        if is_active is not None and "is_active" in cols:
+            payload["is_active"] = 1 if is_active else 0
+
+        if not payload:
+            return
+
+        key_col = "id" if "id" in cols else ("name" if "name" in cols else None)
+        if not key_col:
+            return
+
+        sets = [f"{col} = ?" for col in payload.keys()]
+        params = list(payload.values())
+        params.append(category_id)
+        self.con.execute(
+            f"UPDATE action_categories SET {', '.join(sets)} WHERE {key_col} = ?",
+            params,
+        )
+        self.con.commit()
+
+    def deactivate_action_category(self, category_id: str) -> None:
+        if not category_id:
+            return
+        if not _table_exists(self.con, "action_categories"):
+            return
+        cols = _table_columns(self.con, "action_categories")
+        if not cols or "is_active" not in cols:
+            return
+        key_col = "id" if "id" in cols else ("name" if "name" in cols else None)
+        if not key_col:
+            return
+        self.con.execute(
+            f"UPDATE action_categories SET is_active = 0 WHERE {key_col} = ?",
+            (category_id,),
+        )
+        self.con.commit()
 
 
 class GlobalSettingsRepository:
@@ -770,6 +909,9 @@ class NotificationRepository:
             return False
         if not _table_exists(self.con, "email_notifications_log"):
             return False
+        cols = _table_columns(self.con, "email_notifications_log")
+        if "unique_key" not in cols:
+            return False
         try:
             cur = self.con.execute(
                 """
@@ -795,6 +937,18 @@ class NotificationRepository:
         if not unique_key:
             return
         if not _table_exists(self.con, "email_notifications_log"):
+            return
+        cols = _table_columns(self.con, "email_notifications_log")
+        required = {
+            "id",
+            "created_at",
+            "notification_type",
+            "recipient_email",
+            "action_id",
+            "payload_json",
+            "unique_key",
+        }
+        if not required.issubset(cols):
             return
         payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
         try:
@@ -827,18 +981,29 @@ class NotificationRepository:
     def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "email_notifications_log"):
             return []
+        cols = _table_columns(self.con, "email_notifications_log")
+        select_cols = [
+            c
+            for c in (
+                "id",
+                "created_at",
+                "notification_type",
+                "recipient_email",
+                "action_id",
+                "payload_json",
+                "unique_key",
+            )
+            if c in cols
+        ]
+        if not select_cols:
+            return []
+        order_clause = "ORDER BY created_at DESC" if "created_at" in cols else "ORDER BY rowid DESC"
         try:
             cur = self.con.execute(
-                """
-                SELECT id,
-                       created_at,
-                       notification_type,
-                       recipient_email,
-                       action_id,
-                       payload_json,
-                       unique_key
+                f"""
+                SELECT {", ".join(select_cols)}
                 FROM email_notifications_log
-                ORDER BY created_at DESC
+                {order_clause}
                 LIMIT ?
                 """,
                 (int(limit),),
@@ -865,60 +1030,104 @@ class ActionRepository:
         overdue_only: bool = False,
         search_text: str | None = None,
     ) -> list[dict[str, Any]]:
-        base_query = """
-            SELECT a.*,
-                   p.name AS project_name,
-                   TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS owner_name
+        if not _table_exists(self.con, "actions"):
+            return []
+
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols:
+            return []
+
+        select_cols = [f"a.{c}" for c in action_cols]
+        if "id" not in action_cols:
+            select_cols.append("a.rowid AS id")
+
+        joins: list[str] = []
+        project_name_select = "NULL AS project_name"
+        if _table_exists(self.con, "projects") and "project_id" in action_cols:
+            project_cols = _table_columns(self.con, "projects")
+            if "id" in project_cols and "name" in project_cols:
+                joins.append("LEFT JOIN projects p ON p.id = a.project_id")
+                project_name_select = "p.name AS project_name"
+
+        owner_name_select = "NULL AS owner_name"
+        if _table_exists(self.con, "champions") and "owner_champion_id" in action_cols:
+            champion_cols = _table_columns(self.con, "champions")
+            if "id" in champion_cols:
+                joins.append("LEFT JOIN champions ch ON ch.id = a.owner_champion_id")
+                owner_name_select = (
+                    "TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS owner_name"
+                )
+
+        select_sql = ", ".join(select_cols + [project_name_select, owner_name_select])
+        base_query = f"""
+            SELECT {select_sql}
             FROM actions a
-            LEFT JOIN projects p ON p.id = a.project_id
-            LEFT JOIN champions ch ON ch.id = a.owner_champion_id
+            {' '.join(joins)}
         """
         filters: list[str] = []
         params: list[Any] = []
         today = date.today().isoformat()
 
-        if status:
+        if status and "status" in action_cols:
             filters.append("a.status = ?")
             params.append(status)
-        if project_id:
+        if project_id and "project_id" in action_cols:
             filters.append("a.project_id = ?")
             params.append(project_id)
-        if champion_id:
+        if champion_id and "owner_champion_id" in action_cols:
             filters.append("a.owner_champion_id = ?")
             params.append(champion_id)
-        if is_draft is not None:
+        if is_draft is not None and "is_draft" in action_cols:
             filters.append("a.is_draft = ?")
             params.append(1 if is_draft else 0)
-        if overdue_only:
+        if overdue_only and "due_date" in action_cols and "status" in action_cols:
             filters.append(
                 "a.due_date IS NOT NULL AND a.due_date < ? AND a.status NOT IN ('done','cancelled')"
             )
             params.append(today)
-        if search_text:
+        if search_text and "title" in action_cols:
             filters.append("a.title LIKE ?")
             params.append(f"%{search_text.strip()}%")
 
         if filters:
             base_query += " WHERE " + " AND ".join(filters)
 
-        base_query += """
-            ORDER BY
-                CASE
-                    WHEN a.due_date IS NOT NULL
-                         AND a.due_date < ?
-                         AND a.status NOT IN ('done','cancelled')
-                    THEN 0 ELSE 1 END,
-                a.due_date IS NULL,
-                a.due_date,
-                a.created_at DESC
-        """
-        params.append(today)
+        if "due_date" in action_cols and "status" in action_cols:
+            base_query += """
+                ORDER BY
+                    CASE
+                        WHEN a.due_date IS NOT NULL
+                             AND a.due_date < ?
+                             AND a.status NOT IN ('done','cancelled')
+                        THEN 0 ELSE 1 END,
+                    a.due_date IS NULL,
+                    a.due_date,
+                    a.created_at DESC
+            """
+            params.append(today)
+        elif "created_at" in action_cols:
+            base_query += " ORDER BY a.created_at DESC"
+        else:
+            base_query += " ORDER BY a.rowid DESC"
 
-        cur = self.con.execute(base_query, params)
-        return [dict(r) for r in cur.fetchall()]
+        try:
+            cur = self.con.execute(base_query, params)
+            rows = [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
+        for row in rows:
+            row.setdefault("project_name", None)
+            row.setdefault("owner_name", None)
+        return rows
 
     def create_action(self, data: dict[str, Any]) -> str:
         action_id = data.get("id") or str(uuid4())
+        if not _table_exists(self.con, "actions"):
+            return action_id
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols:
+            return action_id
         payload = self._normalize_action_payload(action_id, data)
 
         cols = [
@@ -945,13 +1154,20 @@ class ActionRepository:
             "submitted_by_email",
             "submitted_at",
         ]
-        vals = [payload.get(c) for c in cols]
-        placeholders = ", ".join(["?"] * len(cols))
-        self.con.execute(
-            f"INSERT INTO actions ({', '.join(cols)}) VALUES ({placeholders})",
-            vals,
-        )
-        self.con.commit()
+        insert_cols = [c for c in cols if c in action_cols]
+        if not insert_cols:
+            return action_id
+        vals = [payload.get(c) for c in insert_cols]
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        _configure_sqlite_connection(self.con)
+        try:
+            self.con.execute(
+                f"INSERT INTO actions ({', '.join(insert_cols)}) VALUES ({placeholders})",
+                vals,
+            )
+            self.con.commit()
+        except sqlite3.Error:
+            return action_id
         return action_id
 
     # ============================
@@ -967,14 +1183,21 @@ class ActionRepository:
           - else => closed_at cleared
         """
         if not action_id:
-            raise ValueError("action_id is required")
+            return
         if not _table_exists(self.con, "actions"):
-            raise ValueError("actions table missing")
+            return
 
-        cur = self.con.execute("SELECT * FROM actions WHERE id = ?", (action_id,))
-        existing_row = cur.fetchone()
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols:
+            return
+
+        try:
+            cur = self.con.execute("SELECT * FROM actions WHERE id = ?", (action_id,))
+            existing_row = cur.fetchone()
+        except sqlite3.Error:
+            return
         if not existing_row:
-            raise ValueError("Action not found")
+            return
 
         existing = dict(existing_row)
 
@@ -1014,7 +1237,7 @@ class ActionRepository:
         sets: list[str] = []
         params: list[Any] = []
         for col in allowed_cols:
-            if col in payload:
+            if col in payload and col in action_cols:
                 sets.append(f"{col} = ?")
                 params.append(payload.get(col))
 
@@ -1023,16 +1246,23 @@ class ActionRepository:
 
         params.append(action_id)
         sql = f"UPDATE actions SET {', '.join(sets)} WHERE id = ?"
-        self.con.execute(sql, params)
-        self.con.commit()
+        _configure_sqlite_connection(self.con)
+        try:
+            self.con.execute(sql, params)
+            self.con.commit()
+        except sqlite3.Error:
+            return
 
     def delete_action(self, action_id: str) -> None:
         if not action_id:
             return
         if not _table_exists(self.con, "actions"):
             return
-        self.con.execute("DELETE FROM actions WHERE id = ?", (action_id,))
-        self.con.commit()
+        try:
+            self.con.execute("DELETE FROM actions WHERE id = ?", (action_id,))
+            self.con.commit()
+        except sqlite3.Error:
+            return
 
     def list_action_changelog(
         self, limit: int = 50, project_id: str | None = None, action_id: str | None = None
@@ -1111,35 +1341,55 @@ class ActionRepository:
         champion_id: str | None = None,
         category: str | None = None,
     ) -> list[dict[str, Any]]:
-        query = """
-            SELECT id,
-                   title,
-                   created_at,
-                   closed_at,
-                   due_date,
-                   status,
-                   owner_champion_id,
-                   category,
-                   project_id,
-                   impact_aspects
-            FROM actions
-            WHERE is_draft = 0
+        if not _table_exists(self.con, "actions"):
+            return []
+
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols:
+            return []
+
+        select_fields = []
+        for col in (
+            "id",
+            "title",
+            "created_at",
+            "closed_at",
+            "due_date",
+            "status",
+            "owner_champion_id",
+            "category",
+            "project_id",
+            "impact_aspects",
+        ):
+            if col in action_cols:
+                select_fields.append(f"a.{col}")
+            else:
+                select_fields.append(f"NULL AS {col}")
+
+        query = f"""
+            SELECT {", ".join(select_fields)}
+            FROM actions a
         """
         filters: list[str] = []
         params: list[Any] = []
-        if project_id:
+        if "is_draft" in action_cols:
+            filters.append("a.is_draft = 0")
+        if project_id and "project_id" in action_cols:
             filters.append("project_id = ?")
             params.append(project_id)
-        if champion_id:
+        if champion_id and "owner_champion_id" in action_cols:
             filters.append("owner_champion_id = ?")
             params.append(champion_id)
-        if category:
+        if category and "category" in action_cols:
             filters.append("category = ?")
             params.append(category)
         if filters:
-            query += " AND " + " AND ".join(filters)
-        cur = self.con.execute(query, params)
-        return [dict(r) for r in cur.fetchall()]
+            query += " WHERE " + " AND ".join(filters)
+        try:
+            cur = self.con.execute(query, params)
+            return [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
 
     def list_actions_for_ranking(
         self,
@@ -1148,47 +1398,87 @@ class ActionRepository:
         date_from: date | None = None,
         date_to: date | None = None,
     ) -> list[dict[str, Any]]:
-        query = """
-            SELECT a.id,
-                   a.title,
-                   a.owner_champion_id,
-                   a.project_id,
-                   p.name AS project_name,
-                   a.category,
-                   a.status,
-                   a.created_at,
-                   a.due_date,
-                   a.closed_at,
-                   a.manual_savings_amount,
-                   a.manual_savings_currency,
-                   a.manual_savings_note,
-                   ae.metric AS effectiveness_metric,
-                   ae.delta AS effectiveness_delta
+        if not _table_exists(self.con, "actions"):
+            return []
+
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols:
+            return []
+
+        select_fields = []
+        for col in (
+            "id",
+            "title",
+            "owner_champion_id",
+            "project_id",
+            "category",
+            "status",
+            "created_at",
+            "due_date",
+            "closed_at",
+            "manual_savings_amount",
+            "manual_savings_currency",
+            "manual_savings_note",
+        ):
+            if col in action_cols:
+                select_fields.append(f"a.{col}")
+            else:
+                select_fields.append(f"NULL AS {col}")
+
+        joins: list[str] = []
+        project_name_select = "NULL AS project_name"
+        if _table_exists(self.con, "projects") and "project_id" in action_cols:
+            project_cols = _table_columns(self.con, "projects")
+            if "id" in project_cols and "name" in project_cols:
+                joins.append("LEFT JOIN projects p ON p.id = a.project_id")
+                project_name_select = "p.name AS project_name"
+
+        effectiveness_select = ["NULL AS effectiveness_metric", "NULL AS effectiveness_delta"]
+        if _table_exists(self.con, "action_effectiveness"):
+            eff_cols = _table_columns(self.con, "action_effectiveness")
+            if "action_id" in eff_cols:
+                joins.append("LEFT JOIN action_effectiveness ae ON ae.action_id = a.id")
+                metric_select = "ae.metric AS effectiveness_metric" if "metric" in eff_cols else "NULL AS effectiveness_metric"
+                delta_select = "ae.delta AS effectiveness_delta" if "delta" in eff_cols else "NULL AS effectiveness_delta"
+                effectiveness_select = [metric_select, delta_select]
+
+        select_sql = ", ".join(select_fields + [project_name_select] + effectiveness_select)
+        query = f"""
+            SELECT {select_sql}
             FROM actions a
-            LEFT JOIN projects p ON p.id = a.project_id
-            LEFT JOIN action_effectiveness ae ON ae.action_id = a.id
-            WHERE a.created_at IS NOT NULL AND a.is_draft = 0
+            {' '.join(joins)}
         """
         filters: list[str] = []
         params: list[Any] = []
-        if project_id:
+        if "created_at" in action_cols:
+            filters.append("a.created_at IS NOT NULL")
+        if "is_draft" in action_cols:
+            filters.append("a.is_draft = 0")
+        if project_id and "project_id" in action_cols:
             filters.append("a.project_id = ?")
             params.append(project_id)
-        if category:
+        if category and "category" in action_cols:
             filters.append("a.category = ?")
             params.append(category)
-        if date_to:
+        if date_to and "created_at" in action_cols:
             filters.append("date(a.created_at) <= date(?)")
             params.append(date_to.isoformat())
-        if date_from:
-            filters.append(
-                "(date(a.created_at) >= date(?) OR (a.closed_at IS NOT NULL AND date(a.closed_at) >= date(?)))"
-            )
-            params.extend([date_from.isoformat(), date_from.isoformat()])
+        if date_from and "created_at" in action_cols:
+            if "closed_at" in action_cols:
+                filters.append(
+                    "(date(a.created_at) >= date(?) OR (a.closed_at IS NOT NULL AND date(a.closed_at) >= date(?)))"
+                )
+                params.extend([date_from.isoformat(), date_from.isoformat()])
+            else:
+                filters.append("date(a.created_at) >= date(?)")
+                params.append(date_from.isoformat())
         if filters:
-            query += " AND " + " AND ".join(filters)
-        cur = self.con.execute(query, params)
-        return [dict(r) for r in cur.fetchall()]
+            query += " WHERE " + " AND ".join(filters)
+        try:
+            cur = self.con.execute(query, params)
+            return [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
 
     def list_actions_for_project_outcome(
         self,
@@ -1200,6 +1490,9 @@ class ActionRepository:
             return []
         if not _table_exists(self.con, "actions"):
             return []
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols or "project_id" not in action_cols:
+            return []
 
         def _d(v: date | str | None) -> str | None:
             if v is None:
@@ -1209,46 +1502,79 @@ class ActionRepository:
         df = _d(date_from)
         dt = _d(date_to)
 
-        query = """
-            SELECT a.id,
-                   a.title,
-                   a.description,
-                   a.category,
-                   a.status,
-                   a.created_at,
-                   a.due_date,
-                   a.closed_at,
-                   a.owner_champion_id,
-                   TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS owner_name,
-                   a.impact_type,
-                   a.impact_value,
-                   a.impact_aspects,
-                   a.manual_savings_amount,
-                   a.manual_savings_currency,
-                   a.manual_savings_note
+        select_fields = []
+        for col in (
+            "id",
+            "title",
+            "description",
+            "category",
+            "status",
+            "created_at",
+            "due_date",
+            "closed_at",
+            "owner_champion_id",
+            "impact_type",
+            "impact_value",
+            "impact_aspects",
+            "manual_savings_amount",
+            "manual_savings_currency",
+            "manual_savings_note",
+        ):
+            if col in action_cols:
+                select_fields.append(f"a.{col}")
+            else:
+                select_fields.append(f"NULL AS {col}")
+
+        joins: list[str] = []
+        owner_name_select = "NULL AS owner_name"
+        if _table_exists(self.con, "champions") and "owner_champion_id" in action_cols:
+            champion_cols = _table_columns(self.con, "champions")
+            if "id" in champion_cols:
+                joins.append("LEFT JOIN champions ch ON ch.id = a.owner_champion_id")
+                owner_name_select = (
+                    "TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS owner_name"
+                )
+
+        select_sql = ", ".join(select_fields + [owner_name_select])
+        query = f"""
+            SELECT {select_sql}
             FROM actions a
-            LEFT JOIN champions ch ON ch.id = a.owner_champion_id
+            {' '.join(joins)}
             WHERE a.project_id = ?
-              AND a.is_draft = 0
         """
         params: list[Any] = [project_id]
+
+        if "is_draft" in action_cols:
+            query += " AND a.is_draft = 0"
 
         if df or dt:
             df = df or "0001-01-01"
             dt = dt or "9999-12-31"
-            query += """
-              AND (
-                    (a.created_at IS NOT NULL AND date(a.created_at) BETWEEN date(?) AND date(?))
-                 OR (a.closed_at  IS NOT NULL AND date(a.closed_at)  BETWEEN date(?) AND date(?))
-                 OR (a.due_date   IS NOT NULL AND date(a.due_date)   BETWEEN date(?) AND date(?))
-              )
-            """
-            params.extend([df, dt, df, dt, df, dt])
+            date_filters = []
+            if "created_at" in action_cols:
+                date_filters.append("(a.created_at IS NOT NULL AND date(a.created_at) BETWEEN date(?) AND date(?))")
+                params.extend([df, dt])
+            if "closed_at" in action_cols:
+                date_filters.append("(a.closed_at IS NOT NULL AND date(a.closed_at) BETWEEN date(?) AND date(?))")
+                params.extend([df, dt])
+            if "due_date" in action_cols:
+                date_filters.append("(a.due_date IS NOT NULL AND date(a.due_date) BETWEEN date(?) AND date(?))")
+                params.extend([df, dt])
+            if date_filters:
+                query += " AND (" + " OR ".join(date_filters) + ")"
 
-        query += " ORDER BY a.closed_at DESC, a.created_at DESC"
+        if "closed_at" in action_cols and "created_at" in action_cols:
+            query += " ORDER BY a.closed_at DESC, a.created_at DESC"
+        elif "created_at" in action_cols:
+            query += " ORDER BY a.created_at DESC"
+        else:
+            query += " ORDER BY a.rowid DESC"
 
-        cur = self.con.execute(query, params)
-        rows = [dict(r) for r in cur.fetchall()]
+        try:
+            cur = self.con.execute(query, params)
+            rows = [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
         for r in rows:
             r.setdefault("owner_name", None)
             r.setdefault("impact_aspects", None)
@@ -1284,58 +1610,46 @@ class EffectivenessRepository:
     def upsert_effectiveness(self, action_id: str, payload: dict[str, Any]) -> None:
         if not _table_exists(self.con, "action_effectiveness"):
             return
+        eff_cols = _table_columns(self.con, "action_effectiveness")
+        if not eff_cols or "action_id" not in eff_cols:
+            return
+
         record_id = payload.get("id") or str(uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        full_payload = {
+            "id": record_id,
+            "action_id": action_id,
+            "metric": payload.get("metric"),
+            "baseline_from": payload.get("baseline_from"),
+            "baseline_to": payload.get("baseline_to"),
+            "after_from": payload.get("after_from"),
+            "after_to": payload.get("after_to"),
+            "baseline_days": int(payload.get("baseline_days") or 0),
+            "after_days": int(payload.get("after_days") or 0),
+            "baseline_avg": payload.get("baseline_avg"),
+            "after_avg": payload.get("after_avg"),
+            "delta": payload.get("delta"),
+            "pct_change": payload.get("pct_change"),
+            "classification": payload.get("classification"),
+            "computed_at": payload.get("computed_at") or now,
+        }
+
+        insert_cols = [c for c in full_payload.keys() if c in eff_cols]
+        if not insert_cols:
+            return
+        values = [full_payload[c] for c in insert_cols]
+        update_cols = [c for c in insert_cols if c not in {"id", "action_id"}]
+        update_clause = ", ".join([f"{col} = excluded.{col}" for col in update_cols])
+        placeholders = ", ".join(["?"] * len(insert_cols))
+
         self.con.execute(
-            """
-            INSERT INTO action_effectiveness (
-                id,
-                action_id,
-                metric,
-                baseline_from,
-                baseline_to,
-                after_from,
-                after_to,
-                baseline_days,
-                after_days,
-                baseline_avg,
-                after_avg,
-                delta,
-                pct_change,
-                classification,
-                computed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            f"""
+            INSERT INTO action_effectiveness ({', '.join(insert_cols)})
+            VALUES ({placeholders})
             ON CONFLICT(action_id) DO UPDATE SET
-                metric = excluded.metric,
-                baseline_from = excluded.baseline_from,
-                baseline_to = excluded.baseline_to,
-                after_from = excluded.after_from,
-                after_to = excluded.after_to,
-                baseline_days = excluded.baseline_days,
-                after_days = excluded.after_days,
-                baseline_avg = excluded.baseline_avg,
-                after_avg = excluded.after_avg,
-                delta = excluded.delta,
-                pct_change = excluded.pct_change,
-                classification = excluded.classification,
-                computed_at = excluded.computed_at
+                {update_clause}
             """,
-            (
-                record_id,
-                action_id,
-                payload.get("metric"),
-                payload.get("baseline_from"),
-                payload.get("baseline_to"),
-                payload.get("after_from"),
-                payload.get("after_to"),
-                int(payload.get("baseline_days") or 0),
-                int(payload.get("after_days") or 0),
-                payload.get("baseline_avg"),
-                payload.get("after_avg"),
-                payload.get("delta"),
-                payload.get("pct_change"),
-                payload.get("classification"),
-                payload.get("computed_at") or datetime.now(timezone.utc).isoformat(),
-            ),
+            values,
         )
         self.con.commit()
 
@@ -1344,10 +1658,14 @@ class EffectivenessRepository:
             return {}
         if not _table_exists(self.con, "action_effectiveness"):
             return {}
+        eff_cols = _table_columns(self.con, "action_effectiveness")
+        if not eff_cols or "action_id" not in eff_cols:
+            return {}
         placeholders = ", ".join(["?"] * len(action_ids))
+        select_cols = ", ".join(eff_cols)
         cur = self.con.execute(
             f"""
-            SELECT *
+            SELECT {select_cols}
             FROM action_effectiveness
             WHERE action_id IN ({placeholders})
             """,
@@ -1370,47 +1688,62 @@ class ProjectRepository:
 
     def create_project(self, data: dict[str, Any]) -> str:
         if not _table_exists(self.con, "projects"):
-            raise ValueError("projects table missing")
+            return ""
 
         project_id = data.get("id") or str(uuid4())
-        payload = self._normalize_project_payload(project_id, data)
-
-        try:
-            cur = self.con.execute("PRAGMA table_info(projects)")
-            cols = {r[1] for r in cur.fetchall()}
-        except sqlite3.Error:
-            cols = set()
+        cols = _table_columns(self.con, "projects")
         if not cols:
-            raise ValueError("projects table has no columns")
+            return ""
+
+        if "name" in cols and not (data.get("name") or "").strip():
+            raise ValueError("name is required")
+        if "work_center" in cols and not (data.get("work_center") or "").strip():
+            raise ValueError("work_center is required")
+
+        if "name" in cols and "work_center" in cols:
+            payload = self._normalize_project_payload(project_id, data)
+        else:
+            payload = {"id": project_id}
+            if "name" in cols:
+                payload["name"] = (data.get("name") or "").strip() or None
+            if "work_center" in cols:
+                payload["work_center"] = (data.get("work_center") or "").strip() or None
+            if "status" in cols:
+                payload["status"] = (data.get("status") or "active").strip() or "active"
+            if "created_at" in cols:
+                payload["created_at"] = datetime.now(timezone.utc).isoformat()
 
         insert_cols = [c for c in payload.keys() if c in cols]
         if not insert_cols:
-            raise ValueError("projects table has no insertable columns")
+            return project_id
 
         placeholders = ", ".join(["?"] * len(insert_cols))
         values = [payload[c] for c in insert_cols]
-        self.con.execute(
-            f"INSERT INTO projects ({', '.join(insert_cols)}) VALUES ({placeholders})",
-            values,
-        )
-        self.con.commit()
+        try:
+            self.con.execute(
+                f"INSERT INTO projects ({', '.join(insert_cols)}) VALUES ({placeholders})",
+                values,
+            )
+            self.con.commit()
+        except sqlite3.Error:
+            return project_id
         return project_id
 
     def update_project(self, project_id: str, data: dict[str, Any]) -> None:
         if not project_id:
-            raise ValueError("project_id is required")
+            return
         if not _table_exists(self.con, "projects"):
-            raise ValueError("projects table missing")
+            return
 
         cols = _table_columns(self.con, "projects")
         if not cols:
-            raise ValueError("projects table has no columns")
+            return
 
         name = (data.get("name") or "").strip()
         work_center = (data.get("work_center") or "").strip()
-        if not name:
+        if "name" in cols and not name:
             raise ValueError("name is required")
-        if not work_center:
+        if "work_center" in cols and not work_center:
             raise ValueError("work_center is required")
 
         data_keys = set(data.keys())
@@ -1526,33 +1859,53 @@ class ProjectRepository:
     def list_projects(self, include_counts: bool = True) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "projects"):
             return []
-        if include_counts and _table_exists(self.con, "actions"):
-            cur = self.con.execute(
-                """
-                SELECT p.id,
-                       p.name,
-                       p.type,
-                       p.owner_champion_id,
-                       p.status,
-                       p.created_at,
-                       p.closed_at,
-                       p.work_center,
-                       p.project_code,
-                       p.project_sop,
-                       p.project_eop,
-                       p.related_work_center,
+        project_cols = _table_columns(self.con, "projects")
+        if not project_cols:
+            return []
+
+        if include_counts and _table_exists(self.con, "actions") and "id" in project_cols:
+            action_cols = _table_columns(self.con, "actions")
+            select_fields = []
+            for col in (
+                "id",
+                "name",
+                "type",
+                "owner_champion_id",
+                "status",
+                "created_at",
+                "closed_at",
+                "work_center",
+                "project_code",
+                "project_sop",
+                "project_eop",
+                "related_work_center",
+            ):
+                if col in project_cols:
+                    select_fields.append(f"p.{col}")
+                else:
+                    select_fields.append(f"NULL AS {col}")
+
+            status_col = "a.status" if "status" in action_cols else "NULL"
+            is_draft_filter = "AND a.is_draft = 0" if "is_draft" in action_cols else ""
+            query = f"""
+                SELECT {", ".join(select_fields)},
                        COUNT(a.id) AS actions_total,
-                       COALESCE(SUM(CASE WHEN a.status IN ('done','cancelled') THEN 1 ELSE 0 END), 0) AS actions_closed,
-                       COALESCE(SUM(CASE WHEN a.status NOT IN ('done','cancelled') THEN 1 ELSE 0 END), 0) AS actions_open
+                       COALESCE(SUM(CASE WHEN {status_col} IN ('done','cancelled') THEN 1 ELSE 0 END), 0) AS actions_closed,
+                       COALESCE(SUM(CASE WHEN {status_col} NOT IN ('done','cancelled') THEN 1 ELSE 0 END), 0) AS actions_open
                 FROM projects p
-                LEFT JOIN actions a ON a.project_id = p.id AND a.is_draft = 0
+                LEFT JOIN actions a ON a.project_id = p.id {is_draft_filter}
                 GROUP BY p.id
-                ORDER BY p.name
-                """
-            )
+            """
+            if "name" in project_cols:
+                query += " ORDER BY p.name"
+            cur = self.con.execute(query)
             return [dict(r) for r in cur.fetchall()]
 
-        cur = self.con.execute("SELECT * FROM projects ORDER BY name")
+        select_cols = ", ".join(project_cols)
+        query = f"SELECT {select_cols} FROM projects"
+        if "name" in project_cols:
+            query += " ORDER BY name"
+        cur = self.con.execute(query)
         return [dict(r) for r in cur.fetchall()]
 
     def list_project_work_centers_norms(self, include_related: bool = True) -> set[str]:
@@ -1570,7 +1923,13 @@ class ProjectRepository:
         if not _table_exists(self.con, "projects"):
             return set()
 
-        cur = self.con.execute("SELECT work_center, related_work_center FROM projects")
+        cols = _table_columns(self.con, "projects")
+        if not cols:
+            return set()
+        select_cols = [c for c in ("work_center", "related_work_center") if c in cols]
+        if not select_cols:
+            return set()
+        cur = self.con.execute(f"SELECT {', '.join(select_cols)} FROM projects")
         norms: set[str] = set()
         for row in cur.fetchall():
             rowd = dict(row)
@@ -1671,20 +2030,21 @@ class ChampionRepository:
         if not _table_exists(self.con, "champions"):
             return []
 
-        cols: set[str] = set()
-        try:
-            cur = self.con.execute("PRAGMA table_info(champions)")
-            cols = {r[1] for r in cur.fetchall()}
-        except sqlite3.Error:
-            cols = set()
+        cols = _table_columns(self.con, "champions")
+        if not cols:
+            return []
 
-        select_cols = ["id", "first_name", "last_name", "email", "active"]
+        base_cols = ["id", "first_name", "last_name", "email", "active"]
+        select_cols = [c for c in base_cols if c in cols]
         if "hire_date" in cols:
             select_cols.append("hire_date")
         if "position" in cols:
             select_cols.append("position")
         if "team" in cols:
             select_cols.append("team")
+
+        if not select_cols:
+            return []
 
         cur = self.con.execute(
             f"""
@@ -1695,6 +2055,11 @@ class ChampionRepository:
         )
         rows = [dict(r) for r in cur.fetchall()]
         for r in rows:
+            r.setdefault("id", None)
+            r.setdefault("first_name", None)
+            r.setdefault("last_name", None)
+            r.setdefault("email", None)
+            r.setdefault("active", 1)
             r["display_name"] = (
                 f"{(r.get('first_name') or '').strip()} {(r.get('last_name') or '').strip()}".strip()
                 or r.get("email")
@@ -1708,6 +2073,9 @@ class ChampionRepository:
 
     def get_assigned_projects(self, champion_id: str) -> list[str]:
         if not _table_exists(self.con, "champion_projects"):
+            return []
+        cols = _table_columns(self.con, "champion_projects")
+        if "champion_id" not in cols or "project_id" not in cols:
             return []
         cur = self.con.execute(
             """
@@ -1770,7 +2138,7 @@ class ChampionRepository:
             self.con.execute("COMMIT")
         except Exception:
             _rollback_safely(self.con)
-            raise
+            return
 
     def list_changelog(self, limit: int = 50, champion_id: str | None = None) -> list[dict[str, Any]]:
         return _list_changelog_generic(
@@ -1789,11 +2157,11 @@ class ChampionRepository:
 
     def create_champion(self, data: dict[str, Any]) -> str:
         if not _table_exists(self.con, "champions"):
-            raise ValueError("champions table missing")
+            return ""
 
         cols = _table_columns(self.con, "champions")
         if not cols:
-            raise ValueError("champions table has no columns")
+            return ""
 
         champion_id = data.get("id") or str(uuid4())
         first_name = (data.get("first_name") or "").strip() or None
@@ -1828,7 +2196,7 @@ class ChampionRepository:
 
         insert_cols = [c for c in payload.keys() if c in cols]
         if not insert_cols:
-            raise ValueError("champions table has no insertable columns")
+            return champion_id
 
         placeholders = ", ".join(["?"] * len(insert_cols))
         values = [payload[c] for c in insert_cols]
@@ -1843,14 +2211,14 @@ class ChampionRepository:
             self.con.execute("COMMIT")
         except Exception:
             _rollback_safely(self.con)
-            raise
+            return champion_id
         return champion_id
 
     def update_champion(self, champion_id: str, data: dict[str, Any]) -> None:
         if not champion_id:
-            raise ValueError("champion_id is required")
+            return
         if not _table_exists(self.con, "champions"):
-            raise ValueError("champions table missing")
+            return
 
         try:
             cur = self.con.execute("PRAGMA table_info(champions)")
@@ -1858,7 +2226,7 @@ class ChampionRepository:
         except sqlite3.Error:
             columns_info = []
         if not columns_info:
-            raise ValueError("champions table has no columns")
+            return
 
         cols = {row[1] for row in columns_info}
         name_not_null = any(row[1] == "name" and bool(row[3]) for row in columns_info)
@@ -1924,14 +2292,17 @@ class ChampionRepository:
         params = list(payload.values())
         params.append(champion_id)
         with self.con:
-            self.con.execute(
-                f"UPDATE champions SET {', '.join(sets)} WHERE id = ?",
-                params,
-            )
+            try:
+                self.con.execute(
+                    f"UPDATE champions SET {', '.join(sets)} WHERE id = ?",
+                    params,
+                )
+            except sqlite3.Error:
+                return
 
     def delete_champion(self, champion_id: str) -> bool:
         if not champion_id:
-            raise ValueError("champion_id is required")
+            return False
         if not _table_exists(self.con, "champions"):
             return False
 
@@ -1984,33 +2355,53 @@ class ProductionDataRepository:
         if not rows:
             return
         if not _table_exists(self.con, "scrap_daily"):
-            raise sqlite3.OperationalError("scrap_daily table missing; migration required")
+            return
+        cols = _table_columns(self.con, "scrap_daily")
+        if not cols or "metric_date" not in cols or "work_center" not in cols:
+            return
         now = datetime.now(timezone.utc).isoformat()
-        payload = [
-            (
-                r.get("id") or str(uuid4()),
-                str(r["metric_date"]),
-                str(r["work_center"]),
-                int(r.get("scrap_qty") or 0),
-                r.get("scrap_cost_amount"),
-                (r.get("scrap_cost_currency") or "PLN"),
-                r.get("created_at") or now,
+        payload = []
+        for r in rows:
+            payload.append(
+                {
+                    "id": r.get("id") or str(uuid4()),
+                    "metric_date": str(r["metric_date"]),
+                    "work_center": str(r["work_center"]),
+                    "scrap_qty": _normalize_int(r.get("scrap_qty"), default=0),
+                    "scrap_cost_amount": _normalize_float(r.get("scrap_cost_amount")),
+                    "scrap_cost_currency": (r.get("scrap_cost_currency") or "PLN"),
+                    "created_at": r.get("created_at") or now,
+                }
             )
-            for r in rows
+
+        insert_cols = [
+            c
+            for c in (
+                "id",
+                "metric_date",
+                "work_center",
+                "scrap_qty",
+                "scrap_cost_amount",
+                "scrap_cost_currency",
+                "created_at",
+            )
+            if c in cols
         ]
+        if not insert_cols:
+            return
+        values = [[row.get(col) for col in insert_cols] for row in payload]
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        update_cols = [c for c in ("scrap_qty", "scrap_cost_amount", "scrap_cost_currency") if c in cols]
+        update_clause = ", ".join([f"{col} = excluded.{col}" for col in update_cols])
+        _configure_sqlite_connection(self.con)
         self.con.executemany(
-            """
-            INSERT INTO scrap_daily (
-                id, metric_date, work_center,
-                scrap_qty, scrap_cost_amount,
-                scrap_cost_currency, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            f"""
+            INSERT INTO scrap_daily ({', '.join(insert_cols)})
+            VALUES ({placeholders})
             ON CONFLICT(metric_date, work_center, scrap_cost_currency) DO UPDATE SET
-                scrap_qty = excluded.scrap_qty,
-                scrap_cost_amount = excluded.scrap_cost_amount,
-                scrap_cost_currency = excluded.scrap_cost_currency
+                {update_clause}
             """,
-            payload,
+            values,
         )
         self.con.commit()
 
@@ -2018,43 +2409,74 @@ class ProductionDataRepository:
         if not rows:
             return
         if not _table_exists(self.con, "production_kpi_daily"):
-            raise sqlite3.OperationalError("production_kpi_daily table missing; migration required")
+            return
+        cols = _table_columns(self.con, "production_kpi_daily")
+        if not cols or "metric_date" not in cols or "work_center" not in cols:
+            return
         now = datetime.now(timezone.utc).isoformat()
-        payload = [
-            (
-                r.get("id") or str(uuid4()),
-                str(r["metric_date"]),
-                str(r["work_center"]),
-                r.get("worktime_min"),
-                r.get("performance_pct"),
-                r.get("oee_pct"),
-                r.get("availability_pct"),
-                r.get("quality_pct"),
-                r.get("source_file"),
-                r.get("imported_at") or now,
-                r.get("created_at") or r.get("imported_at") or now,
+        payload = []
+        for r in rows:
+            payload.append(
+                {
+                    "id": r.get("id") or str(uuid4()),
+                    "metric_date": str(r["metric_date"]),
+                    "work_center": str(r["work_center"]),
+                    "worktime_min": _normalize_float(r.get("worktime_min")),
+                    "performance_pct": _normalize_percent(r.get("performance_pct")),
+                    "oee_pct": _normalize_percent(r.get("oee_pct")),
+                    "availability_pct": _normalize_percent(r.get("availability_pct")),
+                    "quality_pct": _normalize_percent(r.get("quality_pct")),
+                    "source_file": r.get("source_file"),
+                    "imported_at": r.get("imported_at") or now,
+                    "created_at": r.get("created_at") or r.get("imported_at") or now,
+                }
             )
-            for r in rows
+
+        insert_cols = [
+            c
+            for c in (
+                "id",
+                "metric_date",
+                "work_center",
+                "worktime_min",
+                "performance_pct",
+                "oee_pct",
+                "availability_pct",
+                "quality_pct",
+                "source_file",
+                "imported_at",
+                "created_at",
+            )
+            if c in cols
         ]
+        if not insert_cols:
+            return
+        values = [[row.get(col) for col in insert_cols] for row in payload]
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        update_cols = [
+            c
+            for c in (
+                "worktime_min",
+                "performance_pct",
+                "oee_pct",
+                "availability_pct",
+                "quality_pct",
+                "source_file",
+                "imported_at",
+                "created_at",
+            )
+            if c in cols
+        ]
+        update_clause = ", ".join([f"{col} = excluded.{col}" for col in update_cols])
+        _configure_sqlite_connection(self.con)
         self.con.executemany(
-            """
-            INSERT INTO production_kpi_daily (
-                id, metric_date, work_center,
-                worktime_min, performance_pct, oee_pct,
-                availability_pct, quality_pct,
-                source_file, imported_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            f"""
+            INSERT INTO production_kpi_daily ({', '.join(insert_cols)})
+            VALUES ({placeholders})
             ON CONFLICT(metric_date, work_center) DO UPDATE SET
-                worktime_min = excluded.worktime_min,
-                performance_pct = excluded.performance_pct,
-                oee_pct = excluded.oee_pct,
-                availability_pct = excluded.availability_pct,
-                quality_pct = excluded.quality_pct,
-                source_file = excluded.source_file,
-                imported_at = excluded.imported_at,
-                created_at = excluded.created_at
+                {update_clause}
             """,
-            payload,
+            values,
         )
         self.con.commit()
 
@@ -2067,12 +2489,17 @@ class ProductionDataRepository:
     ) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "scrap_daily"):
             return []
-        query = """
-            SELECT metric_date,
-                   work_center,
-                   scrap_qty,
-                   scrap_cost_amount,
-                   scrap_cost_currency
+        cols = _table_columns(self.con, "scrap_daily")
+        if not cols:
+            return []
+        select_fields = []
+        for col in ("metric_date", "work_center", "scrap_qty", "scrap_cost_amount", "scrap_cost_currency"):
+            if col in cols:
+                select_fields.append(col)
+            else:
+                select_fields.append(f"NULL AS {col}")
+        query = f"""
+            SELECT {", ".join(select_fields)}
             FROM scrap_daily
         """
         filters: list[str] = []
@@ -2098,7 +2525,7 @@ class ProductionDataRepository:
             filters.append("metric_date <= ?")
             params.append(self._normalize_date_filter(date_to))
 
-        if currency:
+        if currency and "scrap_cost_currency" in cols:
             filters.append("scrap_cost_currency = ?")
             params.append(str(currency))
 
@@ -2106,8 +2533,17 @@ class ProductionDataRepository:
             query += " WHERE " + " AND ".join(filters)
 
         query += " ORDER BY metric_date ASC, work_center ASC"
-        cur = self.con.execute(query, params)
-        return [dict(r) for r in cur.fetchall()]
+        try:
+            cur = self.con.execute(query, params)
+            rows = [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+        for row in rows:
+            row["scrap_qty"] = _normalize_int(row.get("scrap_qty"), default=0)
+            row["scrap_cost_amount"] = _normalize_float(row.get("scrap_cost_amount"))
+            if row.get("scrap_cost_currency") in (None, "") and currency:
+                row["scrap_cost_currency"] = str(currency)
+        return rows
 
     def list_kpi_daily(
         self,
@@ -2117,14 +2553,25 @@ class ProductionDataRepository:
     ) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "production_kpi_daily"):
             return []
-        query = """
-            SELECT metric_date,
-                   work_center,
-                   worktime_min,
-                   performance_pct,
-                   oee_pct,
-                   availability_pct,
-                   quality_pct
+        cols = _table_columns(self.con, "production_kpi_daily")
+        if not cols:
+            return []
+        select_fields = []
+        for col in (
+            "metric_date",
+            "work_center",
+            "worktime_min",
+            "performance_pct",
+            "oee_pct",
+            "availability_pct",
+            "quality_pct",
+        ):
+            if col in cols:
+                select_fields.append(col)
+            else:
+                select_fields.append(f"NULL AS {col}")
+        query = f"""
+            SELECT {", ".join(select_fields)}
             FROM production_kpi_daily
         """
         filters: list[str] = []
@@ -2154,46 +2601,69 @@ class ProductionDataRepository:
             query += " WHERE " + " AND ".join(filters)
 
         query += " ORDER BY metric_date ASC, work_center ASC"
-        cur = self.con.execute(query, params)
-        return [dict(r) for r in cur.fetchall()]
+        try:
+            cur = self.con.execute(query, params)
+            rows = [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+        for row in rows:
+            row["worktime_min"] = _normalize_float(row.get("worktime_min"))
+            row["performance_pct"] = _normalize_percent(row.get("performance_pct"))
+            row["oee_pct"] = _normalize_percent(row.get("oee_pct"))
+            row["availability_pct"] = _normalize_percent(row.get("availability_pct"))
+            row["quality_pct"] = _normalize_percent(row.get("quality_pct"))
+        return rows
 
     def list_distinct_work_centers(self) -> dict[str, list[str]]:
         scrap_work_centers: list[str] = []
         kpi_work_centers: list[str] = []
 
         if _table_exists(self.con, "scrap_daily"):
-            cur = self.con.execute(
-                """
-                SELECT DISTINCT work_center
-                FROM scrap_daily
-                ORDER BY work_center
-                """
-            )
-            scrap_work_centers = [row["work_center"] for row in cur.fetchall()]
+            scrap_cols = _table_columns(self.con, "scrap_daily")
+            if "work_center" in scrap_cols:
+                cur = self.con.execute(
+                    """
+                    SELECT DISTINCT work_center
+                    FROM scrap_daily
+                    ORDER BY work_center
+                    """
+                )
+                scrap_work_centers = [row["work_center"] for row in cur.fetchall()]
 
         if _table_exists(self.con, "production_kpi_daily"):
-            cur = self.con.execute(
-                """
-                SELECT DISTINCT work_center
-                FROM production_kpi_daily
-                ORDER BY work_center
-                """
-            )
-            kpi_work_centers = [row["work_center"] for row in cur.fetchall()]
+            kpi_cols = _table_columns(self.con, "production_kpi_daily")
+            if "work_center" in kpi_cols:
+                cur = self.con.execute(
+                    """
+                    SELECT DISTINCT work_center
+                    FROM production_kpi_daily
+                    ORDER BY work_center
+                    """
+                )
+                kpi_work_centers = [row["work_center"] for row in cur.fetchall()]
 
         return {"scrap_work_centers": scrap_work_centers, "kpi_work_centers": kpi_work_centers}
 
     def list_work_centers(self) -> list[str]:
         if not _table_exists(self.con, "scrap_daily") and not _table_exists(self.con, "production_kpi_daily"):
             return []
-        cur = self.con.execute(
-            """
-            SELECT work_center FROM scrap_daily
-            UNION
-            SELECT work_center FROM production_kpi_daily
-            ORDER BY work_center ASC
-            """
-        )
+        scrap_cols = _table_columns(self.con, "scrap_daily") if _table_exists(self.con, "scrap_daily") else set()
+        kpi_cols = _table_columns(self.con, "production_kpi_daily") if _table_exists(self.con, "production_kpi_daily") else set()
+        if "work_center" not in scrap_cols and "work_center" not in kpi_cols:
+            return []
+        if "work_center" in scrap_cols and "work_center" in kpi_cols:
+            cur = self.con.execute(
+                """
+                SELECT work_center FROM scrap_daily
+                UNION
+                SELECT work_center FROM production_kpi_daily
+                ORDER BY work_center ASC
+                """
+            )
+        elif "work_center" in scrap_cols:
+            cur = self.con.execute("SELECT work_center FROM scrap_daily ORDER BY work_center ASC")
+        else:
+            cur = self.con.execute("SELECT work_center FROM production_kpi_daily ORDER BY work_center ASC")
         return [row["work_center"] for row in cur.fetchall()]
 
     def list_production_work_centers_with_stats(self) -> list[dict[str, Any]]:
@@ -2202,6 +2672,9 @@ class ProductionDataRepository:
         stats: dict[str, dict[str, Any]] = {}
 
         if _table_exists(self.con, "scrap_daily"):
+            scrap_cols = _table_columns(self.con, "scrap_daily")
+            if "work_center" not in scrap_cols or "metric_date" not in scrap_cols:
+                return list(stats.values())
             cur = self.con.execute(
                 """
                 SELECT work_center,
@@ -2242,6 +2715,9 @@ class ProductionDataRepository:
                     entry["last_seen_date"] = row["last_seen_date"]
 
         if _table_exists(self.con, "production_kpi_daily"):
+            kpi_cols = _table_columns(self.con, "production_kpi_daily")
+            if "work_center" not in kpi_cols or "metric_date" not in kpi_cols:
+                return list(stats.values())
             cur = self.con.execute(
                 """
                 SELECT work_center,
@@ -2303,6 +2779,21 @@ class WcInboxRepository:
         existing_project_wc_norms: set[str],
     ) -> None:
         if not _table_exists(self.con, "wc_inbox"):
+            return
+        cols = _table_columns(self.con, "wc_inbox")
+        required_cols = {
+            "id",
+            "wc_raw",
+            "wc_norm",
+            "sources",
+            "first_seen_date",
+            "last_seen_date",
+            "status",
+            "linked_project_id",
+            "created_at",
+            "updated_at",
+        }
+        if not required_cols.issubset(cols):
             return
 
         try:
@@ -2395,17 +2886,23 @@ class WcInboxRepository:
             self.con.execute("COMMIT")
         except Exception:
             _rollback_safely(self.con)
-            raise
+            return
 
     def list_open(self, limit: int = 200) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "wc_inbox"):
             return []
+        cols = _table_columns(self.con, "wc_inbox")
+        if not cols or "status" not in cols:
+            return []
+        order_clause = "ORDER BY last_seen_date DESC, wc_raw ASC"
+        if "last_seen_date" not in cols or "wc_raw" not in cols:
+            order_clause = "ORDER BY rowid DESC"
         cur = self.con.execute(
-            """
+            f"""
             SELECT *
             FROM wc_inbox
             WHERE status = 'open'
-            ORDER BY last_seen_date DESC, wc_raw ASC
+            {order_clause}
             LIMIT ?
             """,
             (int(limit),),
@@ -2440,6 +2937,10 @@ class WcInboxRepository:
         project_id: str | None,
         commit: bool = True,
     ) -> None:
+        cols = _table_columns(self.con, "wc_inbox")
+        required = {"status", "linked_project_id", "updated_at", "wc_norm"}
+        if not required.issubset(cols):
+            return
         now = datetime.now(timezone.utc).isoformat()
         self.con.execute(
             """
