@@ -112,19 +112,50 @@ def _metric_delta_label(
     return f"{fmt.format(delta)} ({pct_label})"
 
 
-def _metric_delta_label_scrap_good_down(
+def _scrap_delta_badge(
     baseline: float | None,
     after: float | None,
-    fmt: str,
+    unit_fmt: str,
 ) -> str:
     if baseline is None or after is None:
-        return "—"
-    improvement = baseline - after
+        text = "—"
+        color = "#616161"
+        return _scrap_delta_badge_html(text, color)
+    delta = after - baseline
+    if delta == 0:
+        text = "→ 0"
+        color = "#616161"
+        return _scrap_delta_badge_html(text, color)
+    if delta < 0:
+        arrow = "↓"
+        sign = "-"
+        color = "#2e7d32"
+    else:
+        arrow = "↑"
+        sign = "+"
+        color = "#c62828"
     if baseline == 0:
         pct_label = "n/a"
     else:
-        pct_label = f"{improvement / baseline:+.1%}"
-    return f"{fmt.format(improvement)} ({pct_label})"
+        pct_label = f"{delta / baseline:+.1%}"
+    value_label = f"{sign}{unit_fmt.format(abs(delta))}"
+    text = f"{arrow} {value_label} ({pct_label})"
+    return _scrap_delta_badge_html(text, color)
+
+
+def _scrap_delta_badge_html(text: str, color: str) -> str:
+    return (
+        "<span style=\""
+        "padding: 0.15rem 0.5rem; "
+        "border-radius: 999px; "
+        "display: inline-block; "
+        "font-size: 0.9rem; "
+        f"color: {color}; "
+        f"border: 1px solid {color}; "
+        "\">"
+        f"{text}"
+        "</span>"
+    )
 
 
 def _mean_or_none(series: pd.Series | None) -> float | None:
@@ -521,9 +552,10 @@ def render(con: sqlite3.Connection) -> None:
             kpi_cols[0].metric(
                 "Śr. scrap qty/dzień",
                 _format_metric_value(after_scrap_qty, "{:.2f}"),
-                delta=_metric_delta_label_scrap_good_down(
-                    baseline_scrap_qty, after_scrap_qty, "{:+.2f}"
-                ),
+            )
+            kpi_cols[0].markdown(
+                _scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"),
+                unsafe_allow_html=True,
             )
             kpi_cols[0].caption(
                 f"Baseline: {_format_metric_value(baseline_scrap_qty, '{:.2f}')}"
@@ -531,9 +563,10 @@ def render(con: sqlite3.Connection) -> None:
             kpi_cols[1].metric(
                 "Śr. scrap PLN/dzień",
                 _format_metric_value(after_scrap_pln, "{:.2f}"),
-                delta=_metric_delta_label_scrap_good_down(
-                    baseline_scrap_pln, after_scrap_pln, "{:+.2f}"
-                ),
+            )
+            kpi_cols[1].markdown(
+                _scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"),
+                unsafe_allow_html=True,
             )
             kpi_cols[1].caption(
                 f"Baseline: {_format_metric_value(baseline_scrap_pln, '{:.2f}')}"
@@ -554,7 +587,7 @@ def render(con: sqlite3.Connection) -> None:
             kpi_cols[3].caption(
                 f"Baseline: {_format_metric_value(baseline_perf, '{:.1f}%')}"
             )
-            st.caption("Dla scrap spadek = poprawa (zielone).")
+            st.caption("Dla scrap spadek = poprawa.")
             if oee_scale != "unknown" or perf_scale != "unknown":
                 st.caption(
                     "Wykryta skala KPI: "
