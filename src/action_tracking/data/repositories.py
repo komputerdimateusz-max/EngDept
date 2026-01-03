@@ -653,3 +653,307 @@ class WcInboxRepository:
         )
         self.con.commit()
 
+# ============================================================
+# HOTFIX PACK v1 — brakujące metody dla działających zakładek
+# Wklej TEN CAŁY BLOK na SAM KONIEC pliku:
+#   src/action_tracking/data/repositories.py
+# (niczego nie usuwaj — to dopisuje brakujące metody/klucze)
+# Następnie zrestartuj streamlit.
+# ============================================================
+
+from __future__ import annotations
+
+import sqlite3
+import json
+from datetime import date, datetime, timezone
+from typing import Any
+from uuid import uuid4
+
+
+# -------------------------
+# Helper (safe)
+# -------------------------
+def _hotfix__table_exists(con: sqlite3.Connection, table: str) -> bool:
+    try:
+        cur = con.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name = ?
+            """,
+            (table,),
+        )
+        return cur.fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+# ============================================================
+# 1) ProductionDataRepository.list_distinct_work_centers()
+# ============================================================
+if "ProductionDataRepository" in globals() and not hasattr(
+    ProductionDataRepository, "list_distinct_work_centers"
+):
+
+    def _pdr_list_distinct_work_centers(self) -> dict[str, list[str]]:
+        scrap_work_centers: list[str] = []
+        kpi_work_centers: list[str] = []
+
+        if _hotfix__table_exists(self.con, "scrap_daily"):
+            try:
+                cur = self.con.execute(
+                    """
+                    SELECT DISTINCT work_center
+                    FROM scrap_daily
+                    ORDER BY work_center
+                    """
+                )
+                scrap_work_centers = [row["work_center"] for row in cur.fetchall()]
+            except sqlite3.Error:
+                scrap_work_centers = []
+
+        if _hotfix__table_exists(self.con, "production_kpi_daily"):
+            try:
+                cur = self.con.execute(
+                    """
+                    SELECT DISTINCT work_center
+                    FROM production_kpi_daily
+                    ORDER BY work_center
+                    """
+                )
+                kpi_work_centers = [row["work_center"] for row in cur.fetchall()]
+            except sqlite3.Error:
+                kpi_work_centers = []
+
+        return {
+            "scrap_work_centers": scrap_work_centers,
+            "kpi_work_centers": kpi_work_centers,
+        }
+
+    ProductionDataRepository.list_distinct_work_centers = _pdr_list_distinct_work_centers  # type: ignore[attr-defined]
+
+
+# ============================================================
+# 2) EffectivenessRepository.get_effectiveness_for_actions()
+# ============================================================
+if "EffectivenessRepository" in globals() and not hasattr(
+    EffectivenessRepository, "get_effectiveness_for_actions"
+):
+
+    def _eff_get_effectiveness_for_actions(
+        self, action_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        if not action_ids:
+            return {}
+        if not _hotfix__table_exists(self.con, "action_effectiveness"):
+            return {}
+
+        placeholders = ", ".join(["?"] * len(action_ids))
+        try:
+            cur = self.con.execute(
+                f"""
+                SELECT *
+                FROM action_effectiveness
+                WHERE action_id IN ({placeholders})
+                """,
+                action_ids,
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            return {row["action_id"]: row for row in rows if row.get("action_id")}
+        except sqlite3.Error:
+            return {}
+
+    EffectivenessRepository.get_effectiveness_for_actions = _eff_get_effectiveness_for_actions  # type: ignore[attr-defined]
+
+    # (opcjonalnie) alias, żeby inne miejsca też działały
+    if not hasattr(EffectivenessRepository, "list_effectiveness_for_actions"):
+        EffectivenessRepository.list_effectiveness_for_actions = _eff_get_effectiveness_for_actions  # type: ignore[attr-defined]
+
+
+# ============================================================
+# 3) ChampionRepository.list_champions() — dodaj brakujące klucze
+#    Fix: KeyError 'position' / 'hire_date'
+# ============================================================
+if "ChampionRepository" in globals():
+
+    _orig_list_champions = getattr(ChampionRepository, "list_champions", None)
+
+    def _ch_list_champions_safe(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        if callable(_orig_list_champions):
+            try:
+                rows = _orig_list_champions(self)  # type: ignore[misc]
+            except Exception:
+                rows = []
+
+        # jeżeli stara wersja repo zwraca okrojone dict-y, dołóż brakujące klucze
+        for r in rows:
+            r.setdefault("hire_date", None)
+            r.setdefault("position", None)
+            # display_name bywa wymagane w UI
+            if "display_name" not in r:
+                r["display_name"] = (
+                    f"{(r.get('first_name') or '').strip()} {(r.get('last_name') or '').strip()}".strip()
+                    or r.get("name")
+                    or r.get("email")
+                    or r.get("id")
+                )
+        return rows
+
+    ChampionRepository.list_champions = _ch_list_champions_safe  # type: ignore[assignment]
+
+
+# ============================================================
+# 4) NotificationRepository.list_recent() (+ minimalne metody)
+# ============================================================
+# Jeśli klasa istnieje, ale nie ma list_recent -> dopisz.
+if "NotificationRepository" in globals() and not hasattr(NotificationRepository, "list_recent"):
+
+    def _nr_list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
+        if not _hotfix__table_exists(self.con, "email_notifications_log"):
+            return []
+        try:
+            cur = self.con.execute(
+                """
+                SELECT id,
+                       created_at,
+                       notification_type,
+                       recipient_email,
+                       action_id,
+                       payload_json,
+                       unique_key
+                FROM email_notifications_log
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+            return [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
+    def _nr_was_sent(self, unique_key: str) -> bool:
+        if not unique_key or not _hotfix__table_exists(self.con, "email_notifications_log"):
+            return False
+        try:
+            cur = self.con.execute(
+                "SELECT 1 FROM email_notifications_log WHERE unique_key = ?",
+                (unique_key,),
+            )
+            return cur.fetchone() is not None
+        except sqlite3.Error:
+            return False
+
+    def _nr_log_sent(
+        self,
+        notification_type: str,
+        recipient_email: str,
+        action_id: str | None,
+        payload: dict[str, Any] | None,
+        unique_key: str,
+    ) -> None:
+        if not unique_key or not _hotfix__table_exists(self.con, "email_notifications_log"):
+            return
+        try:
+            payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
+            self.con.execute(
+                """
+                INSERT OR IGNORE INTO email_notifications_log (
+                    id, created_at, notification_type, recipient_email,
+                    action_id, payload_json, unique_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    datetime.now(timezone.utc).isoformat(),
+                    notification_type,
+                    recipient_email,
+                    action_id,
+                    payload_json,
+                    unique_key,
+                ),
+            )
+            self.con.commit()
+        except sqlite3.Error:
+            return
+
+    NotificationRepository.list_recent = _nr_list_recent  # type: ignore[attr-defined]
+    NotificationRepository.was_sent = _nr_was_sent  # type: ignore[attr-defined]
+    NotificationRepository.log_sent = _nr_log_sent  # type: ignore[attr-defined]
+
+
+# Jeśli NotificationRepository W OGÓLE nie istnieje (czasem po konfliktach),
+# utwórz minimalną wersję, żeby settings.py działał.
+if "NotificationRepository" not in globals():
+
+    class NotificationRepository:
+        def __init__(self, con: sqlite3.Connection) -> None:
+            self.con = con
+
+        def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
+            if not _hotfix__table_exists(self.con, "email_notifications_log"):
+                return []
+            try:
+                cur = self.con.execute(
+                    """
+                    SELECT id,
+                           created_at,
+                           notification_type,
+                           recipient_email,
+                           action_id,
+                           payload_json,
+                           unique_key
+                    FROM email_notifications_log
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                )
+                return [dict(r) for r in cur.fetchall()]
+            except sqlite3.Error:
+                return []
+
+        def was_sent(self, unique_key: str) -> bool:
+            if not unique_key or not _hotfix__table_exists(self.con, "email_notifications_log"):
+                return False
+            try:
+                cur = self.con.execute(
+                    "SELECT 1 FROM email_notifications_log WHERE unique_key = ?",
+                    (unique_key,),
+                )
+                return cur.fetchone() is not None
+            except sqlite3.Error:
+                return False
+
+        def log_sent(
+            self,
+            notification_type: str,
+            recipient_email: str,
+            action_id: str | None,
+            payload: dict[str, Any] | None,
+            unique_key: str,
+        ) -> None:
+            if not unique_key or not _hotfix__table_exists(self.con, "email_notifications_log"):
+                return
+            try:
+                payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
+                self.con.execute(
+                    """
+                    INSERT OR IGNORE INTO email_notifications_log (
+                        id, created_at, notification_type, recipient_email,
+                        action_id, payload_json, unique_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        datetime.now(timezone.utc).isoformat(),
+                        notification_type,
+                        recipient_email,
+                        action_id,
+                        payload_json,
+                        unique_key,
+                    ),
+                )
+                self.con.commit()
+            except sqlite3.Error:
+                return
