@@ -954,6 +954,409 @@ if "NotificationRepository" not in globals():
                         unique_key,
                     ),
                 )
+
+                # === HOTFIX: restore full ProductionDataRepository API expected by UI ===
+# Wklej TEN BLOK do: src/action_tracking/data/repositories.py
+# ✅ Wklej na SAM KONIEC pliku (lub ZAMIEŃ istniejącą klasę ProductionDataRepository)
+# ❗ WAŻNE: NIE dodawaj tu "from __future__ import annotations" (masz już na górze pliku)
+
+import sqlite3
+from datetime import date, datetime, timezone
+from typing import Any
+from uuid import uuid4
+
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    cur = con.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        """,
+        (table,),
+    )
+    return cur.fetchone() is not None
+
+
+class ProductionDataRepository:
+    """
+    API CONTRACT used by:
+    - production_import.py: upsert_scrap_daily, upsert_production_kpi_daily
+    - production_explorer.py: list_scrap_daily, list_kpi_daily, list_distinct_work_centers, list_work_centers
+    - projects.py (WC inbox): list_production_work_centers_with_stats
+    """
+
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    # ---------------------------
+    # UPSERTS (used by import UI)
+    # ---------------------------
+
+    def upsert_scrap_daily(self, rows: list[dict[str, Any]]) -> None:
+        """
+        Expected row keys:
+        - metric_date (YYYY-MM-DD)
+        - work_center (str)
+        - scrap_qty (int)
+        - scrap_cost_amount (float|None)
+        - scrap_cost_currency (str, default 'PLN')
+        """
+        if not rows:
+            return
+        if not _table_exists(self.con, "scrap_daily"):
+            raise sqlite3.OperationalError("scrap_daily table missing; migration required")
+
+        now = datetime.now(timezone.utc).isoformat()
+        payload = []
+        for r in rows:
+            payload.append(
+                (
+                    r.get("id") or str(uuid4()),
+                    str(r["metric_date"]),
+                    str(r["work_center"]),
+                    int(r.get("scrap_qty") or 0),
+                    r.get("scrap_cost_amount"),
+                    (r.get("scrap_cost_currency") or "PLN"),
+                    r.get("created_at") or now,
+                )
+            )
+
+        self.con.executemany(
+            """
+            INSERT INTO scrap_daily (
+                id,
+                metric_date,
+                work_center,
+                scrap_qty,
+                scrap_cost_amount,
+                scrap_cost_currency,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(metric_date, work_center, scrap_cost_currency) DO UPDATE SET
+                scrap_qty = excluded.scrap_qty,
+                scrap_cost_amount = excluded.scrap_cost_amount,
+                scrap_cost_currency = excluded.scrap_cost_currency
+            """,
+            payload,
+        )
+        self.con.commit()
+
+    def upsert_production_kpi_daily(self, rows: list[dict[str, Any]]) -> None:
+        """
+        Expected row keys:
+        - metric_date, work_center
+        - worktime_min, performance_pct, oee_pct, availability_pct, quality_pct
+        - source_file, imported_at, created_at
+        """
+        if not rows:
+            return
+        if not _table_exists(self.con, "production_kpi_daily"):
+            raise sqlite3.OperationalError("production_kpi_daily table missing; migration required")
+
+        now = datetime.now(timezone.utc).isoformat()
+        payload = []
+        for r in rows:
+            payload.append(
+                (
+                    r.get("id") or str(uuid4()),
+                    str(r["metric_date"]),
+                    str(r["work_center"]),
+                    r.get("worktime_min"),
+                    r.get("performance_pct"),
+                    r.get("oee_pct"),
+                    r.get("availability_pct"),
+                    r.get("quality_pct"),
+                    r.get("source_file"),
+                    r.get("imported_at") or now,
+                    r.get("created_at") or r.get("imported_at") or now,
+                )
+            )
+
+        self.con.executemany(
+            """
+            INSERT INTO production_kpi_daily (
+                id,
+                metric_date,
+                work_center,
+                worktime_min,
+                performance_pct,
+                oee_pct,
+                availability_pct,
+                quality_pct,
+                source_file,
+                imported_at,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(metric_date, work_center) DO UPDATE SET
+                worktime_min = excluded.worktime_min,
+                performance_pct = excluded.performance_pct,
+                oee_pct = excluded.oee_pct,
+                availability_pct = excluded.availability_pct,
+                quality_pct = excluded.quality_pct,
+                source_file = excluded.source_file,
+                imported_at = excluded.imported_at,
+                created_at = excluded.created_at
+            """,
+            payload,
+        )
+        self.con.commit()
+
+    # ---------------------------
+    # QUERIES (used by Explorer/Projects)
+    # ---------------------------
+
+    def list_scrap_daily(
+        self,
+        work_centers: str | list[str] | None,
+        date_from: date | str | None,
+        date_to: date | str | None,
+        currency: str | None = "PLN",
+    ) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "scrap_daily"):
+            return []
+
+        query = """
+            SELECT metric_date,
+                   work_center,
+                   scrap_qty,
+                   scrap_cost_amount,
+                   scrap_cost_currency
+            FROM scrap_daily
+        """
+        filters: list[str] = []
+        params: list[Any] = []
+
+        if work_centers is not None:
+            if isinstance(work_centers, str):
+                wc = work_centers.strip()
+                if wc:
+                    filters.append("work_center = ?")
+                    params.append(wc)
+            else:
+                if not work_centers:
+                    return []
+                placeholders = ", ".join(["?"] * len(work_centers))
+                filters.append(f"work_center IN ({placeholders})")
+                params.extend([str(wc) for wc in work_centers])
+
+        if date_from:
+            filters.append("metric_date >= ?")
+            params.append(self._normalize_date_filter(date_from))
+        if date_to:
+            filters.append("metric_date <= ?")
+            params.append(self._normalize_date_filter(date_to))
+
+        if currency:
+            filters.append("scrap_cost_currency = ?")
+            params.append(str(currency))
+
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+
+        query += " ORDER BY metric_date ASC, work_center ASC"
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_kpi_daily(
+        self,
+        work_centers: str | list[str] | None,
+        date_from: date | str | None,
+        date_to: date | str | None,
+    ) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "production_kpi_daily"):
+            return []
+
+        query = """
+            SELECT metric_date,
+                   work_center,
+                   worktime_min,
+                   performance_pct,
+                   oee_pct,
+                   availability_pct,
+                   quality_pct
+            FROM production_kpi_daily
+        """
+        filters: list[str] = []
+        params: list[Any] = []
+
+        if work_centers is not None:
+            if isinstance(work_centers, str):
+                wc = work_centers.strip()
+                if wc:
+                    filters.append("work_center = ?")
+                    params.append(wc)
+            else:
+                if not work_centers:
+                    return []
+                placeholders = ", ".join(["?"] * len(work_centers))
+                filters.append(f"work_center IN ({placeholders})")
+                params.extend([str(wc) for wc in work_centers])
+
+        if date_from:
+            filters.append("metric_date >= ?")
+            params.append(self._normalize_date_filter(date_from))
+        if date_to:
+            filters.append("metric_date <= ?")
+            params.append(self._normalize_date_filter(date_to))
+
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+
+        query += " ORDER BY metric_date ASC, work_center ASC"
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_production_kpi_daily(
+        self,
+        work_center: str | None,
+        date_from: date | str | None,
+        date_to: date | str | None,
+    ) -> list[dict[str, Any]]:
+        # backward-compat alias used in some places
+        return self.list_kpi_daily(work_center, date_from, date_to)
+
+    def list_distinct_work_centers(self) -> dict[str, list[str]]:
+        scrap_work_centers: list[str] = []
+        kpi_work_centers: list[str] = []
+
+        if _table_exists(self.con, "scrap_daily"):
+            cur = self.con.execute(
+                """
+                SELECT DISTINCT work_center
+                FROM scrap_daily
+                ORDER BY work_center
+                """
+            )
+            scrap_work_centers = [row["work_center"] for row in cur.fetchall()]
+
+        if _table_exists(self.con, "production_kpi_daily"):
+            cur = self.con.execute(
+                """
+                SELECT DISTINCT work_center
+                FROM production_kpi_daily
+                ORDER BY work_center
+                """
+            )
+            kpi_work_centers = [row["work_center"] for row in cur.fetchall()]
+
+        return {
+            "scrap_work_centers": scrap_work_centers,
+            "kpi_work_centers": kpi_work_centers,
+        }
+
+    def list_work_centers(self) -> list[str]:
+        if not _table_exists(self.con, "scrap_daily") and not _table_exists(self.con, "production_kpi_daily"):
+            return []
+        cur = self.con.execute(
+            """
+            SELECT work_center FROM scrap_daily
+            UNION
+            SELECT work_center FROM production_kpi_daily
+            ORDER BY work_center ASC
+            """
+        )
+        return [row["work_center"] for row in cur.fetchall()]
+
+    def list_production_work_centers_with_stats(self) -> list[dict[str, Any]]:
+        """
+        Used by WC inbox feature (Projects page).
+        Aggregates per normalized WC and indicates data presence.
+        """
+        # local import to avoid cycles
+        from action_tracking.services.effectiveness import normalize_wc
+
+        stats: dict[str, dict[str, Any]] = {}
+
+        if _table_exists(self.con, "scrap_daily"):
+            cur = self.con.execute(
+                """
+                SELECT work_center,
+                       MIN(metric_date) AS first_seen_date,
+                       MAX(metric_date) AS last_seen_date,
+                       COUNT(DISTINCT metric_date) AS count_days_present
+                FROM scrap_daily
+                GROUP BY work_center
+                """
+            )
+            for row in cur.fetchall():
+                wc_raw = row["work_center"]
+                wc_norm = normalize_wc(wc_raw)
+                if not wc_norm:
+                    continue
+                entry = stats.setdefault(
+                    wc_norm,
+                    {
+                        "wc_raw": wc_raw,
+                        "wc_norm": wc_norm,
+                        "has_scrap": False,
+                        "has_kpi": False,
+                        "first_seen_date": row["first_seen_date"],
+                        "last_seen_date": row["last_seen_date"],
+                        "count_days_present": 0,
+                    },
+                )
+                entry["has_scrap"] = True
+                entry["count_days_present"] += int(row["count_days_present"] or 0)
+                # maintain min/max across sources
+                if entry.get("first_seen_date") is None or (
+                    row["first_seen_date"] and row["first_seen_date"] < entry["first_seen_date"]
+                ):
+                    entry["first_seen_date"] = row["first_seen_date"]
+                    entry["wc_raw"] = wc_raw
+                if entry.get("last_seen_date") is None or (
+                    row["last_seen_date"] and row["last_seen_date"] > entry["last_seen_date"]
+                ):
+                    entry["last_seen_date"] = row["last_seen_date"]
+
+        if _table_exists(self.con, "production_kpi_daily"):
+            cur = self.con.execute(
+                """
+                SELECT work_center,
+                       MIN(metric_date) AS first_seen_date,
+                       MAX(metric_date) AS last_seen_date,
+                       COUNT(DISTINCT metric_date) AS count_days_present
+                FROM production_kpi_daily
+                GROUP BY work_center
+                """
+            )
+            for row in cur.fetchall():
+                wc_raw = row["work_center"]
+                wc_norm = normalize_wc(wc_raw)
+                if not wc_norm:
+                    continue
+                entry = stats.setdefault(
+                    wc_norm,
+                    {
+                        "wc_raw": wc_raw,
+                        "wc_norm": wc_norm,
+                        "has_scrap": False,
+                        "has_kpi": False,
+                        "first_seen_date": row["first_seen_date"],
+                        "last_seen_date": row["last_seen_date"],
+                        "count_days_present": 0,
+                    },
+                )
+                entry["has_kpi"] = True
+                entry["count_days_present"] += int(row["count_days_present"] or 0)
+                if entry.get("first_seen_date") is None or (
+                    row["first_seen_date"] and row["first_seen_date"] < entry["first_seen_date"]
+                ):
+                    entry["first_seen_date"] = row["first_seen_date"]
+                    entry["wc_raw"] = wc_raw
+                if entry.get("last_seen_date") is None or (
+                    row["last_seen_date"] and row["last_seen_date"] > entry["last_seen_date"]
+                ):
+                    entry["last_seen_date"] = row["last_seen_date"]
+
+        return list(stats.values())
+
+    @staticmethod
+    def _normalize_date_filter(value: date | str) -> str:
+        if isinstance(value, date):
+            return value.isoformat()
+        return str(value)
+
                 self.con.commit()
             except sqlite3.Error:
                 return
