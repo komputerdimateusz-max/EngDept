@@ -76,10 +76,13 @@ def _list_changelog_generic(
 ) -> list[dict[str, Any]]:
     """
     Uniwersalny reader changelogów.
-    Obsługuje różne nazwy tabel (w zależności od wersji bazy).
-    Jeśli tabela/kolumny nie istnieją -> zwraca [] (bez crasha UI).
 
-    Dodatkowo próbuje filtrować po entity_id, jeśli tabela ma taką kolumnę.
+    HOTFIX (kontrakt UI):
+      - UI oczekuje entry["changes_json"] (string JSON), np. w projects.py:
+          changes = json.loads(entry["changes_json"])
+      - dlatego ZAWSZE zwracamy klucz "changes_json" (nawet gdy DB ma payload_json lub inne kolumny).
+
+    Jeśli tabela/kolumny nie istnieją -> [] (bez crasha UI).
     """
     if not table_candidates:
         return []
@@ -92,21 +95,23 @@ def _list_changelog_generic(
     if not table:
         return []
 
+    # kolumny tabeli
     try:
         cur = con.execute(f"PRAGMA table_info({table})")
         cols = [r[1] for r in cur.fetchall()]  # (cid, name, type, notnull, dflt, pk)
     except sqlite3.Error:
         cols = []
-
     if not cols:
         return []
 
+    # czas
     time_col: str | None = None
     for c in ("changed_at", "created_at", "timestamp", "ts", "event_at"):
         if c in cols:
             time_col = c
             break
 
+    # entity id
     entity_col: str | None = None
     for c in ("entity_id", "object_id", "record_id", "champion_id", "project_id", "action_id"):
         if c in cols:
@@ -117,13 +122,17 @@ def _list_changelog_generic(
         "id",
         "entity_type",
         "entity_id",
+        "champion_id",
+        "project_id",
+        "action_id",
         "change_type",
         "field",
         "old_value",
         "new_value",
         "summary",
         "message",
-        "payload_json",
+        "changes_json",   # <- jeśli istnieje, super
+        "payload_json",   # <- fallback
         "user_email",
         "changed_by",
         "created_by",
@@ -155,12 +164,59 @@ def _list_changelog_generic(
     except sqlite3.Error:
         return []
 
+    # --- NORMALIZACJA POD UI ---
     for r in rows:
-        if "payload_json" in r and r.get("payload_json") and "payload" not in r:
+        # changed_at fallback
+        if "changed_at" not in r or r.get("changed_at") in (None, ""):
+            if "created_at" in r and r.get("created_at") not in (None, ""):
+                r["changed_at"] = r.get("created_at")
+            else:
+                r["changed_at"] = None
+
+        # changes_json MUST exist
+        if "changes_json" not in r or r.get("changes_json") in (None, ""):
+            # prefer payload_json jeśli jest
+            if "payload_json" in r and r.get("payload_json"):
+                pj = r.get("payload_json")
+                if isinstance(pj, str):
+                    r["changes_json"] = pj
+                else:
+                    try:
+                        r["changes_json"] = json.dumps(pj, ensure_ascii=False)
+                    except Exception:
+                        r["changes_json"] = "{}"
+            else:
+                # zbuduj minimalny JSON z dostępnych pól
+                minimal: dict[str, Any] = {}
+                if r.get("field") is not None:
+                    minimal["field"] = r.get("field")
+                if "old_value" in r:
+                    minimal["old_value"] = r.get("old_value")
+                if "new_value" in r:
+                    minimal["new_value"] = r.get("new_value")
+                if r.get("message"):
+                    minimal["message"] = r.get("message")
+                if r.get("summary"):
+                    minimal["summary"] = r.get("summary")
+
+                try:
+                    r["changes_json"] = json.dumps(minimal or {}, ensure_ascii=False)
+                except Exception:
+                    r["changes_json"] = "{}"
+
+        # (opcjonalnie) pre-parse dla UI/debug
+        try:
+            r["changes"] = json.loads(r["changes_json"]) if r.get("changes_json") else {}
+        except Exception:
+            r["changes"] = {}
+
+        # zachowaj kompatybilność ze starszym kodem, który używał "payload"
+        if "payload" not in r and "payload_json" in r and r.get("payload_json"):
             try:
                 r["payload"] = json.loads(r["payload_json"])
             except Exception:
                 r["payload"] = None
+
     return rows
 
 
@@ -581,12 +637,6 @@ class ActionRepository:
         date_from: date | str | None = None,
         date_to: date | str | None = None,
     ) -> list[dict[str, Any]]:
-        """
-        Returns actions for a given project, scoped to a date window.
-        We include rows when ANY of the relevant dates is within [date_from, date_to]:
-          - created_at OR closed_at OR due_date
-        This is used by Projects page to compute outcomes/summary.
-        """
         if not project_id:
             return []
         if not _table_exists(self.con, "actions"):
@@ -650,7 +700,6 @@ class ActionRepository:
 
     # =====================================================
     # HOTFIX: CHANGELOG (used by Actions page)
-    # Fixes: AttributeError: 'ActionRepository' object has no attribute 'list_changelog'
     # =====================================================
     def list_changelog(self, limit: int = 50, action_id: str | None = None) -> list[dict[str, Any]]:
         return _list_changelog_generic(
@@ -826,7 +875,6 @@ class ProjectRepository:
 
     # =====================================================
     # HOTFIX: CHANGELOG (used by Projects page)
-    # Fixes: AttributeError: 'ProjectRepository' object has no attribute 'list_changelog'
     # =====================================================
     def list_changelog(self, limit: int = 50, project_id: str | None = None) -> list[dict[str, Any]]:
         return _list_changelog_generic(
@@ -907,7 +955,6 @@ class ChampionRepository:
 
     # =====================================================
     # HOTFIX: CHANGELOG (used by Champions page)
-    # Fixes: AttributeError: 'ChampionRepository' object has no attribute 'list_changelog'
     # =====================================================
     def list_changelog(self, limit: int = 50, champion_id: str | None = None) -> list[dict[str, Any]]:
         return _list_changelog_generic(
