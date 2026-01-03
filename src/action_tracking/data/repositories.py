@@ -6,14 +6,91 @@ from datetime import date, datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from action_tracking.domain.constants import ACTION_CATEGORIES as DEFAULT_ACTION_CATEGORIES
-from action_tracking.services.impact_aspects import normalize_impact_aspects
-from action_tracking.services.normalize import normalize_key
-from action_tracking.services.overlay_targets import (
-    parse_overlay_targets,
-    serialize_overlay_targets,
-)
+# =====================================================
+# OPTIONAL IMPORTS (never crash if modules moved / missing)
+# =====================================================
 
+try:
+    from action_tracking.domain.constants import ACTION_CATEGORIES as DEFAULT_ACTION_CATEGORIES
+except Exception:  # pragma: no cover
+    DEFAULT_ACTION_CATEGORIES = [
+        "Scrap reduction",
+        "OEE improvement",
+        "Cost savings",
+        "Vave",
+        "PDP",
+        "Development",
+    ]
+
+try:
+    from action_tracking.services.normalize import normalize_key
+except Exception:  # pragma: no cover
+    def normalize_key(value: str) -> str:
+        return (value or "").strip().lower()
+
+try:
+    # preferred: shared service
+    from action_tracking.services.impact_aspects import normalize_impact_aspects  # type: ignore
+except Exception:  # pragma: no cover
+    def normalize_impact_aspects(value: Any) -> list[str]:
+        if value in (None, "", []):
+            return []
+        if isinstance(value, str):
+            v = value.strip()
+            if not v:
+                return []
+            # If it's already a JSON list string, best-effort parse
+            if v.startswith("[") and v.endswith("]"):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if str(x).strip()]
+                except Exception:
+                    pass
+            return [v]
+        if isinstance(value, (list, tuple, set)):
+            return [str(x).strip() for x in value if str(x).strip()]
+        return []
+
+try:
+    from action_tracking.services.overlay_targets import (  # type: ignore
+        parse_overlay_targets,
+        serialize_overlay_targets,
+    )
+except Exception:  # pragma: no cover
+    def parse_overlay_targets(value: Any) -> list[str]:
+        """
+        Accept: None / "" / JSON string list / list/tuple/set / comma separated string.
+        Return: list[str]
+        """
+        if value in (None, ""):
+            return []
+        if isinstance(value, str):
+            v = value.strip()
+            if not v:
+                return []
+            # JSON list?
+            if v.startswith("[") and v.endswith("]"):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if str(x).strip()]
+                except Exception:
+                    pass
+            # comma separated
+            return [t.strip() for t in v.split(",") if t.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(x).strip() for x in value if str(x).strip()]
+        return []
+
+    def serialize_overlay_targets(value: Any) -> str | None:
+        arr = parse_overlay_targets(value)
+        return json.dumps(arr, ensure_ascii=False) if arr else None
+
+
+# =====================================================
+# HELPERS
+# =====================================================
 
 def _table_exists(con: sqlite3.Connection, table: str) -> bool:
     cur = con.execute(
@@ -28,11 +105,21 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
 
 
 def _normalize_impact_aspects_payload(value: Any) -> str | None:
+    """
+    impact_aspects stored as JSON string in DB.
+    Accept list/str/None -> returns JSON list string or None.
+    """
     normalized = normalize_impact_aspects(value)
     if not normalized:
         return None
-    return json.dumps(normalized, ensure_ascii=False)
+    # de-dup + stable order
+    cleaned = sorted({x for x in (str(v).strip() for v in normalized) if x})
+    return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
 
+
+# =====================================================
+# DEFAULT CATEGORY RULES (fallback if category_rules missing)
+# =====================================================
 
 DEFAULT_CATEGORY_RULES: dict[str, dict[str, Any]] = {
     "Scrap reduction": {
@@ -105,132 +192,270 @@ def _default_category_rule(category: str) -> dict[str, Any]:
     }
 
 
-def _default_category_rules_list(include_inactive: bool) -> list[dict[str, Any]]:
-    rules = [_default_category_rule(category) for category in DEFAULT_CATEGORY_RULES]
-    if include_inactive:
-        return rules
-    return [rule for rule in rules if rule.get("is_active")]
+def _default_category_rules_list(include_inactive: bool = True) -> list[dict[str, Any]]:
+    # ensure we include defaults + any categories defined in constants
+    categories = list(dict.fromkeys(list(DEFAULT_ACTION_CATEGORIES) + list(DEFAULT_CATEGORY_RULES.keys())))
+    rows = [_default_category_rule(c) for c in categories]
+    if not include_inactive:
+        rows = [r for r in rows if bool(r.get("is_active", True))]
+    return rows
 
+
+# =====================================================
+# CHANGELOG READER (UI CONTRACT)
+# =====================================================
+
+def _list_changelog_generic(
+    con: sqlite3.Connection,
+    table_candidates: list[str],
+    limit: int = 50,
+    entity_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Uniwersalny reader changelogów.
+
+    Kontrakt UI (pages/champions.py, pages/projects.py, pages/actions.py):
+      - entry["event_at"]
+      - entry["event_type"]
+      - entry["changes_json"]  (JSON string)
+
+    Dlatego ZAWSZE zwracamy te klucze, nawet jeśli DB ma inne nazwy kolumn.
+    Jeśli tabela/kolumny nie istnieją -> [] (bez crasha UI).
+    """
+    if not table_candidates:
+        return []
+
+    table: str | None = None
+    for t in table_candidates:
+        if _table_exists(con, t):
+            table = t
+            break
+    if not table:
+        return []
+
+    try:
+        cur = con.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in cur.fetchall()]
+    except sqlite3.Error:
+        cols = []
+    if not cols:
+        return []
+
+    time_col: str | None = None
+    for c in ("event_at", "changed_at", "created_at", "timestamp", "ts"):
+        if c in cols:
+            time_col = c
+            break
+
+    event_type_col: str | None = None
+    for c in ("event_type", "change_type", "action", "event", "type", "entity_type"):
+        if c in cols:
+            event_type_col = c
+            break
+
+    entity_col: str | None = None
+    for c in ("entity_id", "object_id", "record_id", "champion_id", "project_id", "action_id"):
+        if c in cols:
+            entity_col = c
+            break
+
+    preferred = [
+        "id",
+        "entity_type",
+        "entity_id",
+        "champion_id",
+        "project_id",
+        "action_id",
+        "event_type",
+        "change_type",
+        "field",
+        "old_value",
+        "new_value",
+        "summary",
+        "message",
+        "changes_json",
+        "payload_json",
+        "user_email",
+        "changed_by",
+        "created_by",
+        "source",
+        "event_at",
+        "changed_at",
+        "created_at",
+        "timestamp",
+        "ts",
+    ]
+    selected_cols = [c for c in preferred if c in cols]
+    select_sql = ", ".join(selected_cols) if selected_cols else "*"
+
+    query = f"SELECT {select_sql} FROM {table}"
+    params: list[Any] = []
+
+    if entity_id and entity_col:
+        query += f" WHERE {entity_col} = ?"
+        params.append(entity_id)
+
+    if time_col:
+        query += f" ORDER BY {time_col} DESC"
+    else:
+        query += " ORDER BY rowid DESC"
+
+    query += " LIMIT ?"
+    params.append(int(limit))
+
+    try:
+        cur = con.execute(query, params)
+        rows = [dict(r) for r in cur.fetchall()]
+    except sqlite3.Error:
+        return []
+
+    def _ensure_str_json(value: Any) -> str:
+        if value is None:
+            return "{}"
+        if isinstance(value, str):
+            s = value.strip()
+            if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+                return s
+            try:
+                return json.dumps({"message": s}, ensure_ascii=False)
+            except Exception:
+                return "{}"
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return "{}"
+
+    for r in rows:
+        # event_at MUST exist
+        if "event_at" not in r or r.get("event_at") in (None, ""):
+            if r.get("changed_at") not in (None, ""):
+                r["event_at"] = r.get("changed_at")
+            elif r.get("created_at") not in (None, ""):
+                r["event_at"] = r.get("created_at")
+            elif r.get("timestamp") not in (None, ""):
+                r["event_at"] = r.get("timestamp")
+            elif r.get("ts") not in (None, ""):
+                r["event_at"] = r.get("ts")
+            else:
+                r["event_at"] = None
+
+        # event_type MUST exist
+        if "event_type" not in r or r.get("event_type") in (None, ""):
+            if r.get("change_type") not in (None, ""):
+                r["event_type"] = r.get("change_type")
+            elif r.get("entity_type") not in (None, ""):
+                r["event_type"] = r.get("entity_type")
+            elif r.get("field") not in (None, ""):
+                r["event_type"] = f"field_change:{r.get('field')}"
+            elif r.get("summary") not in (None, ""):
+                r["event_type"] = "summary"
+            elif r.get("message") not in (None, ""):
+                r["event_type"] = "message"
+            else:
+                r["event_type"] = "change"
+
+        # changes_json MUST exist
+        if "changes_json" not in r or r.get("changes_json") in (None, ""):
+            if r.get("payload_json") not in (None, ""):
+                r["changes_json"] = _ensure_str_json(r.get("payload_json"))
+            else:
+                minimal: dict[str, Any] = {}
+                if r.get("field") is not None:
+                    minimal["field"] = r.get("field")
+                if "old_value" in r:
+                    minimal["old_value"] = r.get("old_value")
+                if "new_value" in r:
+                    minimal["new_value"] = r.get("new_value")
+                if r.get("summary"):
+                    minimal["summary"] = r.get("summary")
+                if r.get("message"):
+                    minimal["message"] = r.get("message")
+                r["changes_json"] = _ensure_str_json(minimal)
+
+        # aliases for legacy code
+        if "changed_at" not in r or r.get("changed_at") in (None, ""):
+            r["changed_at"] = r.get("event_at")
+        if "change_type" not in r or r.get("change_type") in (None, ""):
+            r["change_type"] = r.get("event_type")
+
+        # pre-parse
+        try:
+            r["changes"] = json.loads(r["changes_json"]) if r.get("changes_json") else {}
+        except Exception:
+            r["changes"] = {}
+
+        # legacy "payload"
+        if "payload" not in r and r.get("payload_json"):
+            try:
+                r["payload"] = json.loads(r["payload_json"])
+            except Exception:
+                r["payload"] = None
+
+    return rows
+
+
+# =====================================================
+# SETTINGS / GLOBAL RULES
+# =====================================================
 
 class SettingsRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
     def list_action_categories(self, active_only: bool = True) -> list[dict[str, Any]]:
-        try:
-            if not _table_exists(self.con, "action_categories"):
-                raise sqlite3.OperationalError("action_categories table missing")
-            query = """
-                SELECT id, name, is_active, sort_order, created_at
-                FROM action_categories
-            """
-            params: list[Any] = []
-            if active_only:
-                query += " WHERE is_active = 1"
-            query += " ORDER BY sort_order ASC, name ASC"
-            cur = self.con.execute(query, params)
-            rows = [dict(r) for r in cur.fetchall()]
-            for row in rows:
-                row["is_active"] = bool(row.get("is_active"))
-            return rows
-        except sqlite3.Error:
+        if not _table_exists(self.con, "action_categories"):
             return [
                 {
                     "id": name,
                     "name": name,
                     "is_active": True,
-                    "sort_order": (index + 1) * 10,
+                    "sort_order": (i + 1) * 10,
+                    "created_at": None,
                 }
-                for index, name in enumerate(DEFAULT_ACTION_CATEGORIES)
+                for i, name in enumerate(DEFAULT_ACTION_CATEGORIES)
             ]
 
-    def create_action_category(self, name: str, sort_order: int | None) -> str:
-        clean_name = (name or "").strip()
-        if not clean_name:
-            raise ValueError("Nazwa kategorii jest wymagana.")
-        if self._category_name_exists(clean_name):
-            raise ValueError("Kategoria o tej nazwie już istnieje.")
-        category_id = str(uuid4())
-        self.con.execute(
-            """
-            INSERT INTO action_categories (id, name, is_active, sort_order, created_at)
-            VALUES (?, ?, 1, ?, ?)
-            """,
-            (
-                category_id,
-                clean_name,
-                int(sort_order) if sort_order is not None else 100,
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-        self.con.commit()
-        return category_id
-
-    def update_action_category(
-        self,
-        category_id: str,
-        name: str,
-        is_active: bool,
-        sort_order: int,
-    ) -> None:
-        clean_name = (name or "").strip()
-        if not clean_name:
-            raise ValueError("Nazwa kategorii jest wymagana.")
-        if self._category_name_exists(clean_name, exclude_id=category_id):
-            raise ValueError("Kategoria o tej nazwie już istnieje.")
-        self.con.execute(
-            """
-            UPDATE action_categories
-            SET name = ?, is_active = ?, sort_order = ?
-            WHERE id = ?
-            """,
-            (clean_name, 1 if is_active else 0, int(sort_order), category_id),
-        )
-        self.con.commit()
-
-    def deactivate_action_category(self, category_id: str) -> None:
-        self.con.execute(
-            """
-            UPDATE action_categories
-            SET is_active = 0
-            WHERE id = ?
-            """,
-            (category_id,),
-        )
-        self.con.commit()
-
-    def reactivate_action_category(self, category_id: str) -> None:
-        self.con.execute(
-            """
-            UPDATE action_categories
-            SET is_active = 1
-            WHERE id = ?
-            """,
-            (category_id,),
-        )
-        self.con.commit()
-
-    def _category_name_exists(self, name: str, exclude_id: str | None = None) -> bool:
-        query = "SELECT 1 FROM action_categories WHERE name = ?"
-        params: list[Any] = [name]
-        if exclude_id:
-            query += " AND id != ?"
-            params.append(exclude_id)
+        query = """
+            SELECT id, name, is_active, sort_order, created_at
+            FROM action_categories
+        """
+        params: list[Any] = []
+        if active_only:
+            query += " WHERE is_active = 1"
+        query += " ORDER BY sort_order ASC, name ASC"
         cur = self.con.execute(query, params)
-        return cur.fetchone() is not None
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["is_active"] = bool(r.get("is_active"))
+        return rows
 
 
 class GlobalSettingsRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
+    # --- UI-facing (Projects / Settings pages expect these keys) ---
     def get_category_rules(self, only_active: bool = True) -> list[dict[str, Any]]:
+        """
+        Returns rows shaped as:
+          {
+            category_label,
+            effectiveness_model,
+            savings_model,
+            overlay_targets (list[str]),
+            overlay_targets_configured (bool),
+            requires_scope_link (bool),
+            description,
+            is_active (bool)
+          }
+        """
+        include_inactive = not only_active
+
+        if not _table_exists(self.con, "category_rules"):
+            return [self._normalize_category_rule_row(r) for r in _default_category_rules_list(include_inactive)]
+
+        # Try query WITH overlay_targets (new schema), fallback to old schema if missing column
         try:
-            if not _table_exists(self.con, "category_rules"):
-                return [
-                    self._normalize_category_rule_row(rule)
-                    for rule in _default_category_rules_list(include_inactive=not only_active)
-                ]
             query = """
                 SELECT category AS category_label,
                        effect_model AS effectiveness_model,
@@ -246,23 +471,48 @@ class GlobalSettingsRepository:
                 query += " WHERE is_active = 1"
             query += " ORDER BY category ASC"
             cur = self.con.execute(query, params)
-            rows = [self._normalize_category_rule_row(dict(row)) for row in cur.fetchall()]
+            rows = [self._normalize_category_rule_row(dict(r)) for r in cur.fetchall()]
             if not rows:
-                return [
-                    self._normalize_category_rule_row(rule)
-                    for rule in _default_category_rules_list(include_inactive=not only_active)
-                ]
+                return [self._normalize_category_rule_row(r) for r in _default_category_rules_list(include_inactive)]
             return rows
         except sqlite3.Error:
-            return [
-                self._normalize_category_rule_row(rule)
-                for rule in _default_category_rules_list(include_inactive=not only_active)
-            ]
+            # Old schema (no overlay_targets)
+            try:
+                query = """
+                    SELECT category AS category_label,
+                           effect_model AS effectiveness_model,
+                           savings_model,
+                           requires_scope_link,
+                           description,
+                           is_active
+                    FROM category_rules
+                """
+                params = []
+                if only_active:
+                    query += " WHERE is_active = 1"
+                query += " ORDER BY category ASC"
+                cur = self.con.execute(query, params)
+                rows = [self._normalize_category_rule_row(dict(r)) for r in cur.fetchall()]
+                if not rows:
+                    return [self._normalize_category_rule_row(r) for r in _default_category_rules_list(include_inactive)]
+                return rows
+            except sqlite3.Error:
+                return [self._normalize_category_rule_row(r) for r in _default_category_rules_list(include_inactive)]
 
+    def resolve_category_rule(self, category_label: str) -> dict[str, Any] | None:
+        if not category_label:
+            return None
+        rules = self.get_category_rules(only_active=True)
+        rules_map = {normalize_key(r.get("category_label") or ""): r for r in rules}
+        return rules_map.get(normalize_key(category_label))
+
+    # --- Admin / internal CRUD (used by configurable overlays/settings) ---
     def list_category_rules(self, include_inactive: bool = False) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "category_rules"):
+            return _default_category_rules_list(include_inactive=True if include_inactive else False)
+
+        # Prefer new schema
         try:
-            if not _table_exists(self.con, "category_rules"):
-                return _default_category_rules_list(include_inactive)
             query = """
                 SELECT category,
                        effect_model,
@@ -279,19 +529,43 @@ class GlobalSettingsRepository:
                 query += " WHERE is_active = 1"
             query += " ORDER BY category ASC"
             cur = self.con.execute(query, params)
-            rows = [self._normalize_rule_row(dict(row)) for row in cur.fetchall()]
+            rows = [self._normalize_rule_row(dict(r)) for r in cur.fetchall()]
             if not rows:
-                return _default_category_rules_list(include_inactive)
+                return _default_category_rules_list(include_inactive=True if include_inactive else False)
             return rows
         except sqlite3.Error:
-            return _default_category_rules_list(include_inactive)
+            # Old schema
+            try:
+                query = """
+                    SELECT category,
+                           effect_model,
+                           savings_model,
+                           requires_scope_link,
+                           is_active,
+                           description,
+                           updated_at
+                    FROM category_rules
+                """
+                params = []
+                if not include_inactive:
+                    query += " WHERE is_active = 1"
+                query += " ORDER BY category ASC"
+                cur = self.con.execute(query, params)
+                rows = [self._normalize_rule_row(dict(r)) for r in cur.fetchall()]
+                if not rows:
+                    return _default_category_rules_list(include_inactive=True if include_inactive else False)
+                return rows
+            except sqlite3.Error:
+                return _default_category_rules_list(include_inactive=True if include_inactive else False)
 
     def get_category_rule(self, category: str) -> dict[str, Any] | None:
         if not category:
             return None
+        if not _table_exists(self.con, "category_rules"):
+            return None
+
+        # Prefer new schema
         try:
-            if not _table_exists(self.con, "category_rules"):
-                return None
             cur = self.con.execute(
                 """
                 SELECT category,
@@ -310,76 +584,106 @@ class GlobalSettingsRepository:
             row = cur.fetchone()
             return self._normalize_rule_row(dict(row)) if row else None
         except sqlite3.Error:
-            return None
+            # Old schema
+            try:
+                cur = self.con.execute(
+                    """
+                    SELECT category,
+                           effect_model,
+                           savings_model,
+                           requires_scope_link,
+                           is_active,
+                           description,
+                           updated_at
+                    FROM category_rules
+                    WHERE category = ?
+                    """,
+                    (category,),
+                )
+                row = cur.fetchone()
+                return self._normalize_rule_row(dict(row)) if row else None
+            except sqlite3.Error:
+                return None
 
     def upsert_category_rule(self, category: str, payload: dict[str, Any]) -> None:
         clean_category = (category or "").strip()
         if not clean_category:
             raise ValueError("Nazwa kategorii jest wymagana.")
-        rule = self._normalize_rule_payload(clean_category, payload)
-        self.con.execute(
-            """
-            INSERT INTO category_rules (
-                category,
-                effect_model,
-                savings_model,
-                overlay_targets,
-                requires_scope_link,
-                is_active,
-                description,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(category) DO UPDATE SET
-                effect_model = excluded.effect_model,
-                savings_model = excluded.savings_model,
-                overlay_targets = excluded.overlay_targets,
-                requires_scope_link = excluded.requires_scope_link,
-                is_active = excluded.is_active,
-                description = excluded.description,
-                updated_at = excluded.updated_at
-            """,
-            (
-                rule["category"],
-                rule["effect_model"],
-                rule["savings_model"],
-                rule.get("overlay_targets"),
-                1 if rule["requires_scope_link"] else 0,
-                1 if rule["is_active"] else 0,
-                rule.get("description"),
-                rule["updated_at"],
-            ),
-        )
-        self.con.commit()
 
-    def set_category_active(self, category: str, is_active: bool) -> None:
-        clean_category = (category or "").strip()
-        if not clean_category:
-            return
-        rule = self.get_category_rule(clean_category)
-        if rule:
+        rule = self._normalize_rule_payload(clean_category, payload)
+
+        # Prefer new schema (overlay_targets)
+        try:
             self.con.execute(
                 """
-                UPDATE category_rules
-                SET is_active = ?, updated_at = ?
-                WHERE category = ?
+                INSERT INTO category_rules (
+                    category,
+                    effect_model,
+                    savings_model,
+                    overlay_targets,
+                    requires_scope_link,
+                    is_active,
+                    description,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(category) DO UPDATE SET
+                    effect_model = excluded.effect_model,
+                    savings_model = excluded.savings_model,
+                    overlay_targets = excluded.overlay_targets,
+                    requires_scope_link = excluded.requires_scope_link,
+                    is_active = excluded.is_active,
+                    description = excluded.description,
+                    updated_at = excluded.updated_at
                 """,
-                (1 if is_active else 0, datetime.now(timezone.utc).isoformat(), clean_category),
+                (
+                    rule["category"],
+                    rule["effect_model"],
+                    rule["savings_model"],
+                    rule.get("overlay_targets"),
+                    1 if rule["requires_scope_link"] else 0,
+                    1 if rule["is_active"] else 0,
+                    rule.get("description"),
+                    rule["updated_at"],
+                ),
             )
             self.con.commit()
             return
-        default_rule = _default_category_rule(clean_category)
-        default_rule["is_active"] = bool(is_active)
-        self.upsert_category_rule(clean_category, default_rule)
+        except sqlite3.Error:
+            # Old schema (no overlay_targets column)
+            self.con.execute(
+                """
+                INSERT INTO category_rules (
+                    category,
+                    effect_model,
+                    savings_model,
+                    requires_scope_link,
+                    is_active,
+                    description,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(category) DO UPDATE SET
+                    effect_model = excluded.effect_model,
+                    savings_model = excluded.savings_model,
+                    requires_scope_link = excluded.requires_scope_link,
+                    is_active = excluded.is_active,
+                    description = excluded.description,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    rule["category"],
+                    rule["effect_model"],
+                    rule["savings_model"],
+                    1 if rule["requires_scope_link"] else 0,
+                    1 if rule["is_active"] else 0,
+                    rule.get("description"),
+                    rule["updated_at"],
+                ),
+            )
+            self.con.commit()
 
-    def resolve_category_rule(self, category_label: str) -> dict[str, Any] | None:
-        if not category_label:
-            return None
-        rules = self.get_category_rules(only_active=True)
-        rules_map = {
-            normalize_key(rule.get("category_label") or ""): rule for rule in rules
-        }
-        return rules_map.get(normalize_key(category_label))
-
+    # --------------------------
+    # Normalizers
+    # --------------------------
     def _normalize_rule_row(self, row: dict[str, Any]) -> dict[str, Any]:
         overlay_targets_raw = row.get("overlay_targets")
         row["overlay_targets"] = parse_overlay_targets(overlay_targets_raw)
@@ -393,9 +697,7 @@ class GlobalSettingsRepository:
         overlay_targets_raw = row.get("overlay_targets")
         return {
             "category_label": category_label,
-            "effectiveness_model": row.get("effectiveness_model")
-            or row.get("effect_model")
-            or "NONE",
+            "effectiveness_model": row.get("effectiveness_model") or row.get("effect_model") or "NONE",
             "savings_model": row.get("savings_model") or "NONE",
             "overlay_targets": parse_overlay_targets(overlay_targets_raw),
             "overlay_targets_configured": overlay_targets_raw not in (None, ""),
@@ -420,6 +722,10 @@ class GlobalSettingsRepository:
         }
 
 
+# =====================================================
+# NOTIFICATIONS (email log)
+# =====================================================
+
 class NotificationRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
@@ -427,12 +733,15 @@ class NotificationRepository:
     def was_sent(self, unique_key: str) -> bool:
         if not unique_key:
             return False
+        if not _table_exists(self.con, "email_notifications_log"):
+            return False
         try:
             cur = self.con.execute(
                 """
                 SELECT 1
                 FROM email_notifications_log
                 WHERE unique_key = ?
+                LIMIT 1
                 """,
                 (unique_key,),
             )
@@ -450,32 +759,39 @@ class NotificationRepository:
     ) -> None:
         if not unique_key:
             return
+        if not _table_exists(self.con, "email_notifications_log"):
+            return
         payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
-        self.con.execute(
-            """
-            INSERT INTO email_notifications_log (
-                id,
-                created_at,
-                notification_type,
-                recipient_email,
-                action_id,
-                payload_json,
-                unique_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(uuid4()),
-                datetime.now(timezone.utc).isoformat(),
-                notification_type,
-                recipient_email,
-                action_id,
-                payload_json,
-                unique_key,
-            ),
-        )
-        self.con.commit()
+        try:
+            self.con.execute(
+                """
+                INSERT INTO email_notifications_log (
+                    id,
+                    created_at,
+                    notification_type,
+                    recipient_email,
+                    action_id,
+                    payload_json,
+                    unique_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    datetime.now(timezone.utc).isoformat(),
+                    notification_type,
+                    recipient_email,
+                    action_id,
+                    payload_json,
+                    unique_key,
+                ),
+            )
+            self.con.commit()
+        except sqlite3.Error:
+            return
 
     def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "email_notifications_log"):
+            return []
         try:
             cur = self.con.execute(
                 """
@@ -490,12 +806,16 @@ class NotificationRepository:
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (int(limit),),
             )
-            return [dict(row) for row in cur.fetchall()]
+            return [dict(r) for r in cur.fetchall()]
         except sqlite3.Error:
             return []
 
+
+# =====================================================
+# ACTIONS
+# =====================================================
 
 class ActionRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
@@ -536,7 +856,7 @@ class ActionRepository:
             params.append(1 if is_draft else 0)
         if overdue_only:
             filters.append(
-                "a.due_date IS NOT NULL AND a.due_date < ? AND a.status NOT IN ('done', 'cancelled')"
+                "a.due_date IS NOT NULL AND a.due_date < ? AND a.status NOT IN ('done','cancelled')"
             )
             params.append(today)
         if search_text:
@@ -551,101 +871,109 @@ class ActionRepository:
                 CASE
                     WHEN a.due_date IS NOT NULL
                          AND a.due_date < ?
-                         AND a.status NOT IN ('done', 'cancelled')
-                    THEN 0
-                    ELSE 1
-                END,
+                         AND a.status NOT IN ('done','cancelled')
+                    THEN 0 ELSE 1 END,
                 a.due_date IS NULL,
                 a.due_date,
-                a.created_at
+                a.created_at DESC
         """
         params.append(today)
 
         cur = self.con.execute(base_query, params)
         return [dict(r) for r in cur.fetchall()]
 
-    def list_open_actions_for_owner(
-        self,
-        owner_champion_id: str,
-        today: date | None = None,
-    ) -> list[dict[str, Any]]:
-        cutoff = (today or date.today()).isoformat()
-        cur = self.con.execute(
-            """
-            SELECT a.id,
-                   a.title,
-                   a.due_date,
-                   a.category,
-                   a.priority,
-                   a.status,
-                   p.name AS project_name
-            FROM actions a
-            LEFT JOIN projects p ON p.id = a.project_id
-            WHERE a.owner_champion_id = ?
-              AND a.is_draft = 0
-              AND a.status NOT IN ('done', 'cancelled')
-              AND (a.due_date IS NULL OR date(a.due_date) >= date(?))
-            ORDER BY a.due_date IS NULL, a.due_date, a.created_at
-            """,
-            (owner_champion_id, cutoff),
-        )
-        return [dict(row) for row in cur.fetchall()]
+    def create_action(self, data: dict[str, Any]) -> str:
+        action_id = data.get("id") or str(uuid4())
+        payload = self._normalize_action_payload(action_id, data)
 
-    def list_overdue_actions_for_owner(
-        self,
-        owner_champion_id: str,
-        cutoff_date: date | None = None,
-    ) -> list[dict[str, Any]]:
-        cutoff = (cutoff_date or date.today()).isoformat()
-        cur = self.con.execute(
-            """
-            SELECT a.id,
-                   a.title,
-                   a.due_date,
-                   a.category,
-                   a.priority,
-                   a.status,
-                   p.name AS project_name
-            FROM actions a
-            LEFT JOIN projects p ON p.id = a.project_id
-            WHERE a.owner_champion_id = ?
-              AND a.is_draft = 0
-              AND a.status NOT IN ('done', 'cancelled')
-              AND a.due_date IS NOT NULL
-              AND date(a.due_date) < date(?)
-            ORDER BY a.due_date, a.created_at
-            """,
-            (owner_champion_id, cutoff),
+        cols = [
+            "id",
+            "project_id",
+            "title",
+            "description",
+            "owner_champion_id",
+            "priority",
+            "status",
+            "is_draft",
+            "due_date",
+            "created_at",
+            "closed_at",
+            "impact_type",
+            "impact_value",
+            "impact_aspects",
+            "category",
+            "manual_savings_amount",
+            "manual_savings_currency",
+            "manual_savings_note",
+            "source",
+            "source_message_id",
+            "submitted_by_email",
+            "submitted_at",
+        ]
+        vals = [payload.get(c) for c in cols]
+        placeholders = ", ".join(["?"] * len(cols))
+        self.con.execute(
+            f"INSERT INTO actions ({', '.join(cols)}) VALUES ({placeholders})",
+            vals,
         )
-        return [dict(row) for row in cur.fetchall()]
+        self.con.commit()
+        return action_id
 
-    def list_actions_becoming_overdue(
-        self,
-        since_date: date,
-        until_date: date,
-    ) -> list[dict[str, Any]]:
-        cur = self.con.execute(
-            """
-            SELECT a.id,
-                   a.title,
-                   a.due_date,
-                   a.category,
-                   a.priority,
-                   a.status,
-                   a.owner_champion_id,
-                   p.name AS project_name
-            FROM actions a
-            LEFT JOIN projects p ON p.id = a.project_id
-            WHERE a.is_draft = 0
-              AND a.status NOT IN ('done', 'cancelled')
-              AND a.due_date IS NOT NULL
-              AND date(a.due_date) > date(?)
-              AND date(a.due_date) <= date(?)
-            ORDER BY a.due_date, a.created_at
-            """,
-            (since_date.isoformat(), until_date.isoformat()),
-        )
-        return [dict(row) for row in cur.fetchall()]
+    def _normalize_action_payload(self, action_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        created_at = data.get("created_at") or date.today().isoformat()
+        created_date = self._parse_date(created_at, "created_at")
+        status = data.get("status") or "open"
+        closed_at = data.get("closed_at") or None
+        if status == "done":
+            closed_at = closed_at or date.today().isoformat()
+            closed_date = self._parse_date(closed_at, "closed_at")
+            if closed_date < created_date:
+                raise ValueError("closed_at < created_at")
+        else:
+            closed_at = None
+
+        due_date = data.get("due_date") or None
+        if due_date:
+            due_date = self._parse_date(due_date, "due_date").isoformat()
+
+        return {
+            "id": action_id,
+            "project_id": (data.get("project_id") or "").strip() or None,
+            "title": (data.get("title") or "").strip(),
+            "description": (data.get("description") or "").strip() or None,
+            "owner_champion_id": (data.get("owner_champion_id") or "").strip() or None,
+            "priority": data.get("priority") or "med",
+            "status": status,
+            "is_draft": 1 if bool(data.get("is_draft")) else 0,
+            "due_date": due_date,
+            "created_at": created_date.isoformat(),
+            "closed_at": closed_at,
+            "impact_type": data.get("impact_type"),
+            "impact_value": data.get("impact_value"),
+            "impact_aspects": _normalize_impact_aspects_payload(data.get("impact_aspects")),
+            "category": data.get("category"),
+            "manual_savings_amount": data.get("manual_savings_amount"),
+            "manual_savings_currency": data.get("manual_savings_currency"),
+            "manual_savings_note": data.get("manual_savings_note"),
+            "source": data.get("source"),
+            "source_message_id": data.get("source_message_id"),
+            "submitted_by_email": data.get("submitted_by_email"),
+            "submitted_at": data.get("submitted_at"),
+        }
+
+    @staticmethod
+    def _parse_date(value: Any, field_name: str) -> date:
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError:
+            try:
+                return datetime.fromisoformat(str(value)).date()
+            except ValueError as exc_two:
+                raise ValueError(f"Invalid date for {field_name}") from exc_two
 
     def list_actions_for_kpi(
         self,
@@ -680,34 +1008,6 @@ class ActionRepository:
             params.append(category)
         if filters:
             query += " AND " + " AND ".join(filters)
-        cur = self.con.execute(query, params)
-        return [dict(r) for r in cur.fetchall()]
-
-    def list_done_actions_for_effectiveness(
-        self,
-        project_id: str | None = None,
-        champion_id: str | None = None,
-        category: str | None = None,
-    ) -> list[dict[str, Any]]:
-        query = """
-            SELECT id,
-                   project_id,
-                   closed_at,
-                   status,
-                   category
-            FROM actions
-            WHERE status = 'done' AND closed_at IS NOT NULL AND is_draft = 0
-        """
-        params: list[Any] = []
-        if project_id:
-            query += " AND project_id = ?"
-            params.append(project_id)
-        if champion_id:
-            query += " AND owner_champion_id = ?"
-            params.append(champion_id)
-        if category:
-            query += " AND category = ?"
-            params.append(category)
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
@@ -763,528 +1063,97 @@ class ActionRepository:
     def list_actions_for_project_outcome(
         self,
         project_id: str,
-        date_from: date | str,
-        date_to: date | str,
+        date_from: date | str | None = None,
+        date_to: date | str | None = None,
     ) -> list[dict[str, Any]]:
-        start = date_from.isoformat() if isinstance(date_from, date) else str(date_from)
-        end = date_to.isoformat() if isinstance(date_to, date) else str(date_to)
+        if not project_id:
+            return []
+        if not _table_exists(self.con, "actions"):
+            return []
+
+        def _d(v: date | str | None) -> str | None:
+            if v is None:
+                return None
+            return v.isoformat() if isinstance(v, date) else str(v)
+
+        df = _d(date_from)
+        dt = _d(date_to)
+
         query = """
             SELECT a.id,
                    a.title,
+                   a.description,
                    a.category,
                    a.status,
                    a.created_at,
                    a.due_date,
                    a.closed_at,
-                   a.impact_aspects,
                    a.owner_champion_id,
-                   CASE
-                       WHEN TRIM(COALESCE(ch.first_name, '')) != ''
-                         OR TRIM(COALESCE(ch.last_name, '')) != ''
-                           THEN TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, ''))
-                       WHEN TRIM(COALESCE(ch.name, '')) != '' THEN ch.name
-                       WHEN TRIM(COALESCE(ch.email, '')) != '' THEN ch.email
-                       ELSE NULL
-                   END AS owner_name
+                   TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS owner_name,
+                   a.impact_type,
+                   a.impact_value,
+                   a.impact_aspects,
+                   a.manual_savings_amount,
+                   a.manual_savings_currency,
+                   a.manual_savings_note
             FROM actions a
             LEFT JOIN champions ch ON ch.id = a.owner_champion_id
             WHERE a.project_id = ?
               AND a.is_draft = 0
+        """
+        params: list[Any] = [project_id]
+
+        if df or dt:
+            df = df or "0001-01-01"
+            dt = dt or "9999-12-31"
+            query += """
               AND (
-                (a.created_at IS NOT NULL AND date(a.created_at) BETWEEN date(?) AND date(?))
-                OR (a.closed_at IS NOT NULL AND date(a.closed_at) BETWEEN date(?) AND date(?))
-                OR (a.due_date IS NOT NULL AND date(a.due_date) BETWEEN date(?) AND date(?))
+                    (a.created_at IS NOT NULL AND date(a.created_at) BETWEEN date(?) AND date(?))
+                 OR (a.closed_at  IS NOT NULL AND date(a.closed_at)  BETWEEN date(?) AND date(?))
+                 OR (a.due_date   IS NOT NULL AND date(a.due_date)   BETWEEN date(?) AND date(?))
               )
-            ORDER BY a.closed_at DESC, a.created_at DESC
-        """
-        params = [project_id, start, end, start, end, start, end]
+            """
+            params.extend([df, dt, df, dt, df, dt])
+
+        query += " ORDER BY a.closed_at DESC, a.created_at DESC"
+
         cur = self.con.execute(query, params)
-        return [dict(r) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r.setdefault("owner_name", None)
+            r.setdefault("impact_aspects", None)
+            r.setdefault("manual_savings_amount", None)
+            r.setdefault("manual_savings_currency", None)
+            r.setdefault("manual_savings_note", None)
+        return rows
 
-    def list_action_changelog(
-        self,
-        limit: int = 50,
-        project_id: str | None = None,
-        action_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        query = """
-            SELECT acl.*,
-                   a.title AS action_title,
-                   a.project_id AS project_id
-            FROM action_changelog acl
-            LEFT JOIN actions a ON a.id = acl.action_id
-        """
-        filters: list[str] = []
-        params: list[Any] = []
-        if project_id:
-            filters.append("a.project_id = ?")
-            params.append(project_id)
-        if action_id:
-            filters.append("acl.action_id = ?")
-            params.append(action_id)
-        if filters:
-            query += " WHERE " + " AND ".join(filters)
-        query += " ORDER BY acl.event_at DESC LIMIT ?"
-        params.append(limit)
-        cur = self.con.execute(query, params)
-        return [dict(r) for r in cur.fetchall()]
-
-    def create_action(self, data: dict[str, Any]) -> str:
-        action_id = data.get("id") or str(uuid4())
-        payload = self._normalize_action_payload(action_id, data, existing=None)
-        cols = [
-            "id",
-            "project_id",
-            "title",
-            "description",
-            "owner_champion_id",
-            "priority",
-            "status",
-            "is_draft",
-            "due_date",
-            "created_at",
-            "closed_at",
-            "impact_type",
-            "impact_value",
-            "impact_aspects",
-            "category",
-            "manual_savings_amount",
-            "manual_savings_currency",
-            "manual_savings_note",
-            "source",
-            "source_message_id",
-            "submitted_by_email",
-            "submitted_at",
-        ]
-        vals = [
-            payload["id"],
-            payload["project_id"],
-            payload["title"],
-            payload["description"],
-            payload["owner_champion_id"],
-            payload["priority"],
-            payload["status"],
-            payload["is_draft"],
-            payload["due_date"],
-            payload["created_at"],
-            payload["closed_at"],
-            payload["impact_type"],
-            payload["impact_value"],
-            payload["impact_aspects"],
-            payload["category"],
-            payload["manual_savings_amount"],
-            payload["manual_savings_currency"],
-            payload["manual_savings_note"],
-            payload["source"],
-            payload["source_message_id"],
-            payload["submitted_by_email"],
-            payload["submitted_at"],
-        ]
-        if len(cols) != len(vals):
-            raise ValueError(
-                "Mismatch between action insert columns and values: "
-                f"{len(cols)} cols vs {len(vals)} values."
-            )
-        placeholders = ", ".join(["?"] * len(cols))
-        sql = f"INSERT INTO actions ({', '.join(cols)}) VALUES ({placeholders})"
-        self.con.execute(sql, tuple(vals))
-        self._log_changelog(
-            action_id,
-            "CREATE",
-            self._serialize_changes(payload),
-        )
-        self.con.commit()
-        return action_id
-
-    def update_action(self, action_id: str, data: dict[str, Any]) -> None:
-        before = self._get_action(action_id)
-        if not before:
-            raise ValueError("Action not found")
-        merged = self._merge_action_payload(before, data)
-        payload = self._normalize_action_payload(action_id, merged, existing=before)
-        changes = self._diff_changes(before, payload)
-        self.con.execute(
-            """
-            UPDATE actions
-            SET project_id = ?,
-                title = ?,
-                description = ?,
-                owner_champion_id = ?,
-                priority = ?,
-                status = ?,
-                is_draft = ?,
-                due_date = ?,
-                created_at = ?,
-                closed_at = ?,
-                impact_type = ?,
-                impact_value = ?,
-                impact_aspects = ?,
-                category = ?,
-                manual_savings_amount = ?,
-                manual_savings_currency = ?,
-                manual_savings_note = ?,
-                source = ?,
-                source_message_id = ?,
-                submitted_by_email = ?,
-                submitted_at = ?
-            WHERE id = ?
-            """,
-            (
-                payload["project_id"],
-                payload["title"],
-                payload["description"],
-                payload["owner_champion_id"],
-                payload["priority"],
-                payload["status"],
-                payload["is_draft"],
-                payload["due_date"],
-                payload["created_at"],
-                payload["closed_at"],
-                payload["impact_type"],
-                payload["impact_value"],
-                payload["impact_aspects"],
-                payload["category"],
-                payload["manual_savings_amount"],
-                payload["manual_savings_currency"],
-                payload["manual_savings_note"],
-                payload["source"],
-                payload["source_message_id"],
-                payload["submitted_by_email"],
-                payload["submitted_at"],
-                action_id,
-            ),
-        )
-        if changes:
-            self._log_changelog(
-                action_id,
-                "UPDATE",
-                self._serialize_changes(changes),
-            )
-        self.con.commit()
-
-    def delete_action(self, action_id: str) -> None:
-        before = self._get_action(action_id)
-        if not before:
-            return
-        self._log_changelog(
-            action_id,
-            "DELETE",
-            self._serialize_changes(before),
-        )
-        self.con.execute("DELETE FROM actions WHERE id = ?", (action_id,))
-        self.con.commit()
-
-    def create_draft(self, data: dict[str, Any]) -> str:
-        action_id = data.get("id") or str(uuid4())
-        payload = self._normalize_draft_payload(action_id, data)
-        self.con.execute(
-            """
-            INSERT INTO actions (
-                id,
-                project_id,
-                title,
-                description,
-                owner_champion_id,
-                priority,
-                status,
-                is_draft,
-                due_date,
-                created_at,
-                closed_at,
-                impact_type,
-                impact_value,
-                impact_aspects,
-                category,
-                manual_savings_amount,
-                manual_savings_currency,
-                manual_savings_note,
-                source,
-                source_message_id,
-                submitted_by_email,
-                submitted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                payload["id"],
-                payload["project_id"],
-                payload["title"],
-                payload["description"],
-                payload["owner_champion_id"],
-                payload["priority"],
-                payload["status"],
-                payload["is_draft"],
-                payload["due_date"],
-                payload["created_at"],
-                payload["closed_at"],
-                payload["impact_type"],
-                payload["impact_value"],
-                payload["impact_aspects"],
-                payload["category"],
-                payload["manual_savings_amount"],
-                payload["manual_savings_currency"],
-                payload["manual_savings_note"],
-                payload["source"],
-                payload["source_message_id"],
-                payload["submitted_by_email"],
-                payload["submitted_at"],
-            ),
-        )
-        self._log_changelog(
-            action_id,
-            "CREATE",
-            self._serialize_changes(payload),
-        )
-        self.con.commit()
-        return action_id
-
-    def get_action_by_source_message_id(self, message_id: str) -> dict[str, Any] | None:
-        if not message_id:
-            return None
-        cur = self.con.execute(
-            """
-            SELECT *
-            FROM actions
-            WHERE source_message_id = ?
-            """,
-            (message_id,),
-        )
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-    def _merge_action_payload(self, before: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
-        fields = [
-            "project_id",
-            "title",
-            "description",
-            "owner_champion_id",
-            "priority",
-            "status",
-            "is_draft",
-            "due_date",
-            "created_at",
-            "closed_at",
-            "impact_type",
-            "impact_value",
-            "impact_aspects",
-            "category",
-            "manual_savings_amount",
-            "manual_savings_currency",
-            "manual_savings_note",
-            "source",
-            "source_message_id",
-            "submitted_by_email",
-            "submitted_at",
-        ]
-        merged: dict[str, Any] = {}
-        for field in fields:
-            if field in data:
-                merged[field] = data[field]
-            else:
-                merged[field] = before.get(field)
-        return merged
-
-    def _normalize_action_payload(
-        self,
-        action_id: str,
-        data: dict[str, Any],
-        existing: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        title = (data.get("title") or "").strip()
-        if not title:
-            raise ValueError("Krótka nazwa akcji jest wymagana.")
-        if len(title) > 20:
-            raise ValueError("Krótka nazwa akcji nie może przekraczać 20 znaków.")
-
-        description = (data.get("description") or "").strip()
-        if description and len(description) > 500:
-            raise ValueError("Opis akcji nie może przekraczać 500 znaków.")
-        description = description or None
-
-        category = data.get("category")
-        if not category:
-            raise ValueError("Kategoria akcji jest wymagana.")
-        if (
-            category not in self._list_active_action_categories()
-            and (existing or {}).get("category") != category
-        ):
-            raise ValueError("Wybrana kategoria akcji jest nieprawidłowa.")
-
-        project_id = (data.get("project_id") or "").strip()
-        if not project_id:
-            raise ValueError("Akcja musi być przypisana do projektu.")
-
-        owner_champion_id = (data.get("owner_champion_id") or "").strip() or None
-        priority = data.get("priority") or "med"
-        status = data.get("status") or "open"
-        is_draft = 1 if bool(data.get("is_draft")) else 0
-        due_date = data.get("due_date") or None
-        if due_date:
-            due_date = self._parse_date(due_date, "due_date").isoformat()
-
-        created_at = data.get("created_at") or (existing or {}).get("created_at")
-        created_at = created_at or date.today().isoformat()
-        created_date = self._parse_date(created_at, "created_at")
-        closed_at = data.get("closed_at") or None
-
-        if status == "done":
-            if not closed_at:
-                closed_at = date.today().isoformat()
-            closed_date = self._parse_date(closed_at, "closed_at")
-            if closed_date < created_date:
-                raise ValueError("Data zamknięcia nie może być wcześniejsza niż data utworzenia.")
-        else:
-            closed_at = None
-
-        manual_savings_amount = data.get("manual_savings_amount")
-        if manual_savings_amount in ("", None):
-            manual_savings_amount = None
-        else:
-            try:
-                manual_savings_amount = float(manual_savings_amount)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("Nieprawidłowa wartość oszczędności manualnych.") from exc
-
-        manual_savings_currency = (data.get("manual_savings_currency") or "").strip() or None
-        manual_savings_note = (data.get("manual_savings_note") or "").strip() or None
-        if manual_savings_note and len(manual_savings_note) > 500:
-            raise ValueError("Uzasadnienie oszczędności nie może przekraczać 500 znaków.")
-
-        return {
-            "id": action_id,
-            "project_id": project_id,
-            "title": title,
-            "description": description,
-            "owner_champion_id": owner_champion_id,
-            "priority": priority,
-            "status": status,
-            "is_draft": is_draft,
-            "due_date": due_date,
-            "created_at": created_date.isoformat(),
-            "closed_at": closed_at,
-            "impact_type": data.get("impact_type"),
-            "impact_value": data.get("impact_value"),
-            "impact_aspects": _normalize_impact_aspects_payload(data.get("impact_aspects")),
-            "category": category,
-            "manual_savings_amount": manual_savings_amount,
-            "manual_savings_currency": manual_savings_currency,
-            "manual_savings_note": manual_savings_note,
-            "source": data.get("source"),
-            "source_message_id": data.get("source_message_id"),
-            "submitted_by_email": data.get("submitted_by_email"),
-            "submitted_at": data.get("submitted_at"),
-        }
-
-    def _normalize_draft_payload(self, action_id: str, data: dict[str, Any]) -> dict[str, Any]:
-        title = (data.get("title") or "").strip()
-        if not title:
-            raise ValueError("Krótka nazwa akcji jest wymagana.")
-        if len(title) > 20:
-            raise ValueError("Krótka nazwa akcji nie może przekraczać 20 znaków.")
-
-        description = (data.get("description") or "").strip()
-        if not description:
-            raise ValueError("Opis akcji jest wymagany.")
-        if len(description) > 500:
-            raise ValueError("Opis akcji nie może przekraczać 500 znaków.")
-
-        owner_champion_id = (data.get("owner_champion_id") or "").strip()
-        if not owner_champion_id:
-            raise ValueError("Champion jest wymagany dla draftu.")
-
-        category = (data.get("category") or "").strip() or None
-        if category and category not in self._list_active_action_categories():
-            raise ValueError("Wybrana kategoria akcji jest nieprawidłowa.")
-
-        priority = data.get("priority") or "med"
-        status = data.get("status") or "open"
-        due_date = data.get("due_date") or None
-        if due_date:
-            due_date = self._parse_date(due_date, "due_date").isoformat()
-
-        created_at = data.get("created_at") or date.today().isoformat()
-        created_date = self._parse_date(created_at, "created_at")
-
-        return {
-            "id": action_id,
-            "project_id": data.get("project_id"),
-            "title": title,
-            "description": description,
-            "owner_champion_id": owner_champion_id,
-            "priority": priority,
-            "status": status,
-            "is_draft": 1,
-            "due_date": due_date,
-            "created_at": created_date.isoformat(),
-            "closed_at": None,
-            "impact_type": None,
-            "impact_value": None,
-            "impact_aspects": _normalize_impact_aspects_payload(data.get("impact_aspects")),
-            "category": category,
-            "manual_savings_amount": None,
-            "manual_savings_currency": None,
-            "manual_savings_note": None,
-            "source": data.get("source"),
-            "source_message_id": data.get("source_message_id"),
-            "submitted_by_email": data.get("submitted_by_email"),
-            "submitted_at": data.get("submitted_at"),
-        }
-
-    def _list_active_action_categories(self) -> list[str]:
-        rules_repo = GlobalSettingsRepository(self.con)
-        categories = rules_repo.get_category_rules(only_active=True)
-        return [row["category_label"] for row in categories]
-
-    def _parse_date(self, value: Any, field_name: str) -> date:
-        if isinstance(value, date) and not isinstance(value, datetime):
-            return value
-        if isinstance(value, datetime):
-            return value.date()
-        try:
-            return date.fromisoformat(str(value))
-        except ValueError as exc:
-            try:
-                return datetime.fromisoformat(str(value)).date()
-            except ValueError as exc_two:
-                raise ValueError(f"Nieprawidłowy format daty dla pola {field_name}.") from exc_two
-
-    def _get_action(self, action_id: str) -> dict[str, Any] | None:
-        cur = self.con.execute(
-            """
-            SELECT *
-            FROM actions
-            WHERE id = ?
-            """,
-            (action_id,),
-        )
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-    def _log_changelog(self, action_id: str, event_type: str, changes_json: str) -> None:
-        event_at = datetime.now(timezone.utc).isoformat()
-        self.con.execute(
-            """
-            INSERT INTO action_changelog (id, action_id, event_type, event_at, changes_json)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (str(uuid4()), action_id, event_type, event_at, changes_json),
+    def list_changelog(self, limit: int = 50, action_id: str | None = None) -> list[dict[str, Any]]:
+        return _list_changelog_generic(
+            self.con,
+            table_candidates=[
+                "action_changelog",
+                "actions_changelog",
+                "changelog_actions",
+                "changelog",
+                "change_log",
+                "audit_log",
+            ],
+            limit=limit,
+            entity_id=action_id,
         )
 
-    def _serialize_changes(self, payload: dict[str, Any]) -> str:
-        return json.dumps(payload, ensure_ascii=False)
 
-    def _diff_changes(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-        diffs: dict[str, Any] = {}
-        for key, value in after.items():
-            if before.get(key) != value:
-                diffs[key] = {"from": before.get(key), "to": value}
-        return diffs
-
+# =====================================================
+# EFFECTIVENESS
+# =====================================================
 
 class EffectivenessRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
     def upsert_effectiveness(self, action_id: str, payload: dict[str, Any]) -> None:
+        if not _table_exists(self.con, "action_effectiveness"):
+            return
         record_id = payload.get("id") or str(uuid4())
         self.con.execute(
             """
@@ -1323,25 +1192,27 @@ class EffectivenessRepository:
             (
                 record_id,
                 action_id,
-                payload["metric"],
-                payload["baseline_from"],
-                payload["baseline_to"],
-                payload["after_from"],
-                payload["after_to"],
-                int(payload["baseline_days"]),
-                int(payload["after_days"]),
-                payload["baseline_avg"],
-                payload["after_avg"],
-                payload["delta"],
-                payload["pct_change"],
-                payload["classification"],
-                payload["computed_at"],
+                payload.get("metric"),
+                payload.get("baseline_from"),
+                payload.get("baseline_to"),
+                payload.get("after_from"),
+                payload.get("after_to"),
+                int(payload.get("baseline_days") or 0),
+                int(payload.get("after_days") or 0),
+                payload.get("baseline_avg"),
+                payload.get("after_avg"),
+                payload.get("delta"),
+                payload.get("pct_change"),
+                payload.get("classification"),
+                payload.get("computed_at") or datetime.now(timezone.utc).isoformat(),
             ),
         )
         self.con.commit()
 
     def get_effectiveness_for_actions(self, action_ids: list[str]) -> dict[str, dict[str, Any]]:
         if not action_ids:
+            return {}
+        if not _table_exists(self.con, "action_effectiveness"):
             return {}
         placeholders = ", ".join(["?"] * len(action_ids))
         cur = self.con.execute(
@@ -1359,26 +1230,24 @@ class EffectivenessRepository:
         return self.get_effectiveness_for_actions(action_ids)
 
 
+# =====================================================
+# PROJECTS
+# =====================================================
+
 class ProjectRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
     def list_projects(self, include_counts: bool = True) -> list[dict[str, Any]]:
-        if include_counts:
+        if not _table_exists(self.con, "projects"):
+            return []
+        if include_counts and _table_exists(self.con, "actions"):
             cur = self.con.execute(
                 """
                 SELECT p.id,
                        p.name,
                        p.type,
                        p.owner_champion_id,
-                       CASE
-                           WHEN TRIM(COALESCE(ch.first_name, '')) != ''
-                             OR TRIM(COALESCE(ch.last_name, '')) != ''
-                               THEN TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, ''))
-                           WHEN TRIM(COALESCE(ch.name, '')) != '' THEN ch.name
-                           WHEN TRIM(COALESCE(ch.email, '')) != '' THEN ch.email
-                           ELSE NULL
-                       END AS owner_champion_name,
                        p.status,
                        p.created_at,
                        p.closed_at,
@@ -1388,427 +1257,114 @@ class ProjectRepository:
                        p.project_eop,
                        p.related_work_center,
                        COUNT(a.id) AS actions_total,
-                       COALESCE(SUM(CASE WHEN a.status IN ('done', 'cancelled') THEN 1 ELSE 0 END), 0)
-                           AS actions_closed,
-                       COALESCE(SUM(CASE WHEN a.status NOT IN ('done', 'cancelled') THEN 1 ELSE 0 END), 0)
-                           AS actions_open
+                       COALESCE(SUM(CASE WHEN a.status IN ('done','cancelled') THEN 1 ELSE 0 END), 0) AS actions_closed,
+                       COALESCE(SUM(CASE WHEN a.status NOT IN ('done','cancelled') THEN 1 ELSE 0 END), 0) AS actions_open
                 FROM projects p
-                LEFT JOIN champions ch ON ch.id = p.owner_champion_id
                 LEFT JOIN actions a ON a.project_id = p.id AND a.is_draft = 0
                 GROUP BY p.id
                 ORDER BY p.name
                 """
             )
-        else:
-            cur = self.con.execute(
-                """
-                SELECT p.id,
-                       p.name,
-                       p.owner_champion_id,
-                       CASE
-                           WHEN TRIM(COALESCE(ch.first_name, '')) != ''
-                             OR TRIM(COALESCE(ch.last_name, '')) != ''
-                               THEN TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, ''))
-                           WHEN TRIM(COALESCE(ch.name, '')) != '' THEN ch.name
-                           WHEN TRIM(COALESCE(ch.email, '')) != '' THEN ch.email
-                           ELSE NULL
-                       END AS owner_champion_name
-                FROM projects p
-                LEFT JOIN champions ch ON ch.id = p.owner_champion_id
-                ORDER BY p.name
-                """
-            )
-        rows = [dict(r) for r in cur.fetchall()]
-        if include_counts:
-            for row in rows:
-                total = row.get("actions_total") or 0
-                closed = row.get("actions_closed") or 0
-                row["pct_closed"] = round((closed / total) * 100, 1) if total else None
-        return rows
+            return [dict(r) for r in cur.fetchall()]
 
-    def list_changelog(self, limit: int = 50) -> list[dict[str, Any]]:
-        cur = self.con.execute(
-            """
-            SELECT pcl.*,
-                   p.name
-            FROM project_changelog pcl
-            LEFT JOIN projects p ON p.id = pcl.project_id
-            ORDER BY pcl.event_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
+        cur = self.con.execute("SELECT * FROM projects ORDER BY name")
         return [dict(r) for r in cur.fetchall()]
 
-    def create_project(self, data: dict[str, Any]) -> str:
-        project_id = data.get("id") or str(uuid4())
-        payload = self._normalize_project_payload(project_id, data)
-        self.con.execute(
-            """
-            INSERT INTO projects (
-                id,
-                name,
-                type,
-                owner_champion_id,
-                status,
-                created_at,
-                closed_at,
-                work_center,
-                project_code,
-                project_sop,
-                project_eop,
-                related_work_center
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                payload["id"],
-                payload["name"],
-                payload["type"],
-                payload["owner_champion_id"],
-                payload["status"],
-                payload["created_at"],
-                payload["closed_at"],
-                payload["work_center"],
-                payload["project_code"],
-                payload["project_sop"],
-                payload["project_eop"],
-                payload["related_work_center"],
-            ),
-        )
-        self._log_changelog(
-            project_id,
-            "CREATE",
-            self._serialize_changes(payload),
-        )
-        self.con.commit()
-        return project_id
-
-    def update_project(self, project_id: str, data: dict[str, Any]) -> None:
-        before = self._get_project(project_id)
-        if not before:
-            raise ValueError("Project not found")
-
-        next_payload = {
-            "name": data.get("name", before["name"]),
-            "type": data.get("type", before["type"]),
-            "owner_champion_id": data.get("owner_champion_id", before["owner_champion_id"]),
-            "status": data.get("status", before["status"]),
-            "created_at": data.get("created_at", before["created_at"]),
-            "closed_at": data.get("closed_at", before["closed_at"]),
-            "work_center": data.get("work_center", before.get("work_center")),
-            "project_code": data.get("project_code", before.get("project_code")),
-            "project_sop": data.get("project_sop", before.get("project_sop")),
-            "project_eop": data.get("project_eop", before.get("project_eop")),
-            "related_work_center": data.get("related_work_center", before.get("related_work_center")),
-        }
-        changes = self._diff_changes(before, next_payload)
-        self.con.execute(
-            """
-            UPDATE projects
-            SET name = ?,
-                type = ?,
-                owner_champion_id = ?,
-                status = ?,
-                created_at = ?,
-                closed_at = ?,
-                work_center = ?,
-                project_code = ?,
-                project_sop = ?,
-                project_eop = ?,
-                related_work_center = ?
-            WHERE id = ?
-            """,
-            (
-                next_payload["name"],
-                next_payload["type"],
-                next_payload["owner_champion_id"],
-                next_payload["status"],
-                next_payload["created_at"],
-                next_payload["closed_at"],
-                next_payload["work_center"],
-                next_payload["project_code"],
-                next_payload["project_sop"],
-                next_payload["project_eop"],
-                next_payload["related_work_center"],
-                project_id,
-            ),
-        )
-        if changes:
-            self._log_changelog(
-                project_id,
-                "UPDATE",
-                self._serialize_changes(changes),
-            )
-        self.con.commit()
-
-    def delete_project(self, project_id: str) -> bool:
-        before = self._get_project(project_id)
-        if not before:
-            return True
+    def list_project_work_centers_norms(self, include_related: bool = True) -> set[str]:
         try:
-            self.con.execute("BEGIN")
-            self._log_changelog(
-                project_id,
-                "DELETE",
-                self._serialize_changes(before),
-            )
-            self.con.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-            self.con.commit()
-            return True
-        except sqlite3.IntegrityError:
-            self.con.rollback()
-            return False
+            from action_tracking.services.effectiveness import normalize_wc, parse_work_centers
+        except Exception:
+            def normalize_wc(v: Any) -> str:
+                return normalize_key(str(v or ""))
 
-    def _get_project(self, project_id: str) -> dict[str, Any] | None:
-        cur = self.con.execute(
-            """
-            SELECT *
-            FROM projects
-            WHERE id = ?
-            """,
-            (project_id,),
+            def parse_work_centers(_: Any, value: Any) -> list[str]:
+                if not value:
+                    return []
+                return [t.strip() for t in str(value).split(",") if t.strip()]
+
+        if not _table_exists(self.con, "projects"):
+            return set()
+
+        cur = self.con.execute("SELECT work_center, related_work_center FROM projects")
+        norms: set[str] = set()
+        for row in cur.fetchall():
+            rowd = dict(row)
+            primary = normalize_wc(rowd.get("work_center"))
+            if primary:
+                norms.add(primary)
+            if include_related:
+                for token in parse_work_centers(None, rowd.get("related_work_center")):
+                    n = normalize_wc(token)
+                    if n:
+                        norms.add(n)
+        return norms
+
+    def list_changelog(self, limit: int = 50, project_id: str | None = None) -> list[dict[str, Any]]:
+        return _list_changelog_generic(
+            self.con,
+            table_candidates=[
+                "project_changelog",
+                "projects_changelog",
+                "changelog_projects",
+                "changelog",
+                "change_log",
+                "audit_log",
+            ],
+            limit=limit,
+            entity_id=project_id,
         )
-        row = cur.fetchone()
-        return dict(row) if row else None
 
-    def _log_changelog(self, project_id: str, event_type: str, changes_json: str) -> None:
-        event_at = datetime.now(timezone.utc).isoformat()
-        self.con.execute(
-            """
-            INSERT INTO project_changelog (id, project_id, event_type, event_at, changes_json)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (str(uuid4()), project_id, event_type, event_at, changes_json),
-        )
 
-    def _normalize_project_payload(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
-        now = datetime.now(timezone.utc).isoformat()
-        return {
-            "id": project_id,
-            "name": data.get("name", "").strip(),
-            "type": data.get("type") or "Others",
-            "owner_champion_id": data.get("owner_champion_id"),
-            "status": data.get("status") or "active",
-            "created_at": data.get("created_at") or now,
-            "closed_at": data.get("closed_at"),
-            "work_center": data.get("work_center", "").strip(),
-            "project_code": data.get("project_code"),
-            "project_sop": data.get("project_sop"),
-            "project_eop": data.get("project_eop"),
-            "related_work_center": data.get("related_work_center"),
-        }
-
-    def _serialize_changes(self, payload: dict[str, Any]) -> str:
-        return json.dumps(payload, ensure_ascii=False)
-
-    def _diff_changes(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-        diffs: dict[str, Any] = {}
-        for key, value in after.items():
-            if before.get(key) != value:
-                diffs[key] = {"from": before.get(key), "to": value}
-        return diffs
-
+# =====================================================
+# CHAMPIONS
+# =====================================================
 
 class ChampionRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
     def list_champions(self) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "champions"):
+            return []
+
+        cols: set[str] = set()
+        try:
+            cur = self.con.execute("PRAGMA table_info(champions)")
+            cols = {r[1] for r in cur.fetchall()}
+        except sqlite3.Error:
+            cols = set()
+
+        select_cols = ["id", "first_name", "last_name", "email", "active"]
+        if "hire_date" in cols:
+            select_cols.append("hire_date")
+        if "position" in cols:
+            select_cols.append("position")
+        if "team" in cols:
+            select_cols.append("team")
+
         cur = self.con.execute(
-            """
-            SELECT id,
-                   first_name,
-                   last_name,
-                   email,
-                   hire_date,
-                   position,
-                   active
+            f"""
+            SELECT {", ".join(select_cols)}
             FROM champions
             ORDER BY last_name, first_name
             """
         )
         rows = [dict(r) for r in cur.fetchall()]
-        for row in rows:
-            display = f"{row.get('first_name', '')} {row.get('last_name', '')}".strip()
-            row["display_name"] = display or row.get("id")
+        for r in rows:
+            r["display_name"] = (
+                f"{(r.get('first_name') or '').strip()} {(r.get('last_name') or '').strip()}".strip()
+                or r.get("email")
+                or r.get("id")
+            )
+            r["active"] = bool(r.get("active"))
+            r.setdefault("hire_date", None)
+            r.setdefault("position", None)
+            r.setdefault("team", None)
         return rows
 
-    def list_changelog(self, limit: int = 50) -> list[dict[str, Any]]:
-        cur = self.con.execute(
-            """
-            SELECT ccl.*,
-                   ch.first_name,
-                   ch.last_name
-            FROM champion_changelog ccl
-            LEFT JOIN champions ch ON ch.id = ccl.champion_id
-            ORDER BY ccl.event_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-        return [dict(r) for r in cur.fetchall()]
-
-    def create_champion(self, data: dict[str, Any]) -> str:
-        champion_id = data.get("id") or str(uuid4())
-        first_name = data.get("first_name", "").strip()
-        last_name = data.get("last_name", "").strip()
-        full_name = f"{first_name} {last_name}".strip()
-        payload = {
-            "id": champion_id,
-            "name": full_name or data.get("name", ""),
-            "first_name": first_name,
-            "last_name": last_name,
-            "email": data.get("email"),
-            "hire_date": data.get("hire_date"),
-            "position": data.get("position"),
-            "active": int(data.get("active", 1)),
-        }
-        self.con.execute(
-            """
-            INSERT INTO champions (
-                id,
-                name,
-                email,
-                active,
-                first_name,
-                last_name,
-                hire_date,
-                position
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                payload["id"],
-                payload["name"],
-                payload["email"],
-                payload["active"],
-                payload["first_name"],
-                payload["last_name"],
-                payload["hire_date"],
-                payload["position"],
-            ),
-        )
-        self._log_changelog(
-            champion_id,
-            "CREATE",
-            self._serialize_changes(payload),
-        )
-        self.con.commit()
-        return champion_id
-
-    def update_champion(self, champion_id: str, data: dict[str, Any]) -> None:
-        before = self._get_champion(champion_id)
-        if not before:
-            raise ValueError("Champion not found")
-
-        next_payload = {
-            "first_name": data.get("first_name", before["first_name"]),
-            "last_name": data.get("last_name", before["last_name"]),
-            "email": data.get("email", before["email"]),
-            "hire_date": data.get("hire_date", before["hire_date"]),
-            "position": data.get("position", before["position"]),
-            "active": int(data.get("active", before["active"])),
-        }
-        full_name = f"{next_payload['first_name']} {next_payload['last_name']}".strip()
-
-        changes = self._diff_changes(before, next_payload)
-
-        self.con.execute(
-            """
-            UPDATE champions
-            SET name = ?,
-                first_name = ?,
-                last_name = ?,
-                email = ?,
-                hire_date = ?,
-                position = ?,
-                active = ?
-            WHERE id = ?
-            """,
-            (
-                full_name or before["name"],
-                next_payload["first_name"],
-                next_payload["last_name"],
-                next_payload["email"],
-                next_payload["hire_date"],
-                next_payload["position"],
-                next_payload["active"],
-                champion_id,
-            ),
-        )
-
-        if changes:
-            self._log_changelog(
-                champion_id,
-                "UPDATE",
-                self._serialize_changes(changes),
-            )
-        self.con.commit()
-
-    def delete_champion(self, champion_id: str) -> None:
-        before = self._get_champion(champion_id)
-        if not before:
-            return
-        self._log_changelog(
-            champion_id,
-            "DELETE",
-            self._serialize_changes(before),
-        )
-        self.con.execute("DELETE FROM champions WHERE id = ?", (champion_id,))
-        self.con.commit()
-
-    def _get_champion(self, champion_id: str) -> dict[str, Any] | None:
-        cur = self.con.execute(
-            """
-            SELECT *
-            FROM champions
-            WHERE id = ?
-            """,
-            (champion_id,),
-        )
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-    def _log_changelog(self, champion_id: str, event_type: str, changes_json: str) -> None:
-        if not _table_exists(self.con, "champion_changelog"):
-            raise sqlite3.OperationalError(
-                "champion_changelog table missing; database migration required"
-            )
-        event_at = datetime.now(timezone.utc).isoformat()
-        self.con.execute(
-            """
-            INSERT INTO champion_changelog (id, champion_id, event_type, event_at, changes_json)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (str(uuid4()), champion_id, event_type, event_at, changes_json),
-        )
-
-    def _serialize_changes(self, payload: dict[str, Any]) -> str:
-        return json.dumps(payload, ensure_ascii=False)
-
-    def _diff_changes(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-        diffs: dict[str, Any] = {}
-        for key, value in after.items():
-            if before.get(key) != value:
-                diffs[key] = {"from": before.get(key), "to": value}
-        return diffs
-
-    def set_assigned_projects(self, champion_id: str, project_ids: list[str]) -> None:
-        self.con.execute(
-            "DELETE FROM champion_projects WHERE champion_id = ?",
-            (champion_id,),
-        )
-        if project_ids:
-            rows = [(champion_id, project_id) for project_id in project_ids]
-            self.con.executemany(
-                """
-                INSERT OR IGNORE INTO champion_projects (champion_id, project_id)
-                VALUES (?, ?)
-                """,
-                rows,
-            )
-        self.con.commit()
-
     def get_assigned_projects(self, champion_id: str) -> list[str]:
+        if not _table_exists(self.con, "champion_projects"):
+            return []
         cur = self.con.execute(
             """
             SELECT project_id
@@ -1820,37 +1376,61 @@ class ChampionRepository:
         )
         return [row["project_id"] for row in cur.fetchall()]
 
+    def list_changelog(self, limit: int = 50, champion_id: str | None = None) -> list[dict[str, Any]]:
+        return _list_changelog_generic(
+            self.con,
+            table_candidates=[
+                "champion_changelog",
+                "champions_changelog",
+                "changelog_champions",
+                "changelog",
+                "change_log",
+                "audit_log",
+            ],
+            limit=limit,
+            entity_id=champion_id,
+        )
+
+
+# =====================================================
+# PRODUCTION DATA (SCRAP / KPI)
+# =====================================================
 
 class ProductionDataRepository:
+    """
+    API CONTRACT used by:
+    - production_import.py: upsert_scrap_daily, upsert_production_kpi_daily
+    - production_explorer.py: list_scrap_daily, list_kpi_daily, list_distinct_work_centers, list_work_centers
+    - projects.py (WC inbox): list_production_work_centers_with_stats
+    """
+
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
     def upsert_scrap_daily(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
+        if not _table_exists(self.con, "scrap_daily"):
+            raise sqlite3.OperationalError("scrap_daily table missing; migration required")
         now = datetime.now(timezone.utc).isoformat()
         payload = [
             (
-                row.get("id") or str(uuid4()),
-                row["metric_date"],
-                row["work_center"],
-                int(row["scrap_qty"]),
-                row.get("scrap_cost_amount"),
-                row.get("scrap_cost_currency", "PLN"),
-                row.get("created_at") or now,
+                r.get("id") or str(uuid4()),
+                str(r["metric_date"]),
+                str(r["work_center"]),
+                int(r.get("scrap_qty") or 0),
+                r.get("scrap_cost_amount"),
+                (r.get("scrap_cost_currency") or "PLN"),
+                r.get("created_at") or now,
             )
-            for row in rows
+            for r in rows
         ]
         self.con.executemany(
             """
             INSERT INTO scrap_daily (
-                id,
-                metric_date,
-                work_center,
-                scrap_qty,
-                scrap_cost_amount,
-                scrap_cost_currency,
-                created_at
+                id, metric_date, work_center,
+                scrap_qty, scrap_cost_amount,
+                scrap_cost_currency, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(metric_date, work_center, scrap_cost_currency) DO UPDATE SET
                 scrap_qty = excluded.scrap_qty,
@@ -1864,42 +1444,37 @@ class ProductionDataRepository:
     def upsert_production_kpi_daily(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
+        if not _table_exists(self.con, "production_kpi_daily"):
+            raise sqlite3.OperationalError("production_kpi_daily table missing; migration required")
         now = datetime.now(timezone.utc).isoformat()
         payload = [
             (
-                row.get("id") or str(uuid4()),
-                row["metric_date"],
-                row["work_center"],
-                row.get("worktime_min"),
-                row.get("oee_pct"),
-                row.get("performance_pct"),
-                row.get("availability_pct"),
-                row.get("quality_pct"),
-                row.get("source_file"),
-                row.get("imported_at") or now,
-                row.get("created_at") or row.get("imported_at") or now,
+                r.get("id") or str(uuid4()),
+                str(r["metric_date"]),
+                str(r["work_center"]),
+                r.get("worktime_min"),
+                r.get("performance_pct"),
+                r.get("oee_pct"),
+                r.get("availability_pct"),
+                r.get("quality_pct"),
+                r.get("source_file"),
+                r.get("imported_at") or now,
+                r.get("created_at") or r.get("imported_at") or now,
             )
-            for row in rows
+            for r in rows
         ]
         self.con.executemany(
             """
             INSERT INTO production_kpi_daily (
-                id,
-                metric_date,
-                work_center,
-                worktime_min,
-                oee_pct,
-                performance_pct,
-                availability_pct,
-                quality_pct,
-                source_file,
-                imported_at,
-                created_at
+                id, metric_date, work_center,
+                worktime_min, performance_pct, oee_pct,
+                availability_pct, quality_pct,
+                source_file, imported_at, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(metric_date, work_center) DO UPDATE SET
                 worktime_min = excluded.worktime_min,
-                oee_pct = excluded.oee_pct,
                 performance_pct = excluded.performance_pct,
+                oee_pct = excluded.oee_pct,
                 availability_pct = excluded.availability_pct,
                 quality_pct = excluded.quality_pct,
                 source_file = excluded.source_file,
@@ -1917,6 +1492,8 @@ class ProductionDataRepository:
         date_to: date | str | None,
         currency: str | None = "PLN",
     ) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "scrap_daily"):
+            return []
         query = """
             SELECT metric_date,
                    work_center,
@@ -1927,28 +1504,34 @@ class ProductionDataRepository:
         """
         filters: list[str] = []
         params: list[Any] = []
+
         if work_centers is not None:
             if isinstance(work_centers, str):
-                if work_centers:
+                wc = work_centers.strip()
+                if wc:
                     filters.append("work_center = ?")
-                    params.append(work_centers)
+                    params.append(wc)
             else:
                 if not work_centers:
                     return []
                 placeholders = ", ".join(["?"] * len(work_centers))
                 filters.append(f"work_center IN ({placeholders})")
-                params.extend(work_centers)
+                params.extend([str(wc) for wc in work_centers])
+
         if date_from:
             filters.append("metric_date >= ?")
             params.append(self._normalize_date_filter(date_from))
         if date_to:
             filters.append("metric_date <= ?")
             params.append(self._normalize_date_filter(date_to))
+
         if currency:
             filters.append("scrap_cost_currency = ?")
-            params.append(currency)
+            params.append(str(currency))
+
         if filters:
             query += " WHERE " + " AND ".join(filters)
+
         query += " ORDER BY metric_date ASC, work_center ASC"
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
@@ -1959,50 +1542,77 @@ class ProductionDataRepository:
         date_from: date | str | None,
         date_to: date | str | None,
     ) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "production_kpi_daily"):
+            return []
         query = """
             SELECT metric_date,
                    work_center,
                    worktime_min,
-                   oee_pct,
                    performance_pct,
+                   oee_pct,
                    availability_pct,
                    quality_pct
             FROM production_kpi_daily
         """
         filters: list[str] = []
         params: list[Any] = []
+
         if work_centers is not None:
             if isinstance(work_centers, str):
-                if work_centers:
+                wc = work_centers.strip()
+                if wc:
                     filters.append("work_center = ?")
-                    params.append(work_centers)
+                    params.append(wc)
             else:
                 if not work_centers:
                     return []
                 placeholders = ", ".join(["?"] * len(work_centers))
                 filters.append(f"work_center IN ({placeholders})")
-                params.extend(work_centers)
+                params.extend([str(wc) for wc in work_centers])
+
         if date_from:
             filters.append("metric_date >= ?")
             params.append(self._normalize_date_filter(date_from))
         if date_to:
             filters.append("metric_date <= ?")
             params.append(self._normalize_date_filter(date_to))
+
         if filters:
             query += " WHERE " + " AND ".join(filters)
+
         query += " ORDER BY metric_date ASC, work_center ASC"
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
-    def list_production_kpi_daily(
-        self,
-        work_center: str | None,
-        date_from: date | str | None,
-        date_to: date | str | None,
-    ) -> list[dict[str, Any]]:
-        return self.list_kpi_daily(work_center, date_from, date_to)
+    def list_distinct_work_centers(self) -> dict[str, list[str]]:
+        scrap_work_centers: list[str] = []
+        kpi_work_centers: list[str] = []
+
+        if _table_exists(self.con, "scrap_daily"):
+            cur = self.con.execute(
+                """
+                SELECT DISTINCT work_center
+                FROM scrap_daily
+                ORDER BY work_center
+                """
+            )
+            scrap_work_centers = [row["work_center"] for row in cur.fetchall()]
+
+        if _table_exists(self.con, "production_kpi_daily"):
+            cur = self.con.execute(
+                """
+                SELECT DISTINCT work_center
+                FROM production_kpi_daily
+                ORDER BY work_center
+                """
+            )
+            kpi_work_centers = [row["work_center"] for row in cur.fetchall()]
+
+        return {"scrap_work_centers": scrap_work_centers, "kpi_work_centers": kpi_work_centers}
 
     def list_work_centers(self) -> list[str]:
+        if not _table_exists(self.con, "scrap_daily") and not _table_exists(self.con, "production_kpi_daily"):
+            return []
         cur = self.con.execute(
             """
             SELECT work_center FROM scrap_daily
@@ -2013,42 +1623,246 @@ class ProductionDataRepository:
         )
         return [row["work_center"] for row in cur.fetchall()]
 
-    def list_distinct_work_centers(self) -> dict[str, list[str]]:
-        scrap_work_centers: list[str] = []
-        kpi_work_centers: list[str] = []
-        try:
-            if _table_exists(self.con, "scrap_daily"):
-                cur = self.con.execute(
-                    """
-                    SELECT DISTINCT work_center
-                    FROM scrap_daily
-                    ORDER BY work_center
-                    """
-                )
-                scrap_work_centers = [row["work_center"] for row in cur.fetchall()]
-        except sqlite3.Error:
-            scrap_work_centers = []
+    def list_production_work_centers_with_stats(self) -> list[dict[str, Any]]:
+        from action_tracking.services.effectiveness import normalize_wc  # type: ignore
 
-        try:
-            if _table_exists(self.con, "production_kpi_daily"):
-                cur = self.con.execute(
-                    """
-                    SELECT DISTINCT work_center
-                    FROM production_kpi_daily
-                    ORDER BY work_center
-                    """
-                )
-                kpi_work_centers = [row["work_center"] for row in cur.fetchall()]
-        except sqlite3.Error:
-            kpi_work_centers = []
+        stats: dict[str, dict[str, Any]] = {}
 
-        return {
-            "scrap_work_centers": scrap_work_centers,
-            "kpi_work_centers": kpi_work_centers,
-        }
+        if _table_exists(self.con, "scrap_daily"):
+            cur = self.con.execute(
+                """
+                SELECT work_center,
+                       MIN(metric_date) AS first_seen_date,
+                       MAX(metric_date) AS last_seen_date,
+                       COUNT(DISTINCT metric_date) AS count_days_present
+                FROM scrap_daily
+                GROUP BY work_center
+                """
+            )
+            for row in cur.fetchall():
+                wc_raw = row["work_center"]
+                wc_norm = normalize_wc(wc_raw)
+                if not wc_norm:
+                    continue
+                entry = stats.setdefault(
+                    wc_norm,
+                    {
+                        "wc_raw": wc_raw,
+                        "wc_norm": wc_norm,
+                        "has_scrap": False,
+                        "has_kpi": False,
+                        "first_seen_date": row["first_seen_date"],
+                        "last_seen_date": row["last_seen_date"],
+                        "count_days_present": 0,
+                    },
+                )
+                entry["has_scrap"] = True
+                entry["count_days_present"] += int(row["count_days_present"] or 0)
+                if entry.get("first_seen_date") is None or (
+                    row["first_seen_date"] and row["first_seen_date"] < entry["first_seen_date"]
+                ):
+                    entry["first_seen_date"] = row["first_seen_date"]
+                    entry["wc_raw"] = wc_raw
+                if entry.get("last_seen_date") is None or (
+                    row["last_seen_date"] and row["last_seen_date"] > entry["last_seen_date"]
+                ):
+                    entry["last_seen_date"] = row["last_seen_date"]
+
+        if _table_exists(self.con, "production_kpi_daily"):
+            cur = self.con.execute(
+                """
+                SELECT work_center,
+                       MIN(metric_date) AS first_seen_date,
+                       MAX(metric_date) AS last_seen_date,
+                       COUNT(DISTINCT metric_date) AS count_days_present
+                FROM production_kpi_daily
+                GROUP BY work_center
+                """
+            )
+            for row in cur.fetchall():
+                wc_raw = row["work_center"]
+                wc_norm = normalize_wc(wc_raw)
+                if not wc_norm:
+                    continue
+                entry = stats.setdefault(
+                    wc_norm,
+                    {
+                        "wc_raw": wc_raw,
+                        "wc_norm": wc_norm,
+                        "has_scrap": False,
+                        "has_kpi": False,
+                        "first_seen_date": row["first_seen_date"],
+                        "last_seen_date": row["last_seen_date"],
+                        "count_days_present": 0,
+                    },
+                )
+                entry["has_kpi"] = True
+                entry["count_days_present"] += int(row["count_days_present"] or 0)
+                if entry.get("first_seen_date") is None or (
+                    row["first_seen_date"] and row["first_seen_date"] < entry["first_seen_date"]
+                ):
+                    entry["first_seen_date"] = row["first_seen_date"]
+                    entry["wc_raw"] = wc_raw
+                if entry.get("last_seen_date") is None or (
+                    row["last_seen_date"] and row["last_seen_date"] > entry["last_seen_date"]
+                ):
+                    entry["last_seen_date"] = row["last_seen_date"]
+
+        return list(stats.values())
 
     @staticmethod
     def _normalize_date_filter(value: date | str) -> str:
-        if isinstance(value, date):
-            return value.isoformat()
-        return value
+        return value.isoformat() if isinstance(value, date) else str(value)
+
+
+# =====================================================
+# WC INBOX
+# =====================================================
+
+class WcInboxRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def upsert_from_production(
+        self,
+        work_centers_stats: list[dict[str, Any]],
+        existing_project_wc_norms: set[str],
+    ) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+
+        try:
+            from action_tracking.services.effectiveness import normalize_wc  # type: ignore
+        except Exception:
+            def normalize_wc(v: Any) -> str:
+                return normalize_key(str(v or ""))
+
+        existing_rows: dict[str, dict[str, Any]] = {}
+        cur = self.con.execute(
+            """
+            SELECT wc_norm, wc_raw, sources, status, first_seen_date, last_seen_date
+            FROM wc_inbox
+            """
+        )
+        for r in cur.fetchall():
+            existing_rows[r["wc_norm"]] = dict(r)
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        for row in work_centers_stats or []:
+            wc_norm = normalize_wc(row.get("wc_norm") or row.get("wc_raw"))
+            if not wc_norm:
+                continue
+
+            existing = existing_rows.get(wc_norm)
+
+            if wc_norm in (existing_project_wc_norms or set()):
+                if existing and existing.get("status") == "open":
+                    self._set_status(wc_norm, "linked", None)
+                continue
+
+            sources: list[str] = []
+            if row.get("has_scrap"):
+                sources.append("scrap")
+            if row.get("has_kpi"):
+                sources.append("kpi")
+
+            if existing:
+                try:
+                    prev_sources = json.loads(existing.get("sources") or "[]")
+                except json.JSONDecodeError:
+                    prev_sources = []
+                sources = sorted(set(prev_sources) | set(sources))
+
+            wc_raw_value = (row.get("wc_raw") or "").strip()
+            if existing and existing.get("wc_raw"):
+                wc_raw_value = existing.get("wc_raw") or wc_raw_value
+
+            self.con.execute(
+                """
+                INSERT INTO wc_inbox (
+                    id, wc_raw, wc_norm, sources,
+                    first_seen_date, last_seen_date,
+                    status, linked_project_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(wc_norm) DO UPDATE SET
+                    wc_raw = excluded.wc_raw,
+                    sources = excluded.sources,
+                    first_seen_date = COALESCE(
+                        MIN(wc_inbox.first_seen_date, excluded.first_seen_date),
+                        excluded.first_seen_date,
+                        wc_inbox.first_seen_date
+                    ),
+                    last_seen_date = COALESCE(
+                        MAX(wc_inbox.last_seen_date, excluded.last_seen_date),
+                        excluded.last_seen_date,
+                        wc_inbox.last_seen_date
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(uuid4()),
+                    wc_raw_value,
+                    wc_norm,
+                    json.dumps(sources, ensure_ascii=False),
+                    row.get("first_seen_date"),
+                    row.get("last_seen_date"),
+                    "open",
+                    None,
+                    now,
+                    now,
+                ),
+            )
+
+        self.con.commit()
+
+    def list_open(self, limit: int = 200) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "wc_inbox"):
+            return []
+        cur = self.con.execute(
+            """
+            SELECT *
+            FROM wc_inbox
+            WHERE status = 'open'
+            ORDER BY last_seen_date DESC, wc_raw ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            try:
+                r["sources"] = json.loads(r.get("sources") or "[]")
+            except json.JSONDecodeError:
+                r["sources"] = []
+        return rows
+
+    def ignore(self, wc_norm: str) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+        self._set_status(wc_norm, "ignored", None)
+
+    def link_to_project(self, wc_norm: str, project_id: str) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+        self._set_status(wc_norm, "linked", project_id)
+
+    def mark_created(self, wc_norm: str, project_id: str) -> None:
+        if not _table_exists(self.con, "wc_inbox"):
+            return
+        self._set_status(wc_norm, "created", project_id)
+
+    def _set_status(self, wc_norm: str, status: str, project_id: str | None) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.con.execute(
+            """
+            UPDATE wc_inbox
+            SET status = ?,
+                linked_project_id = ?,
+                updated_at = ?
+            WHERE wc_norm = ?
+            """,
+            (status, project_id, now, wc_norm),
+        )
+        self.con.commit()
