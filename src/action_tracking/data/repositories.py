@@ -1108,6 +1108,7 @@ class ProductionDataRepository:
         work_centers: str | list[str] | None,
         date_from: date | str | None,
         date_to: date | str | None,
+        currency: str | None = "PLN",
     ) -> list[dict[str, Any]]:
         query = """
             SELECT metric_date,
@@ -1116,6 +1117,47 @@ class ProductionDataRepository:
                    scrap_cost_amount,
                    scrap_cost_currency
             FROM scrap_daily
+        """
+        filters: list[str] = []
+        params: list[Any] = []
+        if work_centers is not None:
+            if isinstance(work_centers, str):
+                if work_centers:
+                    filters.append("work_center = ?")
+                    params.append(work_centers)
+            else:
+                if not work_centers:
+                    return []
+                placeholders = ", ".join(["?"] * len(work_centers))
+                filters.append(f"work_center IN ({placeholders})")
+                params.extend(work_centers)
+        if date_from:
+            filters.append("metric_date >= ?")
+            params.append(self._normalize_date_filter(date_from))
+        if date_to:
+            filters.append("metric_date <= ?")
+            params.append(self._normalize_date_filter(date_to))
+        if currency:
+            filters.append("scrap_cost_currency = ?")
+            params.append(currency)
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+        query += " ORDER BY metric_date ASC, work_center ASC"
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_kpi_daily(
+        self,
+        work_centers: str | list[str] | None,
+        date_from: date | str | None,
+        date_to: date | str | None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT metric_date,
+                   work_center,
+                   oee_pct,
+                   performance_pct
+            FROM production_kpi_daily
         """
         filters: list[str] = []
         params: list[Any] = []
@@ -1148,29 +1190,7 @@ class ProductionDataRepository:
         date_from: date | str | None,
         date_to: date | str | None,
     ) -> list[dict[str, Any]]:
-        query = """
-            SELECT metric_date,
-                   work_center,
-                   oee_pct,
-                   performance_pct
-            FROM production_kpi_daily
-        """
-        filters: list[str] = []
-        params: list[Any] = []
-        if work_center:
-            filters.append("work_center = ?")
-            params.append(work_center)
-        if date_from:
-            filters.append("metric_date >= ?")
-            params.append(self._normalize_date_filter(date_from))
-        if date_to:
-            filters.append("metric_date <= ?")
-            params.append(self._normalize_date_filter(date_to))
-        if filters:
-            query += " WHERE " + " AND ".join(filters)
-        query += " ORDER BY metric_date ASC, work_center ASC"
-        cur = self.con.execute(query, params)
-        return [dict(r) for r in cur.fetchall()]
+        return self.list_kpi_daily(work_center, date_from, date_to)
 
     def list_work_centers(self) -> list[str]:
         cur = self.con.execute(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+import re
 from typing import Any
 
 
@@ -23,16 +24,18 @@ def parse_date(value: Any) -> date | None:
 
 def parse_work_centers(primary: str | None, related: str | None) -> list[str]:
     centers: list[str] = []
-    primary_value = (primary or "").strip()
+
+    def _normalize(value: str) -> str:
+        return " ".join(value.replace("\u00a0", " ").split())
+
+    primary_value = _normalize(primary or "")
     if primary_value:
         centers.append(primary_value)
 
     if related:
-        tokens = [related]
-        for sep in (",", ";", "|"):
-            tokens = [part for token in tokens for part in token.split(sep)]
+        tokens = re.split(r"[,;|\n]+", related)
         for token in tokens:
-            center = token.strip()
+            center = _normalize(token)
             if center and center not in centers:
                 centers.append(center)
 

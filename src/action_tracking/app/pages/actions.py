@@ -175,6 +175,7 @@ def render(con: sqlite3.Connection) -> None:
                     work_centers,
                     date_from,
                     date_to,
+                    currency=None,
                 )
             else:
                 scrap_rows = []

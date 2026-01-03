@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 import sqlite3
 from typing import Any
 
+import altair as alt
+import pandas as pd
 import streamlit as st
 
-from action_tracking.data.repositories import ChampionRepository, ProjectRepository
+from action_tracking.data.repositories import (
+    ChampionRepository,
+    ProductionDataRepository,
+    ProjectRepository,
+)
 from action_tracking.domain.constants import PROJECT_TYPES
+from action_tracking.services.effectiveness import parse_work_centers
 
 
 FIELD_LABELS = {
@@ -64,11 +71,55 @@ def _format_changes(
     return "; ".join(parts) if parts else "Brak danych."
 
 
+def _window_bounds(
+    date_from: date,
+    date_to: date,
+) -> tuple[date, date, date, date, bool]:
+    total_days = (date_to - date_from).days + 1
+    if total_days < 28:
+        mid = date_from + timedelta(days=(total_days - 1) // 2)
+        baseline_to = mid
+        after_from = mid + timedelta(days=1)
+        return date_from, baseline_to, after_from, date_to, True
+    return date_from, date_from + timedelta(days=13), date_to - timedelta(days=13), date_to, False
+
+
+def _format_metric_value(value: float | None, fmt: str) -> str:
+    if value is None:
+        return "—"
+    return fmt.format(value)
+
+
+def _metric_delta_label(
+    baseline: float | None,
+    after: float | None,
+    fmt: str,
+) -> str:
+    if baseline is None or after is None:
+        return "—"
+    delta = after - baseline
+    if baseline == 0:
+        pct_label = "n/a"
+    else:
+        pct_label = f"{delta / baseline:+.1%}"
+    return f"{fmt.format(delta)} ({pct_label})"
+
+
+def _mean_or_none(series: pd.Series | None) -> float | None:
+    if series is None or series.empty:
+        return None
+    value = series.mean()
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Projekty")
 
     project_repo = ProjectRepository(con)
     champion_repo = ChampionRepository(con)
+    production_repo = ProductionDataRepository(con)
 
     champions = champion_repo.list_champions()
     champion_names = {
@@ -244,3 +295,229 @@ def render(con: sqlite3.Connection) -> None:
                 f"**{entry['event_at']}** · {entry['event_type']} · {project_name}"
             )
             st.caption(_format_changes(entry["event_type"], changes, champion_names))
+
+    st.subheader("Outcome projektu (produkcja)")
+    if not projects:
+        st.info("Brak projektów do analizy.")
+        return
+
+    today = date.today()
+    default_from = today - timedelta(days=90)
+
+    selector_col1, selector_col2, selector_col3, selector_col4 = st.columns(4)
+    selected_project_id = selector_col1.selectbox(
+        "Projekt",
+        [project["id"] for project in projects],
+        format_func=lambda pid: projects_by_id[pid].get("name", pid),
+    )
+    selected_from = selector_col2.date_input("Data od", value=default_from)
+    selected_to = selector_col3.date_input("Data do", value=today)
+    include_related = selector_col4.checkbox(
+        "Uwzględnij powiązane Work Center",
+        value=True,
+    )
+    st.caption("Waluta kosztów: PLN (v1).")
+
+    if selected_from > selected_to:
+        st.error("Zakres dat jest nieprawidłowy (Data od > Data do).")
+        return
+
+    selected_project = projects_by_id.get(selected_project_id, {})
+    primary_wc = selected_project.get("work_center")
+    if not (primary_wc and primary_wc.strip()):
+        st.error("Projekt nie ma przypisanego Work Center.")
+        return
+
+    related_wc = selected_project.get("related_work_center") if include_related else None
+    work_centers = parse_work_centers(primary_wc, related_wc)
+    if not work_centers:
+        st.error("Nie znaleziono Work Center dla projektu.")
+        return
+
+    scrap_rows_all = production_repo.list_scrap_daily(
+        work_centers,
+        selected_from,
+        selected_to,
+        currency=None,
+    )
+    kpi_rows = production_repo.list_kpi_daily(
+        work_centers,
+        selected_from,
+        selected_to,
+    )
+
+    if not scrap_rows_all and not kpi_rows:
+        st.info("Brak danych produkcyjnych dla wybranego zakresu.")
+        return
+
+    non_pln_currencies = {
+        row.get("scrap_cost_currency")
+        for row in scrap_rows_all
+        if row.get("scrap_cost_currency") and row.get("scrap_cost_currency") != "PLN"
+    }
+    if non_pln_currencies:
+        st.info(
+            "Dostępne są dane scrap w innych walutach (pominięto): "
+            + ", ".join(sorted(non_pln_currencies))
+        )
+
+    scrap_rows = [
+        row
+        for row in scrap_rows_all
+        if row.get("scrap_cost_currency") == "PLN"
+    ]
+
+    scrap_df = pd.DataFrame(scrap_rows)
+    if not scrap_df.empty:
+        scrap_df["metric_date"] = pd.to_datetime(scrap_df["metric_date"])
+        scrap_daily = (
+            scrap_df.groupby("metric_date", as_index=False)
+            .agg(scrap_qty_sum=("scrap_qty", "sum"), scrap_pln_sum=("scrap_cost_amount", "sum"))
+            .sort_values("metric_date")
+        )
+    else:
+        scrap_daily = pd.DataFrame(columns=["metric_date", "scrap_qty_sum", "scrap_pln_sum"])
+
+    kpi_df = pd.DataFrame(kpi_rows)
+    if not kpi_df.empty:
+        kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"])
+        kpi_daily = (
+            kpi_df.groupby("metric_date", as_index=False)
+            .agg(oee_avg=("oee_pct", "mean"), performance_avg=("performance_pct", "mean"))
+            .sort_values("metric_date")
+        )
+    else:
+        kpi_daily = pd.DataFrame(columns=["metric_date", "oee_avg", "performance_avg"])
+
+    merged_daily = pd.merge(scrap_daily, kpi_daily, on="metric_date", how="outer").sort_values(
+        "metric_date"
+    )
+
+    baseline_from, baseline_to, after_from, after_to, used_halves = _window_bounds(
+        selected_from,
+        selected_to,
+    )
+    if used_halves:
+        st.warning(
+            "Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after)."
+        )
+
+    baseline_mask = (merged_daily["metric_date"].dt.date >= baseline_from) & (
+        merged_daily["metric_date"].dt.date <= baseline_to
+    )
+    after_mask = (merged_daily["metric_date"].dt.date >= after_from) & (
+        merged_daily["metric_date"].dt.date <= after_to
+    )
+
+    baseline_slice = merged_daily.loc[baseline_mask]
+    after_slice = merged_daily.loc[after_mask]
+
+    baseline_scrap_qty = _mean_or_none(baseline_slice.get("scrap_qty_sum"))
+    after_scrap_qty = _mean_or_none(after_slice.get("scrap_qty_sum"))
+    baseline_scrap_pln = _mean_or_none(baseline_slice.get("scrap_pln_sum"))
+    after_scrap_pln = _mean_or_none(after_slice.get("scrap_pln_sum"))
+    baseline_oee = _mean_or_none(baseline_slice.get("oee_avg"))
+    after_oee = _mean_or_none(after_slice.get("oee_avg"))
+    baseline_perf = _mean_or_none(baseline_slice.get("performance_avg"))
+    after_perf = _mean_or_none(after_slice.get("performance_avg"))
+
+    kpi_cols = st.columns(4)
+    kpi_cols[0].metric(
+        "Śr. scrap qty/dzień",
+        _format_metric_value(after_scrap_qty, "{:.2f}"),
+        delta=_metric_delta_label(baseline_scrap_qty, after_scrap_qty, "{:+.2f}"),
+    )
+    kpi_cols[0].caption(
+        f"Baseline: {_format_metric_value(baseline_scrap_qty, '{:.2f}')}"
+    )
+    kpi_cols[1].metric(
+        "Śr. scrap PLN/dzień",
+        _format_metric_value(after_scrap_pln, "{:.2f}"),
+        delta=_metric_delta_label(baseline_scrap_pln, after_scrap_pln, "{:+.2f}"),
+    )
+    kpi_cols[1].caption(
+        f"Baseline: {_format_metric_value(baseline_scrap_pln, '{:.2f}')}"
+    )
+    kpi_cols[2].metric(
+        "Śr. OEE%",
+        _format_metric_value(after_oee, "{:.1f}%"),
+        delta=_metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
+    )
+    kpi_cols[2].caption(f"Baseline: {_format_metric_value(baseline_oee, '{:.1f}%')}")
+    kpi_cols[3].metric(
+        "Śr. Performance%",
+        _format_metric_value(after_perf, "{:.1f}%"),
+        delta=_metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
+    )
+    kpi_cols[3].caption(
+        f"Baseline: {_format_metric_value(baseline_perf, '{:.1f}%')}"
+    )
+
+    chart_cols = st.columns(2)
+    if not scrap_daily.empty:
+        chart_cols[0].altair_chart(
+            alt.Chart(scrap_daily)
+            .mark_line()
+            .encode(
+                x=alt.X("metric_date:T", title="Data"),
+                y=alt.Y("scrap_qty_sum:Q", title="Scrap qty"),
+            )
+            .properties(title="Scrap qty (suma)"),
+            use_container_width=True,
+        )
+        chart_cols[1].altair_chart(
+            alt.Chart(scrap_daily)
+            .mark_line()
+            .encode(
+                x=alt.X("metric_date:T", title="Data"),
+                y=alt.Y("scrap_pln_sum:Q", title="Scrap PLN"),
+            )
+            .properties(title="Scrap PLN (suma)"),
+            use_container_width=True,
+        )
+    else:
+        st.info("Brak danych scrap (PLN) w wybranym zakresie.")
+
+    chart_cols = st.columns(2)
+    if not kpi_daily.empty:
+        chart_cols[0].altair_chart(
+            alt.Chart(kpi_daily)
+            .mark_line()
+            .encode(
+                x=alt.X("metric_date:T", title="Data"),
+                y=alt.Y("oee_avg:Q", title="OEE%"),
+            )
+            .properties(title="OEE% (średnia)"),
+            use_container_width=True,
+        )
+        chart_cols[1].altair_chart(
+            alt.Chart(kpi_daily)
+            .mark_line()
+            .encode(
+                x=alt.X("metric_date:T", title="Data"),
+                y=alt.Y("performance_avg:Q", title="Performance%"),
+            )
+            .properties(title="Performance% (średnia)"),
+            use_container_width=True,
+        )
+    else:
+        st.info("Brak danych KPI w wybranym zakresie.")
+
+    st.subheader("Dzienny podgląd (audit)")
+    if merged_daily.empty:
+        st.caption("Brak danych do wyświetlenia w tabeli.")
+    else:
+        merged_daily = merged_daily.sort_values("metric_date")
+        if len(merged_daily) > 180:
+            merged_daily = merged_daily.tail(180)
+        audit_rows = merged_daily.rename(
+            columns={
+                "metric_date": "metric_date",
+                "scrap_qty_sum": "scrap_qty_sum",
+                "scrap_pln_sum": "scrap_pln_sum",
+                "oee_avg": "oee_avg",
+                "performance_avg": "performance_avg",
+            }
+        )
+        audit_rows["metric_date"] = audit_rows["metric_date"].dt.date
+        st.dataframe(audit_rows, use_container_width=True)
