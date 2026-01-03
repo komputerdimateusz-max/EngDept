@@ -35,7 +35,7 @@ init_db(con)
 st.sidebar.title("engdept")
 
 PAGES = {
-    "Explorer": lambda: explorer.render(con),
+    "Explorer (Produkcja)": lambda: explorer.render(con),
     "Import danych produkcyjnych": lambda: production_import.render(con),
     "KPI": lambda: kpi.render(con),
     "Akcje": lambda: actions.render(con),

@@ -112,8 +112,13 @@ CREATE TABLE IF NOT EXISTS production_kpi_daily (
   id TEXT PRIMARY KEY,
   metric_date TEXT NOT NULL,
   work_center TEXT NOT NULL,
-  oee_pct REAL,
+  worktime_min REAL,
   performance_pct REAL,
+  oee_pct REAL,
+  availability_pct REAL,
+  quality_pct REAL,
+  source_file TEXT,
+  imported_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
   UNIQUE(metric_date, work_center)
 );
@@ -382,6 +387,40 @@ def _migrate_to_v8(con: sqlite3.Connection) -> None:
     _set_user_version(con, 8)
 
 
+def _migrate_to_v9(con: sqlite3.Connection) -> None:
+    if not _column_exists(con, "production_kpi_daily", "worktime_min"):
+        con.execute("ALTER TABLE production_kpi_daily ADD COLUMN worktime_min REAL;")
+    if not _column_exists(con, "production_kpi_daily", "availability_pct"):
+        con.execute("ALTER TABLE production_kpi_daily ADD COLUMN availability_pct REAL;")
+    if not _column_exists(con, "production_kpi_daily", "quality_pct"):
+        con.execute("ALTER TABLE production_kpi_daily ADD COLUMN quality_pct REAL;")
+    if not _column_exists(con, "production_kpi_daily", "source_file"):
+        con.execute("ALTER TABLE production_kpi_daily ADD COLUMN source_file TEXT;")
+    if not _column_exists(con, "production_kpi_daily", "imported_at"):
+        con.execute(
+            "ALTER TABLE production_kpi_daily ADD COLUMN imported_at TEXT NOT NULL DEFAULT '';"
+        )
+    if _column_exists(con, "production_kpi_daily", "imported_at"):
+        now = datetime.now(timezone.utc).isoformat()
+        if _column_exists(con, "production_kpi_daily", "created_at"):
+            con.execute(
+                """
+                UPDATE production_kpi_daily
+                SET imported_at = COALESCE(NULLIF(imported_at, ''), created_at, ?)
+                """,
+                (now,),
+            )
+        else:
+            con.execute(
+                """
+                UPDATE production_kpi_daily
+                SET imported_at = COALESCE(NULLIF(imported_at, ''), ?)
+                """,
+                (now,),
+            )
+    _set_user_version(con, 9)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "action_categories"):
         return
@@ -427,6 +466,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v7(con)
     if current_version < 8:
         _migrate_to_v8(con)
+    if current_version < 9:
+        _migrate_to_v9(con)
     _seed_action_categories(con)
     con.commit()
 
