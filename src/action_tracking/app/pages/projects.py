@@ -112,6 +112,21 @@ def _metric_delta_label(
     return f"{fmt.format(delta)} ({pct_label})"
 
 
+def _metric_delta_label_scrap_good_down(
+    baseline: float | None,
+    after: float | None,
+    fmt: str,
+) -> str:
+    if baseline is None or after is None:
+        return "—"
+    improvement = baseline - after
+    if baseline == 0:
+        pct_label = "n/a"
+    else:
+        pct_label = f"{improvement / baseline:+.1%}"
+    return f"{fmt.format(improvement)} ({pct_label})"
+
+
 def _mean_or_none(series: pd.Series | None) -> float | None:
     if series is None or series.empty:
         return None
@@ -235,6 +250,21 @@ def _weighted_or_mean(values: pd.Series, weights: pd.Series | None) -> float | N
     return _mean_or_none(values)
 
 
+def _as_percent_series(series: pd.Series) -> tuple[pd.Series, str]:
+    if series.empty:
+        return series, "unknown"
+    numeric = series.dropna()
+    if numeric.empty:
+        return series, "unknown"
+    median_value = float(numeric.median())
+    if median_value <= 1.5:
+        scaled = series * 100
+        if not scaled.dropna().empty and float(scaled.max()) > 1000:
+            return series, "percent"
+        return scaled, "fraction"
+    return series, "percent"
+
+
 def _build_work_center_map(work_centers: list[str]) -> dict[str, list[str]]:
     mapping: dict[str, list[str]] = {}
     for work_center in work_centers:
@@ -285,578 +315,628 @@ def render(con: sqlite3.Connection) -> None:
     prod_work_center_map = _build_work_center_map(all_prod_wcs)
     prod_work_center_keys = set(prod_work_center_map)
 
-    st.subheader("Lista projektów")
-    st.caption(f"Liczba projektów: {len(projects)}")
-    table_rows = []
-    for project in projects:
-        total = project.get("actions_total") or 0
-        closed = project.get("actions_closed") or 0
-        open_count = project.get("actions_open") or 0
-        pct_closed = project.get("pct_closed")
-        pct_label = f"{pct_closed:.1f}%" if pct_closed is not None else "—"
-        table_rows.append(
-            {
-                "Nazwa projektu": project.get("name"),
-                "Work center": project.get("work_center"),
-                "Typ": project.get("type"),
-                "Champion": project.get("owner_champion_name")
-                or champion_names.get(project.get("owner_champion_id"), "—"),
-                "Status": project.get("status"),
-                "Akcje (łącznie)": total,
-                "Akcje (otwarte)": open_count,
-                "Akcje (zamknięte)": closed,
-                "% zamkniętych": pct_label,
+    st.subheader("Outcome projektu (produkcja)")
+    if not projects:
+        st.info("Brak projektów do analizy.")
+    else:
+        today = date.today()
+        default_from = today - timedelta(days=90)
+
+        selector_col1, selector_col2, selector_col3, selector_col4 = st.columns(4)
+        selected_project_id = selector_col1.selectbox(
+            "Projekt",
+            [project["id"] for project in projects],
+            format_func=lambda pid: projects_by_id[pid].get("name", pid),
+        )
+        selected_from = selector_col2.date_input("Data od", value=default_from)
+        selected_to = selector_col3.date_input("Data do", value=today)
+        include_related = selector_col4.checkbox(
+            "Uwzględnij powiązane Work Center",
+            value=True,
+        )
+        st.caption("Waluta kosztów: PLN (v1).")
+
+        outcome_ready = True
+        if selected_from > selected_to:
+            st.error("Zakres dat jest nieprawidłowy (Data od > Data do).")
+            outcome_ready = False
+
+        selected_project = projects_by_id.get(selected_project_id, {})
+        primary_wc = selected_project.get("work_center")
+        if outcome_ready and not (primary_wc and primary_wc.strip()):
+            st.error("Projekt nie ma przypisanego Work Center.")
+            outcome_ready = False
+
+        related_wc = (
+            selected_project.get("related_work_center") if include_related else None
+        )
+        work_centers = parse_work_centers(primary_wc, related_wc)
+        if outcome_ready and not work_centers:
+            st.error("Nie znaleziono Work Center dla projektu.")
+            outcome_ready = False
+
+        if outcome_ready:
+            scrap_rows_all = production_repo.list_scrap_daily(
+                work_centers,
+                selected_from,
+                selected_to,
+                currency=None,
+            )
+            kpi_rows = production_repo.list_kpi_daily(
+                work_centers,
+                selected_from,
+                selected_to,
+            )
+
+            if not scrap_rows_all and not kpi_rows:
+                st.info("Brak danych produkcyjnych dla wybranego zakresu.")
+
+            non_pln_currencies = {
+                row.get("scrap_cost_currency")
+                for row in scrap_rows_all
+                if row.get("scrap_cost_currency")
+                and row.get("scrap_cost_currency") != "PLN"
             }
-        )
-    st.dataframe(table_rows, use_container_width=True)
+            if non_pln_currencies:
+                st.info(
+                    "Dostępne są dane scrap w innych walutach (pominięto): "
+                    + ", ".join(sorted(non_pln_currencies))
+                )
 
-    st.subheader("Dodaj / Edytuj projekt")
-    project_options = ["(nowy)"] + [project["id"] for project in projects]
-    selected_id = st.selectbox(
-        "Wybierz projekt do edycji",
-        project_options,
-        format_func=lambda pid: "(nowy)"
-        if pid == "(nowy)"
-        else projects_by_id[pid].get("name", pid),
-    )
-    editing = selected_id != "(nowy)"
-    selected = projects_by_id.get(selected_id, {}) if editing else {}
+            scrap_rows = [
+                row
+                for row in scrap_rows_all
+                if row.get("scrap_cost_currency") == "PLN"
+            ]
 
-    sop_value = (
-        date.fromisoformat(selected["project_sop"])
-        if selected.get("project_sop")
-        else None
-    )
-    eop_value = (
-        date.fromisoformat(selected["project_eop"])
-        if selected.get("project_eop")
-        else None
-    )
-
-    with st.form("project_form"):
-        name = st.text_input(
-            "Nazwa projektu",
-            value=selected.get("name", "") or "",
-        )
-        use_wc_picker = st.checkbox(
-            "Wybierz Work Center z danych produkcyjnych",
-            value=False,
-            disabled=not all_prod_wcs,
-            help="Opcjonalny wybór z listy WC dostępnych w danych produkcyjnych.",
-        )
-        if use_wc_picker and all_prod_wcs:
-            default_work_center = _resolve_work_center_default(
-                selected.get("work_center", "") or "",
-                prod_work_center_map,
-                all_prod_wcs,
-            )
-            work_center_index = (
-                all_prod_wcs.index(default_work_center) if default_work_center else 0
-            )
-            work_center = st.selectbox(
-                "Work center",
-                all_prod_wcs,
-                index=work_center_index,
-            )
-        else:
-            work_center = st.text_input(
-                "Work center",
-                value=selected.get("work_center", "") or "",
-            )
-        project_code = st.text_input(
-            "Project Code",
-            value=selected.get("project_code", "") or "",
-        )
-        no_sop = st.checkbox("Brak daty SOP", value=sop_value is None)
-        project_sop = st.date_input(
-            "Project SOP",
-            value=sop_value or date.today(),
-            disabled=no_sop,
-        )
-        no_eop = st.checkbox("Brak daty EOP", value=eop_value is None)
-        project_eop = st.date_input(
-            "Project EOP",
-            value=eop_value or date.today(),
-            disabled=no_eop,
-        )
-        if use_wc_picker and all_prod_wcs:
-            related_defaults = []
-            related_tokens = parse_work_centers(
-                None,
-                selected.get("related_work_center", "") or "",
-            )
-            for token in related_tokens:
-                normalized = normalize_wc(token)
-                if normalized in prod_work_center_map:
-                    related_defaults.append(prod_work_center_map[normalized][0])
-            related_selection = st.multiselect(
-                "Powiązane Work Center",
-                all_prod_wcs,
-                default=related_defaults,
-            )
-            related_work_center = "; ".join(related_selection)
-        else:
-            related_work_center = st.text_input(
-                "Powiązane Work Center",
-                value=selected.get("related_work_center", "") or "",
-            )
-
-        st.markdown("**Walidacja Work Center**")
-        if not all_prod_wcs:
-            st.info(
-                "Brak danych produkcyjnych w bazie – nie można zweryfikować WC."
-            )
-        else:
-            primary_label = work_center.strip() or "—"
-            related_list = parse_work_centers(None, related_work_center)
-            related_label = ", ".join(related_list) if related_list else "—"
-            st.write(f"Project WC (primary): {primary_label}")
-            st.write(f"Related WC: {related_label}")
-
-            def _render_wc_status(label: str, value: str) -> None:
-                normalized = normalize_wc(value)
-                if not normalized:
-                    st.caption(f"{label}: brak wartości do sprawdzenia.")
-                    return
-                if normalized in prod_work_center_keys:
-                    st.success(f"{label}: ✅ Found in production data.")
-                    return
-                suggestions = suggest_work_centers(value, all_prod_wcs)
-                message = f"{label}: ⚠ Nie znaleziono w danych produkcyjnych."
-                if suggestions:
-                    message += f" Sugestie: {', '.join(suggestions)}."
-                st.warning(message)
-
-            _render_wc_status("Project WC (primary)", work_center)
-            for related in related_list:
-                _render_wc_status(f"Related WC ({related})", related)
-        selected_category = selected.get("type")
-        if editing and selected_category and selected_category not in PROJECT_TYPES:
-            st.caption(f"Legacy type: {selected_category}")
-        category_index = PROJECT_TYPES.index("Others")
-        if selected_category in PROJECT_TYPES:
-            category_index = PROJECT_TYPES.index(selected_category)
-        project_type = st.selectbox(
-            "Typ",
-            PROJECT_TYPES,
-            index=category_index,
-        )
-        owner_champion_id = st.selectbox(
-            "Champion",
-            champion_options,
-            index=champion_options.index(selected.get("owner_champion_id", "(brak)"))
-            if editing and selected.get("owner_champion_id") in champion_options
-            else 0,
-            format_func=lambda cid: "(brak)"
-            if cid == "(brak)"
-            else champion_names.get(cid, cid),
-        )
-        status = st.selectbox(
-            "Status",
-            ["active", "closed", "on_hold"],
-            index=["active", "closed", "on_hold"].index(
-                selected.get("status") or "active"
-            ),
-        )
-        submitted = st.form_submit_button("Zapisz")
-
-    if submitted:
-        if not name.strip() or not work_center.strip():
-            st.error("Nazwa projektu i Work center są wymagane.")
-        else:
-            payload = {
-                "name": name.strip(),
-                "work_center": work_center.strip(),
-                "project_code": project_code.strip() or None,
-                "project_sop": None if no_sop else project_sop.isoformat(),
-                "project_eop": None if no_eop else project_eop.isoformat(),
-                "related_work_center": related_work_center.strip() or None,
-                "type": project_type,
-                "owner_champion_id": None
-                if owner_champion_id == "(brak)"
-                else owner_champion_id,
-                "status": status,
-            }
-            if editing:
-                project_repo.update_project(selected_id, payload)
-                st.success("Projekt zaktualizowany.")
+            scrap_df = pd.DataFrame(scrap_rows)
+            if not scrap_df.empty:
+                scrap_df["metric_date"] = pd.to_datetime(scrap_df["metric_date"])
+                scrap_daily = (
+                    scrap_df.groupby("metric_date", as_index=False)
+                    .agg(
+                        scrap_qty_sum=("scrap_qty", "sum"),
+                        scrap_pln_sum=("scrap_cost_amount", "sum"),
+                    )
+                    .sort_values("metric_date")
+                )
             else:
-                project_repo.create_project(payload)
-                st.success("Projekt dodany.")
-            st.rerun()
+                scrap_daily = pd.DataFrame(
+                    columns=["metric_date", "scrap_qty_sum", "scrap_pln_sum"]
+                )
 
-    st.subheader("Usuń projekt")
-    delete_id = st.selectbox(
-        "Wybierz projekt do usunięcia",
-        ["(brak)"] + [project["id"] for project in projects],
-        format_func=lambda pid: "(brak)"
-        if pid == "(brak)"
-        else projects_by_id[pid].get("name", pid),
-        key="delete_project_select",
-    )
-    confirm_delete = st.checkbox(
-        "Potwierdzam usunięcie projektu",
-        key="delete_project_confirm",
-    )
-    if st.button("Usuń", disabled=delete_id == "(brak)" or not confirm_delete):
-        removed = project_repo.delete_project(delete_id)
-        if removed:
-            st.success("Projekt usunięty.")
-            st.rerun()
-        else:
-            st.error("Nie można usunąć projektu powiązanego z akcjami.")
+            kpi_df = pd.DataFrame(kpi_rows)
+            if not kpi_df.empty:
+                kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"])
+                kpi_daily = (
+                    kpi_df.groupby("metric_date")
+                    .apply(
+                        lambda group: pd.Series(
+                            {
+                                "oee_avg": _weighted_or_mean(
+                                    group["oee_pct"], group.get("worktime_min")
+                                ),
+                                "performance_avg": _weighted_or_mean(
+                                    group["performance_pct"], group.get("worktime_min")
+                                ),
+                            }
+                        )
+                    )
+                    .reset_index()
+                    .sort_values("metric_date")
+                )
+            else:
+                kpi_daily = pd.DataFrame(
+                    columns=["metric_date", "oee_avg", "performance_avg"]
+                )
 
-    st.subheader("Changelog")
-    with st.expander("Changelog", expanded=False):
+            oee_scale = "unknown"
+            perf_scale = "unknown"
+            if not kpi_daily.empty:
+                kpi_daily["oee_avg"], oee_scale = _as_percent_series(
+                    kpi_daily["oee_avg"]
+                )
+                kpi_daily["performance_avg"], perf_scale = _as_percent_series(
+                    kpi_daily["performance_avg"]
+                )
+
+            actions = action_repo.list_actions_for_project_outcome(
+                selected_project_id,
+                selected_from,
+                selected_to,
+            )
+            action_ids = [str(row.get("id")) for row in actions]
+            effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(
+                action_ids
+            )
+
+            closed_markers: list[dict[str, Any]] = []
+            for action in actions:
+                action_id = str(action.get("id") or "")
+                owner = action.get("owner_name") or champion_names.get(
+                    action.get("owner_champion_id"), "—"
+                )
+                effect_row = effectiveness_map.get(action_id)
+                effect_label, _ = _effectiveness_style(effect_row)
+                title = action.get("title") or ""
+                short_id = _short_action_id(action_id)
+                action_label = f"{title} ({short_id})" if short_id else title
+                closed_date = parse_date(action.get("closed_at"))
+                if closed_date and selected_from <= closed_date <= selected_to:
+                    closed_markers.append(
+                        {
+                            "closed_at": pd.to_datetime(closed_date),
+                            "action_label": action_label,
+                            "owner": owner or "—",
+                            "effect_label": "Neutral"
+                            if effect_label == "Not computed"
+                            else effect_label,
+                            "delta_scrap_qty": _format_delta(
+                                _effectiveness_delta(effect_row, "scrap_qty")
+                            ),
+                            "delta_scrap_pln": _format_delta(
+                                _effectiveness_delta(effect_row, "scrap_cost")
+                                or _effectiveness_delta(effect_row, "scrap_pln")
+                            ),
+                        }
+                    )
+
+            markers_df = pd.DataFrame(closed_markers)
+
+            merged_daily = pd.merge(
+                scrap_daily, kpi_daily, on="metric_date", how="outer"
+            ).sort_values("metric_date")
+
+            baseline_from, baseline_to, after_from, after_to, used_halves = (
+                _window_bounds(
+                    selected_from,
+                    selected_to,
+                )
+            )
+            if used_halves:
+                st.warning(
+                    "Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after)."
+                )
+
+            baseline_mask = (
+                merged_daily["metric_date"].dt.date >= baseline_from
+            ) & (merged_daily["metric_date"].dt.date <= baseline_to)
+            after_mask = (merged_daily["metric_date"].dt.date >= after_from) & (
+                merged_daily["metric_date"].dt.date <= after_to
+            )
+
+            baseline_slice = merged_daily.loc[baseline_mask]
+            after_slice = merged_daily.loc[after_mask]
+
+            baseline_scrap_qty = _mean_or_none(baseline_slice.get("scrap_qty_sum"))
+            after_scrap_qty = _mean_or_none(after_slice.get("scrap_qty_sum"))
+            baseline_scrap_pln = _mean_or_none(baseline_slice.get("scrap_pln_sum"))
+            after_scrap_pln = _mean_or_none(after_slice.get("scrap_pln_sum"))
+            baseline_oee = _mean_or_none(baseline_slice.get("oee_avg"))
+            after_oee = _mean_or_none(after_slice.get("oee_avg"))
+            baseline_perf = _mean_or_none(baseline_slice.get("performance_avg"))
+            after_perf = _mean_or_none(after_slice.get("performance_avg"))
+
+            kpi_cols = st.columns(4)
+            kpi_cols[0].metric(
+                "Śr. scrap qty/dzień",
+                _format_metric_value(after_scrap_qty, "{:.2f}"),
+                delta=_metric_delta_label_scrap_good_down(
+                    baseline_scrap_qty, after_scrap_qty, "{:+.2f}"
+                ),
+            )
+            kpi_cols[0].caption(
+                f"Baseline: {_format_metric_value(baseline_scrap_qty, '{:.2f}')}"
+            )
+            kpi_cols[1].metric(
+                "Śr. scrap PLN/dzień",
+                _format_metric_value(after_scrap_pln, "{:.2f}"),
+                delta=_metric_delta_label_scrap_good_down(
+                    baseline_scrap_pln, after_scrap_pln, "{:+.2f}"
+                ),
+            )
+            kpi_cols[1].caption(
+                f"Baseline: {_format_metric_value(baseline_scrap_pln, '{:.2f}')}"
+            )
+            kpi_cols[2].metric(
+                "Śr. OEE%",
+                _format_metric_value(after_oee, "{:.1f}%"),
+                delta=_metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
+            )
+            kpi_cols[2].caption(
+                f"Baseline: {_format_metric_value(baseline_oee, '{:.1f}%')}"
+            )
+            kpi_cols[3].metric(
+                "Śr. Performance%",
+                _format_metric_value(after_perf, "{:.1f}%"),
+                delta=_metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
+            )
+            kpi_cols[3].caption(
+                f"Baseline: {_format_metric_value(baseline_perf, '{:.1f}%')}"
+            )
+            st.caption("Dla scrap spadek = poprawa (zielone).")
+            if oee_scale != "unknown" or perf_scale != "unknown":
+                st.caption(
+                    "Wykryta skala KPI: "
+                    f"OEE={oee_scale}, Performance={perf_scale}."
+                )
+
+            marker_count = len(markers_df)
+            show_markers_default = marker_count > 0 and marker_count <= 20
+            show_markers = st.checkbox(
+                "Pokaż markery zamknięcia akcji",
+                value=show_markers_default,
+                disabled=marker_count == 0,
+            )
+            if marker_count == 0:
+                st.caption("Brak zamkniętych akcji w wybranym zakresie dat.")
+            if marker_count > 20:
+                st.warning(
+                    "W zakresie jest dużo zamkniętych akcji — aby zachować czytelność, "
+                    "markery są domyślnie ukryte."
+                )
+                if show_markers:
+                    show_all_markers = st.checkbox(
+                        "Pokaż wszystkie markery", value=False
+                    )
+                    if not show_all_markers:
+                        markers_df = markers_df.sort_values("closed_at").tail(20)
+                        st.caption("Pokazano 20 ostatnich zamkniętych akcji.")
+
+            chart_cols = st.columns(2)
+            if not scrap_daily.empty:
+                chart_cols[0].altair_chart(
+                    _line_chart_with_markers(
+                        scrap_daily,
+                        "scrap_qty_sum",
+                        "Scrap qty",
+                        "Scrap qty (suma)",
+                        markers_df,
+                        show_markers,
+                    ),
+                    use_container_width=True,
+                )
+                chart_cols[1].altair_chart(
+                    _line_chart_with_markers(
+                        scrap_daily,
+                        "scrap_pln_sum",
+                        "Scrap PLN",
+                        "Scrap PLN (suma)",
+                        markers_df,
+                        show_markers,
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.info("Brak danych scrap (PLN) w wybranym zakresie.")
+
+            chart_cols = st.columns(2)
+            if not kpi_daily.empty:
+                chart_cols[0].altair_chart(
+                    _line_chart_with_markers(
+                        kpi_daily,
+                        "oee_avg",
+                        "OEE (%)",
+                        "OEE (średnia, %)",
+                        markers_df,
+                        show_markers,
+                    ),
+                    use_container_width=True,
+                )
+                chart_cols[1].altair_chart(
+                    _line_chart_with_markers(
+                        kpi_daily,
+                        "performance_avg",
+                        "Performance (%)",
+                        "Performance (średnia, %)",
+                        markers_df,
+                        show_markers,
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.info("Brak danych KPI w wybranym zakresie.")
+
+            st.caption(
+                "Markery pokazują daty zamknięcia akcji. Kolor markera odzwierciedla "
+                "skuteczność scrap (jeśli policzona): zielony = effective, szary = "
+                "neutral/unknown, czerwony = ineffective."
+            )
+
+            st.subheader("Akcje w wybranym zakresie")
+            if not actions:
+                st.caption("Brak akcji w wybranym zakresie.")
+            else:
+                action_table: list[dict[str, Any]] = []
+                for action in sorted(actions, key=_actions_sort_key):
+                    action_id = str(action.get("id") or "")
+                    owner = action.get("owner_name") or champion_names.get(
+                        action.get("owner_champion_id"), "—"
+                    )
+                    effect_row = effectiveness_map.get(action_id)
+                    effect_label, _ = _effectiveness_style(effect_row)
+                    title = action.get("title") or ""
+                    short_id = _short_action_id(action_id)
+                    action_label = f"{title} ({short_id})" if short_id else title
+                    action_table.append(
+                        {
+                            "Zamknięta": _format_action_date(
+                                action.get("closed_at")
+                            ),
+                            "Akcja": action_label,
+                            "Kategoria": action.get("category") or "—",
+                            "Status": action.get("status") or "—",
+                            "Termin": _format_action_date(action.get("due_date")),
+                            "Owner": owner or "—",
+                            "Skuteczność": effect_label,
+                            "Δ scrap qty": _format_delta(
+                                _effectiveness_delta(effect_row, "scrap_qty")
+                            ),
+                            "Δ scrap PLN": _format_delta(
+                                _effectiveness_delta(effect_row, "scrap_cost")
+                                or _effectiveness_delta(effect_row, "scrap_pln")
+                            ),
+                            "Utworzono": _format_action_date(
+                                action.get("created_at")
+                            ),
+                        }
+                    )
+                st.dataframe(action_table, use_container_width=True)
+
+            st.subheader("Dzienny podgląd (audit)")
+            if merged_daily.empty:
+                st.caption("Brak danych do wyświetlenia w tabeli.")
+            else:
+                merged_daily = merged_daily.sort_values("metric_date")
+                if len(merged_daily) > 180:
+                    merged_daily = merged_daily.tail(180)
+                audit_rows = merged_daily.rename(
+                    columns={
+                        "metric_date": "metric_date",
+                        "scrap_qty_sum": "scrap_qty_sum",
+                        "scrap_pln_sum": "scrap_pln_sum",
+                        "oee_avg": "oee_avg",
+                        "performance_avg": "performance_avg",
+                    }
+                )
+                audit_rows["metric_date"] = audit_rows["metric_date"].dt.date
+                st.dataframe(audit_rows, use_container_width=True)
+    with st.expander("📁 Zarządzanie projektami (lista + edycja)", expanded=False):
+        st.subheader("Lista projektów")
+        st.caption(f"Liczba projektów: {len(projects)}")
+        table_rows = []
+        for project in projects:
+            total = project.get("actions_total") or 0
+            closed = project.get("actions_closed") or 0
+            open_count = project.get("actions_open") or 0
+            pct_closed = project.get("pct_closed")
+            pct_label = f"{pct_closed:.1f}%" if pct_closed is not None else "—"
+            table_rows.append(
+                {
+                    "Nazwa projektu": project.get("name"),
+                    "Work center": project.get("work_center"),
+                    "Typ": project.get("type"),
+                    "Champion": project.get("owner_champion_name")
+                    or champion_names.get(project.get("owner_champion_id"), "—"),
+                    "Status": project.get("status"),
+                    "Akcje (łącznie)": total,
+                    "Akcje (otwarte)": open_count,
+                    "Akcje (zamknięte)": closed,
+                    "% zamkniętych": pct_label,
+                }
+            )
+        st.dataframe(table_rows, use_container_width=True)
+
+        st.subheader("Dodaj / Edytuj projekt")
+        project_options = ["(nowy)"] + [project["id"] for project in projects]
+        selected_id = st.selectbox(
+            "Wybierz projekt do edycji",
+            project_options,
+            format_func=lambda pid: "(nowy)"
+            if pid == "(nowy)"
+            else projects_by_id[pid].get("name", pid),
+        )
+        editing = selected_id != "(nowy)"
+        selected = projects_by_id.get(selected_id, {}) if editing else {}
+
+        sop_value = (
+            date.fromisoformat(selected["project_sop"])
+            if selected.get("project_sop")
+            else None
+        )
+        eop_value = (
+            date.fromisoformat(selected["project_eop"])
+            if selected.get("project_eop")
+            else None
+        )
+
+        with st.form("project_form"):
+            name = st.text_input(
+                "Nazwa projektu",
+                value=selected.get("name", "") or "",
+            )
+            use_wc_picker = st.checkbox(
+                "Wybierz Work Center z danych produkcyjnych",
+                value=False,
+                disabled=not all_prod_wcs,
+                help="Opcjonalny wybór z listy WC dostępnych w danych produkcyjnych.",
+            )
+            if use_wc_picker and all_prod_wcs:
+                default_work_center = _resolve_work_center_default(
+                    selected.get("work_center", "") or "",
+                    prod_work_center_map,
+                    all_prod_wcs,
+                )
+                work_center_index = (
+                    all_prod_wcs.index(default_work_center)
+                    if default_work_center
+                    else 0
+                )
+                work_center = st.selectbox(
+                    "Work center",
+                    all_prod_wcs,
+                    index=work_center_index,
+                )
+            else:
+                work_center = st.text_input(
+                    "Work center",
+                    value=selected.get("work_center", "") or "",
+                )
+            project_code = st.text_input(
+                "Project Code",
+                value=selected.get("project_code", "") or "",
+            )
+            no_sop = st.checkbox("Brak daty SOP", value=sop_value is None)
+            project_sop = st.date_input(
+                "Project SOP",
+                value=sop_value or date.today(),
+                disabled=no_sop,
+            )
+            no_eop = st.checkbox("Brak daty EOP", value=eop_value is None)
+            project_eop = st.date_input(
+                "Project EOP",
+                value=eop_value or date.today(),
+                disabled=no_eop,
+            )
+            if use_wc_picker and all_prod_wcs:
+                related_defaults = []
+                related_tokens = parse_work_centers(
+                    None,
+                    selected.get("related_work_center", "") or "",
+                )
+                for token in related_tokens:
+                    normalized = normalize_wc(token)
+                    if normalized in prod_work_center_map:
+                        related_defaults.append(prod_work_center_map[normalized][0])
+                related_selection = st.multiselect(
+                    "Powiązane Work Center",
+                    all_prod_wcs,
+                    default=related_defaults,
+                )
+                related_work_center = "; ".join(related_selection)
+            else:
+                related_work_center = st.text_input(
+                    "Powiązane Work Center",
+                    value=selected.get("related_work_center", "") or "",
+                )
+
+            st.markdown("**Walidacja Work Center**")
+            if not all_prod_wcs:
+                st.info(
+                    "Brak danych produkcyjnych w bazie – nie można zweryfikować WC."
+                )
+            else:
+                primary_label = work_center.strip() or "—"
+                related_list = parse_work_centers(None, related_work_center)
+                related_label = ", ".join(related_list) if related_list else "—"
+                st.write(f"Project WC (primary): {primary_label}")
+                st.write(f"Related WC: {related_label}")
+
+                def _render_wc_status(label: str, value: str) -> None:
+                    normalized = normalize_wc(value)
+                    if not normalized:
+                        st.caption(f"{label}: brak wartości do sprawdzenia.")
+                        return
+                    if normalized in prod_work_center_keys:
+                        st.success(f"{label}: ✅ Found in production data.")
+                        return
+                    suggestions = suggest_work_centers(value, all_prod_wcs)
+                    message = f"{label}: ⚠ Nie znaleziono w danych produkcyjnych."
+                    if suggestions:
+                        message += f" Sugestie: {', '.join(suggestions)}."
+                    st.warning(message)
+
+                _render_wc_status("Project WC (primary)", work_center)
+                for related in related_list:
+                    _render_wc_status(f"Related WC ({related})", related)
+            selected_category = selected.get("type")
+            if editing and selected_category and selected_category not in PROJECT_TYPES:
+                st.caption(f"Legacy type: {selected_category}")
+            category_index = PROJECT_TYPES.index("Others")
+            if selected_category in PROJECT_TYPES:
+                category_index = PROJECT_TYPES.index(selected_category)
+            project_type = st.selectbox(
+                "Typ",
+                PROJECT_TYPES,
+                index=category_index,
+            )
+            owner_champion_id = st.selectbox(
+                "Champion",
+                champion_options,
+                index=champion_options.index(
+                    selected.get("owner_champion_id", "(brak)")
+                )
+                if editing and selected.get("owner_champion_id") in champion_options
+                else 0,
+                format_func=lambda cid: "(brak)"
+                if cid == "(brak)"
+                else champion_names.get(cid, cid),
+            )
+            status = st.selectbox(
+                "Status",
+                ["active", "closed", "on_hold"],
+                index=["active", "closed", "on_hold"].index(
+                    selected.get("status") or "active"
+                ),
+            )
+            submitted = st.form_submit_button("Zapisz")
+
+        if submitted:
+            if not name.strip() or not work_center.strip():
+                st.error("Nazwa projektu i Work center są wymagane.")
+            else:
+                payload = {
+                    "name": name.strip(),
+                    "work_center": work_center.strip(),
+                    "project_code": project_code.strip() or None,
+                    "project_sop": None if no_sop else project_sop.isoformat(),
+                    "project_eop": None if no_eop else project_eop.isoformat(),
+                    "related_work_center": related_work_center.strip() or None,
+                    "type": project_type,
+                    "owner_champion_id": None
+                    if owner_champion_id == "(brak)"
+                    else owner_champion_id,
+                    "status": status,
+                }
+                if editing:
+                    project_repo.update_project(selected_id, payload)
+                    st.success("Projekt zaktualizowany.")
+                else:
+                    project_repo.create_project(payload)
+                    st.success("Projekt dodany.")
+                st.rerun()
+
+        st.subheader("Usuń projekt")
+        delete_id = st.selectbox(
+            "Wybierz projekt do usunięcia",
+            ["(brak)"] + [project["id"] for project in projects],
+            format_func=lambda pid: "(brak)"
+            if pid == "(brak)"
+            else projects_by_id[pid].get("name", pid),
+            key="delete_project_select",
+        )
+        confirm_delete = st.checkbox(
+            "Potwierdzam usunięcie projektu",
+            key="delete_project_confirm",
+        )
+        if st.button("Usuń", disabled=delete_id == "(brak)" or not confirm_delete):
+            removed = project_repo.delete_project(delete_id)
+            if removed:
+                st.success("Projekt usunięty.")
+                st.rerun()
+            else:
+                st.error("Nie można usunąć projektu powiązanego z akcjami.")
+
+    with st.expander("🧾 Changelog projektów", expanded=False):
         changelog_entries = project_repo.list_changelog(limit=50)
         if not changelog_entries:
             st.caption("Brak wpisów w changelogu.")
         for entry in changelog_entries:
             changes = json.loads(entry["changes_json"])
-            project_name = entry.get("name") or changes.get("name") or entry.get("project_id")
+            project_name = (
+                entry.get("name") or changes.get("name") or entry.get("project_id")
+            )
             st.markdown(
                 f"**{entry['event_at']}** · {entry['event_type']} · {project_name}"
             )
             st.caption(_format_changes(entry["event_type"], changes, champion_names))
-
-    st.subheader("Outcome projektu (produkcja)")
-    if not projects:
-        st.info("Brak projektów do analizy.")
-        return
-
-    today = date.today()
-    default_from = today - timedelta(days=90)
-
-    selector_col1, selector_col2, selector_col3, selector_col4 = st.columns(4)
-    selected_project_id = selector_col1.selectbox(
-        "Projekt",
-        [project["id"] for project in projects],
-        format_func=lambda pid: projects_by_id[pid].get("name", pid),
-    )
-    selected_from = selector_col2.date_input("Data od", value=default_from)
-    selected_to = selector_col3.date_input("Data do", value=today)
-    include_related = selector_col4.checkbox(
-        "Uwzględnij powiązane Work Center",
-        value=True,
-    )
-    st.caption("Waluta kosztów: PLN (v1).")
-
-    if selected_from > selected_to:
-        st.error("Zakres dat jest nieprawidłowy (Data od > Data do).")
-        return
-
-    selected_project = projects_by_id.get(selected_project_id, {})
-    primary_wc = selected_project.get("work_center")
-    if not (primary_wc and primary_wc.strip()):
-        st.error("Projekt nie ma przypisanego Work Center.")
-        return
-
-    related_wc = selected_project.get("related_work_center") if include_related else None
-    work_centers = parse_work_centers(primary_wc, related_wc)
-    if not work_centers:
-        st.error("Nie znaleziono Work Center dla projektu.")
-        return
-
-    scrap_rows_all = production_repo.list_scrap_daily(
-        work_centers,
-        selected_from,
-        selected_to,
-        currency=None,
-    )
-    kpi_rows = production_repo.list_kpi_daily(
-        work_centers,
-        selected_from,
-        selected_to,
-    )
-
-    if not scrap_rows_all and not kpi_rows:
-        st.info("Brak danych produkcyjnych dla wybranego zakresu.")
-
-    non_pln_currencies = {
-        row.get("scrap_cost_currency")
-        for row in scrap_rows_all
-        if row.get("scrap_cost_currency") and row.get("scrap_cost_currency") != "PLN"
-    }
-    if non_pln_currencies:
-        st.info(
-            "Dostępne są dane scrap w innych walutach (pominięto): "
-            + ", ".join(sorted(non_pln_currencies))
-        )
-
-    scrap_rows = [
-        row
-        for row in scrap_rows_all
-        if row.get("scrap_cost_currency") == "PLN"
-    ]
-
-    scrap_df = pd.DataFrame(scrap_rows)
-    if not scrap_df.empty:
-        scrap_df["metric_date"] = pd.to_datetime(scrap_df["metric_date"])
-        scrap_daily = (
-            scrap_df.groupby("metric_date", as_index=False)
-            .agg(scrap_qty_sum=("scrap_qty", "sum"), scrap_pln_sum=("scrap_cost_amount", "sum"))
-            .sort_values("metric_date")
-        )
-    else:
-        scrap_daily = pd.DataFrame(columns=["metric_date", "scrap_qty_sum", "scrap_pln_sum"])
-
-    kpi_df = pd.DataFrame(kpi_rows)
-    if not kpi_df.empty:
-        kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"])
-        kpi_daily = (
-            kpi_df.groupby("metric_date")
-            .apply(
-                lambda group: pd.Series(
-                    {
-                        "oee_avg": _weighted_or_mean(
-                            group["oee_pct"], group.get("worktime_min")
-                        ),
-                        "performance_avg": _weighted_or_mean(
-                            group["performance_pct"], group.get("worktime_min")
-                        ),
-                    }
-                )
-            )
-            .reset_index()
-            .sort_values("metric_date")
-        )
-    else:
-        kpi_daily = pd.DataFrame(columns=["metric_date", "oee_avg", "performance_avg"])
-
-    actions = action_repo.list_actions_for_project_outcome(
-        selected_project_id,
-        selected_from,
-        selected_to,
-    )
-    action_ids = [str(row.get("id")) for row in actions]
-    effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(action_ids)
-
-    closed_markers: list[dict[str, Any]] = []
-    for action in actions:
-        action_id = str(action.get("id") or "")
-        owner = action.get("owner_name") or champion_names.get(
-            action.get("owner_champion_id"), "—"
-        )
-        effect_row = effectiveness_map.get(action_id)
-        effect_label, _ = _effectiveness_style(effect_row)
-        title = action.get("title") or ""
-        short_id = _short_action_id(action_id)
-        action_label = f"{title} ({short_id})" if short_id else title
-        closed_date = parse_date(action.get("closed_at"))
-        if closed_date and selected_from <= closed_date <= selected_to:
-            closed_markers.append(
-                {
-                    "closed_at": pd.to_datetime(closed_date),
-                    "action_label": action_label,
-                    "owner": owner or "—",
-                    "effect_label": "Neutral" if effect_label == "Not computed" else effect_label,
-                    "delta_scrap_qty": _format_delta(
-                        _effectiveness_delta(effect_row, "scrap_qty")
-                    ),
-                    "delta_scrap_pln": _format_delta(
-                        _effectiveness_delta(effect_row, "scrap_cost")
-                        or _effectiveness_delta(effect_row, "scrap_pln")
-                    ),
-                }
-            )
-
-    markers_df = pd.DataFrame(closed_markers)
-
-    merged_daily = pd.merge(scrap_daily, kpi_daily, on="metric_date", how="outer").sort_values(
-        "metric_date"
-    )
-
-    baseline_from, baseline_to, after_from, after_to, used_halves = _window_bounds(
-        selected_from,
-        selected_to,
-    )
-    if used_halves:
-        st.warning(
-            "Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after)."
-        )
-
-    baseline_mask = (merged_daily["metric_date"].dt.date >= baseline_from) & (
-        merged_daily["metric_date"].dt.date <= baseline_to
-    )
-    after_mask = (merged_daily["metric_date"].dt.date >= after_from) & (
-        merged_daily["metric_date"].dt.date <= after_to
-    )
-
-    baseline_slice = merged_daily.loc[baseline_mask]
-    after_slice = merged_daily.loc[after_mask]
-
-    baseline_scrap_qty = _mean_or_none(baseline_slice.get("scrap_qty_sum"))
-    after_scrap_qty = _mean_or_none(after_slice.get("scrap_qty_sum"))
-    baseline_scrap_pln = _mean_or_none(baseline_slice.get("scrap_pln_sum"))
-    after_scrap_pln = _mean_or_none(after_slice.get("scrap_pln_sum"))
-    baseline_oee = _mean_or_none(baseline_slice.get("oee_avg"))
-    after_oee = _mean_or_none(after_slice.get("oee_avg"))
-    baseline_perf = _mean_or_none(baseline_slice.get("performance_avg"))
-    after_perf = _mean_or_none(after_slice.get("performance_avg"))
-
-    kpi_cols = st.columns(4)
-    kpi_cols[0].metric(
-        "Śr. scrap qty/dzień",
-        _format_metric_value(after_scrap_qty, "{:.2f}"),
-        delta=_metric_delta_label(baseline_scrap_qty, after_scrap_qty, "{:+.2f}"),
-    )
-    kpi_cols[0].caption(
-        f"Baseline: {_format_metric_value(baseline_scrap_qty, '{:.2f}')}"
-    )
-    kpi_cols[1].metric(
-        "Śr. scrap PLN/dzień",
-        _format_metric_value(after_scrap_pln, "{:.2f}"),
-        delta=_metric_delta_label(baseline_scrap_pln, after_scrap_pln, "{:+.2f}"),
-    )
-    kpi_cols[1].caption(
-        f"Baseline: {_format_metric_value(baseline_scrap_pln, '{:.2f}')}"
-    )
-    kpi_cols[2].metric(
-        "Śr. OEE%",
-        _format_metric_value(after_oee, "{:.1f}%"),
-        delta=_metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
-    )
-    kpi_cols[2].caption(f"Baseline: {_format_metric_value(baseline_oee, '{:.1f}%')}")
-    kpi_cols[3].metric(
-        "Śr. Performance%",
-        _format_metric_value(after_perf, "{:.1f}%"),
-        delta=_metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
-    )
-    kpi_cols[3].caption(
-        f"Baseline: {_format_metric_value(baseline_perf, '{:.1f}%')}"
-    )
-
-    marker_count = len(markers_df)
-    show_markers_default = marker_count > 0 and marker_count <= 20
-    show_markers = st.checkbox(
-        "Pokaż markery zamknięcia akcji",
-        value=show_markers_default,
-        disabled=marker_count == 0,
-    )
-    if marker_count == 0:
-        st.caption("Brak zamkniętych akcji w wybranym zakresie dat.")
-    if marker_count > 20:
-        st.warning(
-            "W zakresie jest dużo zamkniętych akcji — aby zachować czytelność, "
-            "markery są domyślnie ukryte."
-        )
-        if show_markers:
-            show_all_markers = st.checkbox("Pokaż wszystkie markery", value=False)
-            if not show_all_markers:
-                markers_df = markers_df.sort_values("closed_at").tail(20)
-                st.caption("Pokazano 20 ostatnich zamkniętych akcji.")
-
-    chart_cols = st.columns(2)
-    if not scrap_daily.empty:
-        chart_cols[0].altair_chart(
-            _line_chart_with_markers(
-                scrap_daily,
-                "scrap_qty_sum",
-                "Scrap qty",
-                "Scrap qty (suma)",
-                markers_df,
-                show_markers,
-            ),
-            use_container_width=True,
-        )
-        chart_cols[1].altair_chart(
-            _line_chart_with_markers(
-                scrap_daily,
-                "scrap_pln_sum",
-                "Scrap PLN",
-                "Scrap PLN (suma)",
-                markers_df,
-                show_markers,
-            ),
-            use_container_width=True,
-        )
-    else:
-        st.info("Brak danych scrap (PLN) w wybranym zakresie.")
-
-    chart_cols = st.columns(2)
-    if not kpi_daily.empty:
-        chart_cols[0].altair_chart(
-            _line_chart_with_markers(
-                kpi_daily,
-                "oee_avg",
-                "OEE%",
-                "OEE% (średnia)",
-                markers_df,
-                show_markers,
-            ),
-            use_container_width=True,
-        )
-        chart_cols[1].altair_chart(
-            _line_chart_with_markers(
-                kpi_daily,
-                "performance_avg",
-                "Performance%",
-                "Performance% (średnia)",
-                markers_df,
-                show_markers,
-            ),
-            use_container_width=True,
-        )
-    else:
-        st.info("Brak danych KPI w wybranym zakresie.")
-
-    st.caption(
-        "Markery pokazują daty zamknięcia akcji. Kolor markera odzwierciedla "
-        "skuteczność scrap (jeśli policzona): zielony = effective, szary = neutral/unknown, "
-        "czerwony = ineffective."
-    )
-
-    st.subheader("Akcje w wybranym zakresie")
-    if not actions:
-        st.caption("Brak akcji w wybranym zakresie.")
-    else:
-        action_table: list[dict[str, Any]] = []
-        for action in sorted(actions, key=_actions_sort_key):
-            action_id = str(action.get("id") or "")
-            owner = action.get("owner_name") or champion_names.get(
-                action.get("owner_champion_id"), "—"
-            )
-            effect_row = effectiveness_map.get(action_id)
-            effect_label, _ = _effectiveness_style(effect_row)
-            title = action.get("title") or ""
-            short_id = _short_action_id(action_id)
-            action_label = f"{title} ({short_id})" if short_id else title
-            action_table.append(
-                {
-                    "Zamknięta": _format_action_date(action.get("closed_at")),
-                    "Akcja": action_label,
-                    "Kategoria": action.get("category") or "—",
-                    "Status": action.get("status") or "—",
-                    "Termin": _format_action_date(action.get("due_date")),
-                    "Owner": owner or "—",
-                    "Skuteczność": effect_label,
-                    "Δ scrap qty": _format_delta(
-                        _effectiveness_delta(effect_row, "scrap_qty")
-                    ),
-                    "Δ scrap PLN": _format_delta(
-                        _effectiveness_delta(effect_row, "scrap_cost")
-                        or _effectiveness_delta(effect_row, "scrap_pln")
-                    ),
-                    "Utworzono": _format_action_date(action.get("created_at")),
-                }
-            )
-        st.dataframe(action_table, use_container_width=True)
-
-    st.subheader("Dzienny podgląd (audit)")
-    if merged_daily.empty:
-        st.caption("Brak danych do wyświetlenia w tabeli.")
-    else:
-        merged_daily = merged_daily.sort_values("metric_date")
-        if len(merged_daily) > 180:
-            merged_daily = merged_daily.tail(180)
-        audit_rows = merged_daily.rename(
-            columns={
-                "metric_date": "metric_date",
-                "scrap_qty_sum": "scrap_qty_sum",
-                "scrap_pln_sum": "scrap_pln_sum",
-                "oee_avg": "oee_avg",
-                "performance_avg": "performance_avg",
-            }
-        )
-        audit_rows["metric_date"] = audit_rows["metric_date"].dt.date
-        st.dataframe(audit_rows, use_container_width=True)
