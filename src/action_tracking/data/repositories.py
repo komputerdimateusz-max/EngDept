@@ -1469,6 +1469,60 @@ class ProjectRepository:
         )
         self.con.commit()
 
+    def delete_project(self, project_id: str) -> bool:
+        if not project_id:
+            raise ValueError("project_id is required")
+        if not _table_exists(self.con, "projects"):
+            return False
+
+        with self.con:
+            if _table_exists(self.con, "actions"):
+                cur = self.con.execute(
+                    """
+                    SELECT 1
+                    FROM actions
+                    WHERE project_id = ?
+                    LIMIT 1
+                    """,
+                    (project_id,),
+                )
+                if cur.fetchone():
+                    return False
+
+            if _table_exists(self.con, "champion_projects"):
+                self.con.execute(
+                    "DELETE FROM champion_projects WHERE project_id = ?",
+                    (project_id,),
+                )
+
+            if _table_exists(self.con, "wc_inbox"):
+                inbox_cols = _table_columns(self.con, "wc_inbox")
+                if "linked_project_id" in inbox_cols:
+                    if "status" in inbox_cols:
+                        self.con.execute(
+                            """
+                            UPDATE wc_inbox
+                            SET linked_project_id = NULL,
+                                status = CASE
+                                    WHEN linked_project_id = ? AND status IN ('linked', 'created') THEN 'open'
+                                    ELSE status
+                                END
+                            WHERE linked_project_id = ?
+                            """,
+                            (project_id, project_id),
+                        )
+                    else:
+                        self.con.execute(
+                            "UPDATE wc_inbox SET linked_project_id = NULL WHERE linked_project_id = ?",
+                            (project_id,),
+                        )
+
+            cur = self.con.execute(
+                "DELETE FROM projects WHERE id = ?",
+                (project_id,),
+            )
+            return cur.rowcount > 0
+
     def list_projects(self, include_counts: bool = True) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "projects"):
             return []
@@ -1791,6 +1845,124 @@ class ChampionRepository:
             _rollback_safely(self.con)
             raise
         return champion_id
+
+    def update_champion(self, champion_id: str, data: dict[str, Any]) -> None:
+        if not champion_id:
+            raise ValueError("champion_id is required")
+        if not _table_exists(self.con, "champions"):
+            raise ValueError("champions table missing")
+
+        try:
+            cur = self.con.execute("PRAGMA table_info(champions)")
+            columns_info = cur.fetchall()
+        except sqlite3.Error:
+            columns_info = []
+        if not columns_info:
+            raise ValueError("champions table has no columns")
+
+        cols = {row[1] for row in columns_info}
+        name_not_null = any(row[1] == "name" and bool(row[3]) for row in columns_info)
+
+        data_keys = set(data.keys())
+        payload: dict[str, Any] = {}
+
+        existing: dict[str, Any] | None = None
+        if "name" in cols and (name_not_null or "name" in data_keys):
+            cur = self.con.execute(
+                "SELECT name, first_name, last_name, email FROM champions WHERE id = ?",
+                (champion_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                existing = dict(row)
+
+        if "first_name" in data_keys and "first_name" in cols:
+            payload["first_name"] = (data.get("first_name") or "").strip() or None
+        if "last_name" in data_keys and "last_name" in cols:
+            payload["last_name"] = (data.get("last_name") or "").strip() or None
+        if "email" in data_keys and "email" in cols:
+            payload["email"] = (data.get("email") or "").strip() or None
+        if "active" in data_keys and "active" in cols:
+            payload["active"] = int(bool(data.get("active")))
+        if "hire_date" in data_keys and "hire_date" in cols:
+            hire_date = data.get("hire_date") or None
+            if isinstance(hire_date, datetime):
+                hire_date = hire_date.date().isoformat()
+            elif isinstance(hire_date, date):
+                hire_date = hire_date.isoformat()
+            elif hire_date:
+                hire_date = str(hire_date)
+            payload["hire_date"] = hire_date
+        if "position" in data_keys and "position" in cols:
+            payload["position"] = (data.get("position") or "").strip() or None
+        if "team" in data_keys and "team" in cols:
+            payload["team"] = (data.get("team") or "").strip() or None
+
+        if "name" in cols:
+            name_value = None
+            if "name" in data_keys:
+                name_value = (data.get("name") or "").strip() or None
+            if name_not_null or "name" in data_keys:
+                first_name = (data.get("first_name") if "first_name" in data_keys else None)
+                last_name = (data.get("last_name") if "last_name" in data_keys else None)
+                email = (data.get("email") if "email" in data_keys else None)
+                if existing:
+                    if first_name is None:
+                        first_name = existing.get("first_name")
+                    if last_name is None:
+                        last_name = existing.get("last_name")
+                    if email is None:
+                        email = existing.get("email")
+                full_name = " ".join(part for part in [first_name, last_name] if part).strip()
+                derived_name = full_name or email or (existing.get("name") if existing else None) or champion_id
+                payload["name"] = name_value or derived_name
+
+        if not payload:
+            return
+
+        sets = [f"{col} = ?" for col in payload.keys()]
+        params = list(payload.values())
+        params.append(champion_id)
+        with self.con:
+            self.con.execute(
+                f"UPDATE champions SET {', '.join(sets)} WHERE id = ?",
+                params,
+            )
+
+    def delete_champion(self, champion_id: str) -> bool:
+        if not champion_id:
+            raise ValueError("champion_id is required")
+        if not _table_exists(self.con, "champions"):
+            return False
+
+        with self.con:
+            if _table_exists(self.con, "champion_projects"):
+                self.con.execute(
+                    "DELETE FROM champion_projects WHERE champion_id = ?",
+                    (champion_id,),
+                )
+
+            if _table_exists(self.con, "actions"):
+                action_cols = _table_columns(self.con, "actions")
+                if "owner_champion_id" in action_cols:
+                    self.con.execute(
+                        "UPDATE actions SET owner_champion_id = NULL WHERE owner_champion_id = ?",
+                        (champion_id,),
+                    )
+
+            if _table_exists(self.con, "projects"):
+                project_cols = _table_columns(self.con, "projects")
+                if "owner_champion_id" in project_cols:
+                    self.con.execute(
+                        "UPDATE projects SET owner_champion_id = NULL WHERE owner_champion_id = ?",
+                        (champion_id,),
+                    )
+
+            cur = self.con.execute(
+                "DELETE FROM champions WHERE id = ?",
+                (champion_id,),
+            )
+            return cur.rowcount > 0
 
 
 # =====================================================
