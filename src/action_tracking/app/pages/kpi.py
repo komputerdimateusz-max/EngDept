@@ -18,6 +18,10 @@ from action_tracking.data.repositories import (
     SettingsRepository,
 )
 
+IMPACT_TARGET_PLN = 5000
+CLOSE_TARGET = 5
+OVERDUE_TOLERANCE = 3
+
 
 @dataclass(frozen=True)
 class ParsedAction:
@@ -130,6 +134,22 @@ def _weekly_backlog(actions: list[ParsedAction], today: date) -> pd.DataFrame:
         bucket["on_time_open"] = max(int(bucket["actual_open"]) - int(bucket["actual_overdue"]), 0)
 
     return pd.DataFrame(buckets)
+
+
+def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, value))
+
+
+def _impact_delta_pln(effect_row: dict[str, Any] | None) -> float | None:
+    if not effect_row:
+        return None
+    metric = effect_row.get("metric")
+    if metric not in {"scrap_cost", "scrap_pln", "scrap_cost_pln", "scrap_cost_amount"}:
+        return None
+    delta = effect_row.get("delta")
+    if isinstance(delta, (int, float)):
+        return float(delta)
+    return None
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -427,5 +447,239 @@ def render(con: sqlite3.Connection) -> None:
 - **Planned open**: zakładamy zamknięcie w `due_date` (bez wcześniejszych zamknięć).
 - **Overdue**: `due_date < cutoff_date`.
 - **Open**: `created <= cutoff_date` oraz (`closed is null` lub `closed > cutoff_date`).
+"""
+        )
+
+    st.subheader("Champion ranking")
+    st.caption("Ranking oparty o wpływ biznesowy, skuteczność i terminowość.")
+
+    ranking_date_to = date.today()
+    ranking_date_from = ranking_date_to - timedelta(days=90)
+
+    r1, r2, r3, r4, r5 = st.columns([1.5, 1.2, 1.2, 1.2, 1.1])
+    ranking_range = r1.date_input(
+        "Zakres dat (zamknięcia)",
+        value=(ranking_date_from, ranking_date_to),
+    )
+    ranking_project = r2.selectbox(
+        "Projekt (ranking)",
+        project_options,
+        index=project_options.index(selected_project),
+        format_func=lambda pid: pid if pid == "Wszystkie" else project_names.get(pid, pid),
+    )
+    ranking_category = r3.selectbox(
+        "Kategoria (ranking)",
+        category_options,
+        index=category_options.index(selected_category),
+    )
+    include_unassigned = r4.checkbox("Uwzględnij nieprzypisane", value=False)
+    show_inactive = r5.checkbox("Pokaż nieaktywnych", value=False)
+
+    if isinstance(ranking_range, tuple) and len(ranking_range) == 2:
+        date_from, date_to = ranking_range
+    else:
+        date_from, date_to = ranking_date_from, ranking_date_to
+
+    ranking_project_filter = None if ranking_project == "Wszystkie" else ranking_project
+    ranking_category_filter = None if ranking_category == "(Wszystkie)" else ranking_category
+
+    ranking_rows = repo.list_actions_for_ranking(
+        project_id=ranking_project_filter,
+        category=ranking_category_filter,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    ranking_actions, ranking_issues = _prepare_actions(ranking_rows)
+    ranking_effectiveness = effectiveness_repo.list_effectiveness_for_actions(
+        [action.action_id for action in ranking_actions]
+    )
+
+    cutoff_date = date_to
+
+    effective_labels = {"effective", "no_scrap"}
+    champion_stats: dict[str, dict[str, Any]] = {}
+
+    def _ensure_stats(champion_key: str) -> dict[str, Any]:
+        if champion_key not in champion_stats:
+            champion_stats[champion_key] = {
+                "open_now": 0,
+                "overdue_now": 0,
+                "closed_in_range": 0,
+                "closed_with_due": 0,
+                "closed_on_time": 0,
+                "effectiveness_total": 0,
+                "effectiveness_effective": 0,
+                "impact_pln": 0.0,
+                "durations": [],
+            }
+        return champion_stats[champion_key]
+
+    for action in ranking_actions:
+        if action.status == "cancelled":
+            continue
+        if not include_unassigned and action.champion_id is None:
+            continue
+        champion_key = action.champion_id or "unassigned"
+        stats = _ensure_stats(champion_key)
+
+        if _open_at_cutoff(action, cutoff_date):
+            stats["open_now"] += 1
+            if action.due is not None and action.due < cutoff_date:
+                stats["overdue_now"] += 1
+
+        if action.closed is not None and date_from <= action.closed <= date_to:
+            stats["closed_in_range"] += 1
+            if action.due is not None:
+                stats["closed_with_due"] += 1
+                if action.closed <= action.due:
+                    stats["closed_on_time"] += 1
+            stats["durations"].append((action.closed - action.created).days)
+
+            effect_row = ranking_effectiveness.get(action.action_id)
+            if effect_row:
+                stats["effectiveness_total"] += 1
+                if effect_row.get("classification") in effective_labels:
+                    stats["effectiveness_effective"] += 1
+                impact_delta = _impact_delta_pln(effect_row)
+                if impact_delta is not None:
+                    stats["impact_pln"] += max(0.0, -impact_delta)
+
+    if show_inactive:
+        for champ in champions:
+            champ_id = champ.get("id")
+            if champ_id:
+                _ensure_stats(champ_id)
+
+    ranking_rows_out: list[dict[str, Any]] = []
+    breakdown_rows: list[dict[str, Any]] = []
+
+    for champion_id, stats in champion_stats.items():
+        if not show_inactive and not (
+            stats["open_now"] or stats["overdue_now"] or stats["closed_in_range"]
+        ):
+            continue
+
+        on_time_rate = (
+            stats["closed_on_time"] / stats["closed_with_due"]
+            if stats["closed_with_due"]
+            else None
+        )
+        effectiveness_rate = (
+            stats["effectiveness_effective"] / stats["effectiveness_total"]
+            if stats["effectiveness_total"]
+            else None
+        )
+        median_ttc = (
+            float(median(stats["durations"])) if stats["durations"] else None
+        )
+        impact_pln = float(stats["impact_pln"])
+
+        impact_points = 40 * _clamp(impact_pln / IMPACT_TARGET_PLN)
+        effective_points = 25 * (effectiveness_rate or 0.0)
+        timeliness_points = 20 * (on_time_rate or 0.0)
+        volume_points = 15 * _clamp(stats["closed_in_range"] / CLOSE_TARGET)
+        overdue_penalty = 15 * _clamp(stats["overdue_now"] / OVERDUE_TOLERANCE)
+
+        score = _clamp(
+            impact_points + effective_points + timeliness_points + volume_points - overdue_penalty,
+            lower=0.0,
+            upper=100.0,
+        )
+
+        label = (
+            "Nieprzypisany"
+            if champion_id == "unassigned"
+            else champion_names.get(champion_id, champion_id)
+        )
+        ranking_rows_out.append(
+            {
+                "Champion": label,
+                "Score": round(score, 1),
+                "Open actions now": stats["open_now"],
+                "Overdue now": stats["overdue_now"],
+                "Closed in range": stats["closed_in_range"],
+                "On-time close rate": "—"
+                if on_time_rate is None
+                else f"{on_time_rate:.1%}",
+                "Effective close rate (scrap)": "—"
+                if effectiveness_rate is None
+                else f"{effectiveness_rate:.1%}",
+                "Impact PLN": round(impact_pln, 2),
+                "Median time-to-close (days)": "—"
+                if median_ttc is None
+                else f"{median_ttc:.1f}",
+            }
+        )
+        breakdown_rows.append(
+            {
+                "Champion": label,
+                "Impact": impact_points,
+                "Effectiveness": effective_points,
+                "Timeliness": timeliness_points,
+                "Delivery": volume_points,
+                "Overdue penalty": overdue_penalty,
+                "Score": score,
+            }
+        )
+
+    if ranking_rows_out:
+        ranking_df = pd.DataFrame(ranking_rows_out).sort_values("Score", ascending=False)
+        ranking_df.insert(0, "Rank", range(1, len(ranking_df) + 1))
+        st.dataframe(ranking_df, use_container_width=True, height=360)
+
+        top10 = ranking_df.head(10)
+        chart = (
+            alt.Chart(top10)
+            .mark_bar()
+            .encode(
+                x=alt.X("Score:Q", title="Score (0-100)"),
+                y=alt.Y("Champion:N", sort="-x", title=None),
+                tooltip=[alt.Tooltip("Champion:N"), alt.Tooltip("Score:Q")],
+            )
+            .properties(height=280)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+        with st.expander("Score breakdown", expanded=False):
+            breakdown_df = pd.DataFrame(breakdown_rows).sort_values("Score", ascending=False)
+            breakdown_df["Impact"] = breakdown_df["Impact"].map(lambda v: f"{v:.1f}/40")
+            breakdown_df["Effectiveness"] = breakdown_df["Effectiveness"].map(lambda v: f"{v:.1f}/25")
+            breakdown_df["Timeliness"] = breakdown_df["Timeliness"].map(lambda v: f"{v:.1f}/20")
+            breakdown_df["Delivery"] = breakdown_df["Delivery"].map(lambda v: f"{v:.1f}/15")
+            breakdown_df["Overdue penalty"] = breakdown_df["Overdue penalty"].map(lambda v: f"-{v:.1f}")
+            breakdown_df["Score"] = breakdown_df["Score"].map(lambda v: f"{v:.1f}")
+            st.dataframe(
+                breakdown_df[
+                    [
+                        "Champion",
+                        "Impact",
+                        "Effectiveness",
+                        "Timeliness",
+                        "Delivery",
+                        "Overdue penalty",
+                        "Score",
+                    ]
+                ],
+                use_container_width=True,
+            )
+    else:
+        st.info("Brak danych rankingowych dla wybranych filtrów.")
+
+    if ranking_issues:
+        st.caption(f"Pominięto {ranking_issues} rekordów z błędną datą w rankingu.")
+
+    with st.expander("Jak liczony jest score", expanded=False):
+        st.markdown(
+            f"""
+- Okno zamknięć: **{date_from.isoformat()} → {date_to.isoformat()}**.
+- Cutoff dla otwartych/opóźnionych: **{cutoff_date.isoformat()}**.
+- Impact PLN to suma **max(0, -Δ scrap)** z `action_effectiveness` (ujemna delta oznacza oszczędność).
+- Składowe score:
+  - Impact: `40 × clamp(impact / {IMPACT_TARGET_PLN})`
+  - Effectiveness: `25 × skuteczność scrap`
+  - Timeliness: `20 × on-time close rate`
+  - Delivery: `15 × clamp(closed / {CLOSE_TARGET})`
+  - Overdue penalty: `15 × clamp(overdue / {OVERDUE_TOLERANCE})`
+- Finalny score: suma składowych minus kara, ograniczona do 0–100.
 """
         )

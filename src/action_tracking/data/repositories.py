@@ -254,6 +254,44 @@ class ActionRepository:
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
+    def list_actions_for_ranking(
+        self,
+        project_id: str | None = None,
+        category: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT id,
+                   owner_champion_id,
+                   project_id,
+                   category,
+                   status,
+                   created_at,
+                   due_date,
+                   closed_at
+            FROM actions
+            WHERE created_at IS NOT NULL
+        """
+        filters: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            filters.append("project_id = ?")
+            params.append(project_id)
+        if category:
+            filters.append("category = ?")
+            params.append(category)
+        if date_to:
+            filters.append("date(created_at) <= date(?)")
+            params.append(date_to.isoformat())
+        if date_from:
+            filters.append("(closed_at IS NULL OR date(closed_at) >= date(?))")
+            params.append(date_from.isoformat())
+        if filters:
+            query += " AND " + " AND ".join(filters)
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
     def list_actions_for_project_outcome(
         self,
         project_id: str,
@@ -641,6 +679,9 @@ class EffectivenessRepository:
         )
         rows = [dict(r) for r in cur.fetchall()]
         return {row["action_id"]: row for row in rows}
+
+    def list_effectiveness_for_actions(self, action_ids: list[str]) -> dict[str, dict[str, Any]]:
+        return self.get_effectiveness_for_actions(action_ids)
 
 
 class ProjectRepository:
