@@ -1,21 +1,127 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from action_tracking.data.repositories import GlobalSettingsRepository, SettingsRepository
+from action_tracking.data.repositories import (
+    ChampionRepository,
+    GlobalSettingsRepository,
+    NotificationRepository,
+    SettingsRepository,
+)
+from action_tracking.integrations.email_sender import smtp_config_status
 from action_tracking.services.normalize import normalize_key
+
+
+def _truthy_env(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _safe_json_loads(value: str | None) -> Any:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return None
 
 
 def render(con: sqlite3.Connection) -> None:
     st.header("Ustawienia Globalne")
-    st.caption("Zarządzaj globalnymi słownikami dla aplikacji.")
+    st.caption("Zarządzaj globalnymi słownikami i regułami dla aplikacji.")
 
     repo = SettingsRepository(con)
     rules_repo = GlobalSettingsRepository(con)
+    champion_repo = ChampionRepository(con)
+    notification_repo = NotificationRepository(con)
 
+    # =========================
+    # EMAIL NOTIFICATIONS
+    # =========================
+    st.subheader("Powiadomienia email")
+
+    notifications_enabled = os.getenv("ACTION_TRACKING_EMAIL_NOTIFICATIONS_ENABLED")
+    enabled_flag = _truthy_env(notifications_enabled)
+    st.checkbox(
+        "Włącz powiadomienia email (env)",
+        value=enabled_flag,
+        disabled=True,
+        help="Ustaw ACTION_TRACKING_EMAIL_NOTIFICATIONS_ENABLED w środowisku.",
+    )
+
+    status = smtp_config_status()
+    if status.get("configured"):
+        smtp_config = status.get("config") or {}
+        masked_user = (smtp_config.get("user") or "").replace("@", " [at] ")
+        masked_from = (smtp_config.get("from_address") or "").replace("@", " [at] ")
+        st.success("SMTP skonfigurowane.")
+        st.markdown(
+            "\n".join(
+                [
+                    f"- Host: {smtp_config.get('host')}",
+                    f"- Port: {smtp_config.get('port')}",
+                    f"- TLS: {smtp_config.get('tls')}",
+                    f"- User: {masked_user or 'brak'}",
+                    f"- From: {masked_from or 'brak'}",
+                ]
+            )
+        )
+    else:
+        missing = ", ".join(status.get("missing") or [])
+        st.warning(f"SMTP nie jest skonfigurowane. Braki: {missing or 'nieznane'}")
+
+    champions = champion_repo.list_champions()
+    missing_email = [ch for ch in champions if ch.get("active") and not ch.get("email")]
+    if missing_email:
+        st.info("Champions bez adresu email (pomijani w powiadomieniach):")
+        st.write([row.get("display_name") or row.get("id") for row in missing_email])
+
+    logs = notification_repo.list_recent(limit=50)
+    if logs:
+        def _payload_count(payload_json: str | None) -> int:
+            payload = _safe_json_loads(payload_json)
+            if payload is None:
+                return 0
+            if isinstance(payload, dict):
+                if payload.get("action_ids"):
+                    try:
+                        return len(payload["action_ids"])
+                    except TypeError:
+                        return 0
+                try:
+                    return int(payload.get("overdue_count") or 0) + int(payload.get("open_count") or 0)
+                except (TypeError, ValueError):
+                    return 0
+            return 0
+
+        for row in logs:
+            row["action_count"] = _payload_count(row.get("payload_json"))
+
+        logs_df = pd.DataFrame(logs)
+        cols = ["created_at", "notification_type", "recipient_email", "action_count"]
+        existing_cols = [c for c in cols if c in logs_df.columns]
+        logs_df = logs_df[existing_cols].rename(
+            columns={
+                "created_at": "Data",
+                "notification_type": "Typ",
+                "recipient_email": "Odbiorca",
+                "action_count": "Liczba akcji",
+            }
+        )
+        st.dataframe(logs_df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Brak logów powiadomień email.")
+
+    st.divider()
+
+    # =========================
+    # ACTION CATEGORIES (DB)
+    # =========================
     st.subheader("Kategorie akcji")
     categories = repo.list_action_categories(active_only=False)
     if not categories:
@@ -53,6 +159,7 @@ def render(con: sqlite3.Connection) -> None:
         categories_by_name = {row["name"]: row for row in categories}
         selected_name = st.selectbox("Wybierz kategorię", list(categories_by_name.keys()))
         selected = categories_by_name[selected_name]
+
         with st.form("edit_action_category"):
             edit_name = st.text_input("Nazwa", value=selected.get("name", ""))
             edit_active = st.checkbox("Aktywna", value=bool(selected.get("is_active")))
@@ -85,6 +192,10 @@ def render(con: sqlite3.Connection) -> None:
             st.rerun()
 
     st.divider()
+
+    # =========================
+    # CATEGORY RULES (EFFECTIVENESS + SAVINGS)
+    # =========================
     st.subheader("Reguły kategorii akcji (effectiveness + savings)")
     rules = rules_repo.get_category_rules(only_active=False)
     if not rules:
@@ -127,11 +238,14 @@ def render(con: sqlite3.Connection) -> None:
             "is_active": True,
             "description": None,
         }
+
         effect_options = ["SCRAP", "OEE", "PERFORMANCE", "NONE"]
         savings_options = ["AUTO_SCRAP_COST", "MANUAL_REQUIRED", "AUTO_TIME_TO_PLN", "NONE"]
+
         st.caption(
             f"Zapisana etykieta: '{selected_category}' | normalized: '{normalize_key(selected_category)}'"
         )
+
         with st.form("edit_category_rule"):
             effect_model = st.selectbox(
                 "Model skuteczności",
@@ -156,6 +270,7 @@ def render(con: sqlite3.Connection) -> None:
                 value=selected_rule.get("description") or "",
                 max_chars=500,
             )
+
             submitted_rule = st.form_submit_button("Zapisz regułę")
             if submitted_rule:
                 try:
@@ -182,6 +297,7 @@ def render(con: sqlite3.Connection) -> None:
                 st.markdown(
                     f"**{rule['category_label']}**: {rule.get('description') or 'Brak opisu.'}"
                 )
+
         st.markdown(
             """
 - Okno bazowe i po zmianie obejmuje ostatnie 14 dni przed/po zamknięciu akcji.

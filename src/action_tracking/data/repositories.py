@@ -393,6 +393,83 @@ class GlobalSettingsRepository:
         }
 
 
+class NotificationRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def was_sent(self, unique_key: str) -> bool:
+        if not unique_key:
+            return False
+        try:
+            cur = self.con.execute(
+                """
+                SELECT 1
+                FROM email_notifications_log
+                WHERE unique_key = ?
+                """,
+                (unique_key,),
+            )
+            return cur.fetchone() is not None
+        except sqlite3.Error:
+            return False
+
+    def log_sent(
+        self,
+        notification_type: str,
+        recipient_email: str,
+        action_id: str | None,
+        payload: dict[str, Any] | None,
+        unique_key: str,
+    ) -> None:
+        if not unique_key:
+            return
+        payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
+        self.con.execute(
+            """
+            INSERT INTO email_notifications_log (
+                id,
+                created_at,
+                notification_type,
+                recipient_email,
+                action_id,
+                payload_json,
+                unique_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid4()),
+                datetime.now(timezone.utc).isoformat(),
+                notification_type,
+                recipient_email,
+                action_id,
+                payload_json,
+                unique_key,
+            ),
+        )
+        self.con.commit()
+
+    def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
+        try:
+            cur = self.con.execute(
+                """
+                SELECT id,
+                       created_at,
+                       notification_type,
+                       recipient_email,
+                       action_id,
+                       payload_json,
+                       unique_key
+                FROM email_notifications_log
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
+
 class ActionRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
@@ -459,6 +536,89 @@ class ActionRepository:
 
         cur = self.con.execute(base_query, params)
         return [dict(r) for r in cur.fetchall()]
+
+    def list_open_actions_for_owner(
+        self,
+        owner_champion_id: str,
+        today: date | None = None,
+    ) -> list[dict[str, Any]]:
+        cutoff = (today or date.today()).isoformat()
+        cur = self.con.execute(
+            """
+            SELECT a.id,
+                   a.title,
+                   a.due_date,
+                   a.category,
+                   a.priority,
+                   a.status,
+                   p.name AS project_name
+            FROM actions a
+            LEFT JOIN projects p ON p.id = a.project_id
+            WHERE a.owner_champion_id = ?
+              AND a.is_draft = 0
+              AND a.status NOT IN ('done', 'cancelled')
+              AND (a.due_date IS NULL OR date(a.due_date) >= date(?))
+            ORDER BY a.due_date IS NULL, a.due_date, a.created_at
+            """,
+            (owner_champion_id, cutoff),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def list_overdue_actions_for_owner(
+        self,
+        owner_champion_id: str,
+        cutoff_date: date | None = None,
+    ) -> list[dict[str, Any]]:
+        cutoff = (cutoff_date or date.today()).isoformat()
+        cur = self.con.execute(
+            """
+            SELECT a.id,
+                   a.title,
+                   a.due_date,
+                   a.category,
+                   a.priority,
+                   a.status,
+                   p.name AS project_name
+            FROM actions a
+            LEFT JOIN projects p ON p.id = a.project_id
+            WHERE a.owner_champion_id = ?
+              AND a.is_draft = 0
+              AND a.status NOT IN ('done', 'cancelled')
+              AND a.due_date IS NOT NULL
+              AND date(a.due_date) < date(?)
+            ORDER BY a.due_date, a.created_at
+            """,
+            (owner_champion_id, cutoff),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def list_actions_becoming_overdue(
+        self,
+        since_date: date,
+        until_date: date,
+    ) -> list[dict[str, Any]]:
+        cur = self.con.execute(
+            """
+            SELECT a.id,
+                   a.title,
+                   a.due_date,
+                   a.category,
+                   a.priority,
+                   a.status,
+                   a.owner_champion_id,
+                   p.name AS project_name
+            FROM actions a
+            LEFT JOIN projects p ON p.id = a.project_id
+            WHERE a.is_draft = 0
+              AND a.status NOT IN ('done', 'cancelled')
+              AND a.due_date IS NOT NULL
+              AND date(a.due_date) > date(?)
+              AND date(a.due_date) <= date(?)
+            ORDER BY a.due_date, a.created_at
+            """,
+            (since_date.isoformat(), until_date.isoformat()),
+        )
+        return [dict(row) for row in cur.fetchall()]
 
     def list_actions_for_kpi(
         self,
