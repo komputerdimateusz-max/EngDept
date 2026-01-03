@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
 import sqlite3
+from datetime import date, timedelta
 from typing import Any
 
 import altair as alt
@@ -13,6 +13,7 @@ from action_tracking.data.repositories import (
     ActionRepository,
     ChampionRepository,
     EffectivenessRepository,
+    GlobalSettingsRepository,
     ProductionDataRepository,
     ProjectRepository,
     WcInboxRepository,
@@ -24,13 +25,12 @@ from action_tracking.services.effectiveness import (
     parse_work_centers,
     suggest_work_centers,
 )
-from action_tracking.services.impact_aspects import (
-    IMPACT_ASPECT_COLORS,
-    IMPACT_ASPECT_LABELS,
-    parse_impact_aspects,
-)
 from action_tracking.services.normalize import normalize_key
-
+from action_tracking.services.overlay_targets import (
+    OVERLAY_TARGET_COLORS,
+    OVERLAY_TARGET_LABELS,
+    default_overlay_targets,
+)
 
 FIELD_LABELS = {
     "name": "Nazwa projektu",
@@ -238,7 +238,7 @@ def _line_chart_with_markers(
     title: str,
     markers_df: pd.DataFrame,
     show_markers: bool,
-    aspect: str,
+    overlay_target: str,
 ) -> alt.Chart:
     base = (
         alt.Chart(data)
@@ -251,20 +251,18 @@ def _line_chart_with_markers(
     )
     if not show_markers or markers_df.empty:
         return base
-    filtered_markers = markers_df[markers_df["aspect"] == aspect]
+    filtered_markers = markers_df[markers_df["overlay_target"] == overlay_target]
     if filtered_markers.empty:
         return base
-    marker_labels = list(IMPACT_ASPECT_COLORS.keys())
-    marker_colors = [
-        IMPACT_ASPECT_COLORS.get(label, "#9e9e9e") for label in marker_labels
-    ]
+    marker_labels = list(OVERLAY_TARGET_COLORS.keys())
+    marker_colors = [OVERLAY_TARGET_COLORS.get(label, "#9e9e9e") for label in marker_labels]
     marker_layer = (
         alt.Chart(filtered_markers)
         .mark_rule(strokeDash=[6, 4])
         .encode(
             x=alt.X("closed_at:T"),
             color=alt.Color(
-                "aspect:N",
+                "overlay_target:N",
                 scale=alt.Scale(domain=marker_labels, range=marker_colors),
                 legend=None,
             ),
@@ -273,13 +271,28 @@ def _line_chart_with_markers(
                 alt.Tooltip("closed_at:T", title="Zamknięta"),
                 alt.Tooltip("owner:N", title="Owner"),
                 alt.Tooltip("category:N", title="Kategoria"),
-                alt.Tooltip("aspect_label:N", title="Aspekt"),
+                alt.Tooltip("overlay_label:N", title="Wykres"),
                 alt.Tooltip("delta_scrap_qty:N", title="Δ scrap qty"),
                 alt.Tooltip("delta_scrap_pln:N", title="Δ scrap PLN"),
             ],
         )
     )
     return base + marker_layer
+
+
+def _resolve_overlay_targets(
+    action_row: dict[str, Any],
+    rules_repo: GlobalSettingsRepository,
+) -> list[str]:
+    rule = rules_repo.resolve_category_rule(action_row.get("category") or "")
+    if rule and rule.get("overlay_targets_configured"):
+        overlay_targets = list(rule.get("overlay_targets") or [])
+    else:
+        overlay_targets = []
+    if overlay_targets:
+        return overlay_targets
+    effect_model = rule.get("effectiveness_model") if rule else None
+    return default_overlay_targets(effect_model)
 
 
 def _project_matches_work_centers(
@@ -366,7 +379,6 @@ def _apply_weekend_filter(
     return temp.loc[mask]
 
 
-
 def render(con: sqlite3.Connection) -> None:
     st.header("Projekty")
 
@@ -375,29 +387,26 @@ def render(con: sqlite3.Connection) -> None:
     action_repo = ActionRepository(con)
     effectiveness_repo = EffectivenessRepository(con)
     production_repo = ProductionDataRepository(con)
+
+    # ✅ RESOLVE MERGE: both are required later in this page
+    rules_repo = GlobalSettingsRepository(con)
     wc_inbox_repo = WcInboxRepository(con)
 
     champions = champion_repo.list_champions()
-    champion_names = {
-        champion["id"]: _champion_display_name(champion) for champion in champions
-    }
-    champion_options = ["(brak)"] + [champion["id"] for champion in champions]
+    champion_names = {c["id"]: _champion_display_name(c) for c in champions}
+    champion_options = ["(brak)"] + [c["id"] for c in champions]
 
     projects = project_repo.list_projects(include_counts=True)
-    projects_by_id = {project["id"]: project for project in projects}
-    project_wc_norms = project_repo.list_project_work_centers_norms(
-        include_related=True
-    )
+    projects_by_id = {p["id"]: p for p in projects}
+    project_wc_norms = project_repo.list_project_work_centers_norms(include_related=True)
+
     wc_lists = production_repo.list_distinct_work_centers()
-    all_prod_wcs = sorted(
-        set(wc_lists.get("scrap_work_centers", []) + wc_lists.get("kpi_work_centers", []))
-    )
+    all_prod_wcs = sorted(set(wc_lists.get("scrap_work_centers", []) + wc_lists.get("kpi_work_centers", [])))
     prod_work_center_map = _build_work_center_map(all_prod_wcs)
     prod_work_center_keys = set(prod_work_center_map)
+
     production_stats = production_repo.list_production_work_centers_with_stats()
-    production_stats_by_norm = {
-        row["wc_norm"]: row for row in production_stats if row.get("wc_norm")
-    }
+    production_stats_by_norm = {row["wc_norm"]: row for row in production_stats if row.get("wc_norm")}
     wc_inbox_repo.upsert_from_production(production_stats, project_wc_norms)
 
     st.subheader("Outcome projektu (produkcja)")
@@ -411,7 +420,7 @@ def render(con: sqlite3.Connection) -> None:
         default_from = today - timedelta(days=90)
 
         selector_col1, selector_col2, selector_col3, selector_col4 = st.columns(4)
-        project_ids = [project["id"] for project in projects]
+        project_ids = [p["id"] for p in projects]
         selected_project_id = selector_col1.selectbox(
             "Projekt",
             project_ids,
@@ -422,10 +431,7 @@ def render(con: sqlite3.Connection) -> None:
             st.info("Wybrany projekt nie istnieje — pokazuję pierwszy dostępny.")
         selected_from = selector_col2.date_input("Data od", value=default_from)
         selected_to = selector_col3.date_input("Data do", value=today)
-        include_related = selector_col4.checkbox(
-            "Uwzględnij powiązane Work Center",
-            value=True,
-        )
+        include_related = selector_col4.checkbox("Uwzględnij powiązane Work Center", value=True)
         st.caption("Waluta kosztów: PLN (v1).")
 
         if selected_from > selected_to:
@@ -435,14 +441,12 @@ def render(con: sqlite3.Connection) -> None:
     if outcome_available:
         selected_project = projects_by_id.get(selected_project_id, {})
         primary_wc = selected_project.get("work_center")
-        if not (primary_wc and primary_wc.strip()):
+        if not (primary_wc and str(primary_wc).strip()):
             st.error("Projekt nie ma przypisanego Work Center.")
             outcome_available = False
 
     if outcome_available:
-        related_wc = (
-            selected_project.get("related_work_center") if include_related else None
-        )
+        related_wc = selected_project.get("related_work_center") if include_related else None
         work_centers = parse_work_centers(primary_wc, related_wc)
         if not work_centers:
             st.error("Nie znaleziono Work Center dla projektu.")
@@ -455,11 +459,7 @@ def render(con: sqlite3.Connection) -> None:
             selected_to,
             currency=None,
         )
-        kpi_rows = production_repo.list_kpi_daily(
-            work_centers,
-            selected_from,
-            selected_to,
-        )
+        kpi_rows = production_repo.list_kpi_daily(work_centers, selected_from, selected_to)
 
         if not scrap_rows_all and not kpi_rows:
             st.info("Brak danych produkcyjnych dla wybranego zakresu.")
@@ -469,8 +469,7 @@ def render(con: sqlite3.Connection) -> None:
         non_pln_currencies = {
             row.get("scrap_cost_currency")
             for row in scrap_rows_all
-            if row.get("scrap_cost_currency")
-            and row.get("scrap_cost_currency") != "PLN"
+            if row.get("scrap_cost_currency") and row.get("scrap_cost_currency") != "PLN"
         }
         if non_pln_currencies:
             st.info(
@@ -478,45 +477,30 @@ def render(con: sqlite3.Connection) -> None:
                 + ", ".join(sorted(non_pln_currencies))
             )
 
-        scrap_rows = [
-            row
-            for row in scrap_rows_all
-            if row.get("scrap_cost_currency") == "PLN"
-        ]
+        scrap_rows = [row for row in scrap_rows_all if row.get("scrap_cost_currency") == "PLN"]
 
         scrap_df = pd.DataFrame(scrap_rows)
         if not scrap_df.empty:
-            scrap_df["metric_date"] = pd.to_datetime(
-                scrap_df["metric_date"], errors="coerce"
-            )
+            scrap_df["metric_date"] = pd.to_datetime(scrap_df["metric_date"], errors="coerce")
             scrap_df = scrap_df.dropna(subset=["metric_date"])
             scrap_daily = (
                 scrap_df.groupby("metric_date", as_index=False)
-                .agg(
-                    scrap_qty_sum=("scrap_qty", "sum"),
-                    scrap_pln_sum=("scrap_cost_amount", "sum"),
-                )
+                .agg(scrap_qty_sum=("scrap_qty", "sum"), scrap_pln_sum=("scrap_cost_amount", "sum"))
                 .sort_values("metric_date")
             )
         else:
-            scrap_daily = pd.DataFrame(
-                columns=["metric_date", "scrap_qty_sum", "scrap_pln_sum"]
-            )
+            scrap_daily = pd.DataFrame(columns=["metric_date", "scrap_qty_sum", "scrap_pln_sum"])
 
         kpi_df = pd.DataFrame(kpi_rows)
         if not kpi_df.empty:
-            kpi_df["metric_date"] = pd.to_datetime(
-                kpi_df["metric_date"], errors="coerce"
-            )
+            kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"], errors="coerce")
             kpi_df = kpi_df.dropna(subset=["metric_date"])
             kpi_daily = (
                 kpi_df.groupby("metric_date")
                 .apply(
                     lambda group: pd.Series(
                         {
-                            "oee_avg": _weighted_or_mean(
-                                group["oee_pct"], group.get("worktime_min")
-                            ),
+                            "oee_avg": _weighted_or_mean(group["oee_pct"], group.get("worktime_min")),
                             "performance_avg": _weighted_or_mean(
                                 group["performance_pct"], group.get("worktime_min")
                             ),
@@ -527,36 +511,25 @@ def render(con: sqlite3.Connection) -> None:
                 .sort_values("metric_date")
             )
         else:
-            kpi_daily = pd.DataFrame(
-                columns=["metric_date", "oee_avg", "performance_avg"]
-            )
+            kpi_daily = pd.DataFrame(columns=["metric_date", "oee_avg", "performance_avg"])
 
         oee_scale = "unknown"
         perf_scale = "unknown"
         if not kpi_daily.empty:
             kpi_daily["oee_avg"], oee_scale = _as_percent_series(kpi_daily["oee_avg"])
-            kpi_daily["performance_avg"], perf_scale = _as_percent_series(
-                kpi_daily["performance_avg"]
-            )
+            kpi_daily["performance_avg"], perf_scale = _as_percent_series(kpi_daily["performance_avg"])
 
         action_project_ids = [selected_project_id]
         if include_related:
-            work_center_keys = {
-                normalize_key(center) for center in work_centers if center
-            }
-            action_project_ids = [
-                project["id"]
-                for project in projects
-                if _project_matches_work_centers(project, work_center_keys)
-            ] or [selected_project_id]
+            work_center_keys = {normalize_key(center) for center in work_centers if center}
+            action_project_ids = (
+                [p["id"] for p in projects if _project_matches_work_centers(p, work_center_keys)]
+                or [selected_project_id]
+            )
 
         actions_map: dict[str, dict[str, Any]] = {}
         for project_id in action_project_ids:
-            project_actions = action_repo.list_actions_for_project_outcome(
-                project_id,
-                selected_from,
-                selected_to,
-            )
+            project_actions = action_repo.list_actions_for_project_outcome(project_id, selected_from, selected_to)
             for action in project_actions:
                 action_id = str(action.get("id") or "")
                 if action_id and action_id not in actions_map:
@@ -564,37 +537,31 @@ def render(con: sqlite3.Connection) -> None:
         actions = list(actions_map.values())
 
         action_ids = [str(row.get("id")) for row in actions]
-        effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(
-            action_ids
-        )
+        effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(action_ids)
 
         closed_markers: list[dict[str, Any]] = []
         for action in actions:
             if action.get("status") != "done":
                 continue
             action_id = str(action.get("id") or "")
-            owner = action.get("owner_name") or champion_names.get(
-                action.get("owner_champion_id"), "—"
-            )
+            owner = action.get("owner_name") or champion_names.get(action.get("owner_champion_id"), "—")
             effect_row = effectiveness_map.get(action_id)
             title = action.get("title") or ""
             short_id = _short_action_id(action_id)
             action_label = f"{title} ({short_id})" if short_id else title
             closed_date = parse_date(action.get("closed_at"))
-            aspects = parse_impact_aspects(action.get("impact_aspects"))
             if closed_date and selected_from <= closed_date <= selected_to:
-                for aspect in aspects:
+                overlay_targets = _resolve_overlay_targets(action, rules_repo)
+                for overlay_target in overlay_targets:
                     closed_markers.append(
                         {
                             "closed_at": pd.to_datetime(closed_date),
                             "action_label": action_label,
                             "owner": owner or "—",
                             "category": action.get("category") or "—",
-                            "aspect": aspect,
-                            "aspect_label": IMPACT_ASPECT_LABELS.get(aspect, aspect),
-                            "delta_scrap_qty": _format_delta(
-                                _effectiveness_delta(effect_row, "scrap_qty")
-                            ),
+                            "overlay_target": overlay_target,
+                            "overlay_label": OVERLAY_TARGET_LABELS.get(overlay_target, overlay_target),
+                            "delta_scrap_qty": _format_delta(_effectiveness_delta(effect_row, "scrap_qty")),
                             "delta_scrap_pln": _format_delta(
                                 _effectiveness_delta(effect_row, "scrap_cost")
                                 or _effectiveness_delta(effect_row, "scrap_pln")
@@ -604,21 +571,15 @@ def render(con: sqlite3.Connection) -> None:
 
         markers_df = pd.DataFrame(closed_markers)
 
-        merged_daily = pd.merge(
-            scrap_daily, kpi_daily, on="metric_date", how="outer"
-        ).sort_values("metric_date")
+        merged_daily = pd.merge(scrap_daily, kpi_daily, on="metric_date", how="outer").sort_values("metric_date")
 
         if "metric_date" not in merged_daily.columns:
             st.info("Brak danych produkcyjnych dla wybranego zakresu.")
             outcome_available = False
 
     if outcome_available:
-        merged_daily["metric_date"] = pd.to_datetime(
-            merged_daily["metric_date"], errors="coerce"
-        )
-        merged_daily = merged_daily.dropna(subset=["metric_date"]).sort_values(
-            "metric_date"
-        )
+        merged_daily["metric_date"] = pd.to_datetime(merged_daily["metric_date"], errors="coerce")
+        merged_daily = merged_daily.dropna(subset=["metric_date"]).sort_values("metric_date")
         if merged_daily.empty:
             st.info("Brak poprawnych danych produkcyjnych dla wybranego zakresu.")
             outcome_available = False
@@ -632,42 +593,21 @@ def render(con: sqlite3.Connection) -> None:
             value=show_markers_default,
             disabled=marker_count == 0,
         )
-        remove_saturdays = filter_cols[1].checkbox(
-            "Usuń soboty", value=False, key="remove_saturdays"
-        )
-        remove_sundays = filter_cols[2].checkbox(
-            "Usuń niedziele", value=False, key="remove_sundays"
-        )
+        remove_saturdays = filter_cols[1].checkbox("Usuń soboty", value=False, key="remove_saturdays")
+        remove_sundays = filter_cols[2].checkbox("Usuń niedziele", value=False, key="remove_sundays")
 
-        scrap_daily_f = _apply_weekend_filter(
-            scrap_daily,
-            remove_saturdays,
-            remove_sundays,
-        )
-        kpi_daily_f = _apply_weekend_filter(
-            kpi_daily,
-            remove_saturdays,
-            remove_sundays,
-        )
-        merged_daily_f = _apply_weekend_filter(
-            merged_daily,
-            remove_saturdays,
-            remove_sundays,
-        )
+        scrap_daily_f = _apply_weekend_filter(scrap_daily, remove_saturdays, remove_sundays)
+        kpi_daily_f = _apply_weekend_filter(kpi_daily, remove_saturdays, remove_sundays)
+        merged_daily_f = _apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
 
         if merged_daily_f.empty:
             st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
             outcome_available = False
 
     if outcome_available:
-        baseline_from, baseline_to, after_from, after_to, used_halves = _window_bounds(
-            selected_from,
-            selected_to,
-        )
+        baseline_from, baseline_to, after_from, after_to, used_halves = _window_bounds(selected_from, selected_to)
         if used_halves:
-            st.warning(
-                "Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after)."
-            )
+            st.warning("Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after).")
 
         baseline_mask = (merged_daily_f["metric_date"].dt.date >= baseline_from) & (
             merged_daily_f["metric_date"].dt.date <= baseline_to
@@ -689,50 +629,31 @@ def render(con: sqlite3.Connection) -> None:
         after_perf = _mean_or_none(after_slice.get("performance_avg"))
 
         kpi_cols = st.columns(4)
-        kpi_cols[0].metric(
-            "Śr. scrap qty/dzień",
-            _format_metric_value(after_scrap_qty, "{:.2f}"),
-        )
-        kpi_cols[0].markdown(
-            _scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"),
-            unsafe_allow_html=True,
-        )
-        kpi_cols[0].caption(
-            f"Baseline: {_format_metric_value(baseline_scrap_qty, '{:.2f}')}"
-        )
-        kpi_cols[1].metric(
-            "Śr. scrap PLN/dzień",
-            _format_metric_value(after_scrap_pln, "{:.2f}"),
-        )
-        kpi_cols[1].markdown(
-            _scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"),
-            unsafe_allow_html=True,
-        )
-        kpi_cols[1].caption(
-            f"Baseline: {_format_metric_value(baseline_scrap_pln, '{:.2f}')}"
-        )
+        kpi_cols[0].metric("Śr. scrap qty/dzień", _format_metric_value(after_scrap_qty, "{:.2f}"))
+        kpi_cols[0].markdown(_scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"), unsafe_allow_html=True)
+        kpi_cols[0].caption(f"Baseline: {_format_metric_value(baseline_scrap_qty, '{:.2f}')}")
+
+        kpi_cols[1].metric("Śr. scrap PLN/dzień", _format_metric_value(after_scrap_pln, "{:.2f}"))
+        kpi_cols[1].markdown(_scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"), unsafe_allow_html=True)
+        kpi_cols[1].caption(f"Baseline: {_format_metric_value(baseline_scrap_pln, '{:.2f}')}")
+
         kpi_cols[2].metric(
             "Śr. OEE%",
             _format_metric_value(after_oee, "{:.1f}%"),
             delta=_metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
         )
-        kpi_cols[2].caption(
-            f"Baseline: {_format_metric_value(baseline_oee, '{:.1f}%')}"
-        )
+        kpi_cols[2].caption(f"Baseline: {_format_metric_value(baseline_oee, '{:.1f}%')}")
+
         kpi_cols[3].metric(
             "Śr. Performance%",
             _format_metric_value(after_perf, "{:.1f}%"),
             delta=_metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
         )
-        kpi_cols[3].caption(
-            f"Baseline: {_format_metric_value(baseline_perf, '{:.1f}%')}"
-        )
+        kpi_cols[3].caption(f"Baseline: {_format_metric_value(baseline_perf, '{:.1f}%')}")
+
         st.caption("Dla scrap spadek = poprawa.")
         if oee_scale != "unknown" or perf_scale != "unknown":
-            st.caption(
-                "Wykryta skala KPI: "
-                f"OEE={oee_scale}, Performance={perf_scale}."
-            )
+            st.caption(f"Wykryta skala KPI: OEE={oee_scale}, Performance={perf_scale}.")
 
         if marker_count == 0:
             st.caption("Brak zamkniętych akcji w wybranym zakresie dat.")
@@ -748,7 +669,6 @@ def render(con: sqlite3.Connection) -> None:
                     st.caption("Pokazano 20 ostatnich zamkniętych akcji.")
 
         chart_cols = st.columns(2)
-
         if not scrap_daily_f.empty:
             chart_cols[0].altair_chart(
                 _line_chart_with_markers(
@@ -758,7 +678,7 @@ def render(con: sqlite3.Connection) -> None:
                     "Scrap qty (suma)",
                     markers_df,
                     show_markers,
-                    "SCRAP",
+                    "SCRAP_QTY",
                 ),
                 use_container_width=True,
             )
@@ -770,7 +690,7 @@ def render(con: sqlite3.Connection) -> None:
                     "Scrap PLN (suma)",
                     markers_df,
                     show_markers,
-                    "SCRAP",
+                    "SCRAP_COST",
                 ),
                 use_container_width=True,
             )
@@ -807,8 +727,8 @@ def render(con: sqlite3.Connection) -> None:
             st.info("Brak danych KPI w wybranym zakresie.")
 
         st.caption(
-            "Markery pokazują daty zamknięcia akcji oraz aspekt wpływu "
-            "(Scrap/OEE/Performance)."
+            "Markery pokazują daty zamknięcia akcji oraz docelowe wykresy "
+            "(ustawiane w Global Settings → reguły kategorii)."
         )
 
         st.subheader("Akcje w wybranym zakresie")
@@ -818,9 +738,7 @@ def render(con: sqlite3.Connection) -> None:
             action_table: list[dict[str, Any]] = []
             for action in sorted(actions, key=_actions_sort_key):
                 action_id = str(action.get("id") or "")
-                owner = action.get("owner_name") or champion_names.get(
-                    action.get("owner_champion_id"), "—"
-                )
+                owner = action.get("owner_name") or champion_names.get(action.get("owner_champion_id"), "—")
                 effect_row = effectiveness_map.get(action_id)
                 effect_label, _ = _effectiveness_style(effect_row)
                 title = action.get("title") or ""
@@ -835,9 +753,7 @@ def render(con: sqlite3.Connection) -> None:
                         "Termin": _format_action_date(action.get("due_date")),
                         "Owner": owner or "—",
                         "Skuteczność": effect_label,
-                        "Δ scrap qty": _format_delta(
-                            _effectiveness_delta(effect_row, "scrap_qty")
-                        ),
+                        "Δ scrap qty": _format_delta(_effectiveness_delta(effect_row, "scrap_qty")),
                         "Δ scrap PLN": _format_delta(
                             _effectiveness_delta(effect_row, "scrap_cost")
                             or _effectiveness_delta(effect_row, "scrap_pln")
@@ -865,6 +781,7 @@ def render(con: sqlite3.Connection) -> None:
             )
             audit_rows["metric_date"] = audit_rows["metric_date"].dt.date
             st.dataframe(audit_rows, use_container_width=True)
+
     with st.expander("📁 Zarządzanie projektami (lista + edycja)", expanded=False):
         st.subheader("Lista projektów")
         st.caption(f"Liczba projektów: {len(projects)}")
@@ -898,29 +815,16 @@ def render(con: sqlite3.Connection) -> None:
         selected_id = st.selectbox(
             "Wybierz projekt do edycji",
             project_options,
-            format_func=lambda pid: "(nowy)"
-            if pid == "(nowy)"
-            else projects_by_id[pid].get("name", pid),
+            format_func=lambda pid: "(nowy)" if pid == "(nowy)" else projects_by_id[pid].get("name", pid),
         )
         editing = selected_id != "(nowy)"
         selected = projects_by_id.get(selected_id, {}) if editing else {}
 
-        sop_value = (
-            date.fromisoformat(selected["project_sop"])
-            if selected.get("project_sop")
-            else None
-        )
-        eop_value = (
-            date.fromisoformat(selected["project_eop"])
-            if selected.get("project_eop")
-            else None
-        )
+        sop_value = date.fromisoformat(selected["project_sop"]) if selected.get("project_sop") else None
+        eop_value = date.fromisoformat(selected["project_eop"]) if selected.get("project_eop") else None
 
         with st.form("project_form"):
-            name = st.text_input(
-                "Nazwa projektu",
-                value=selected.get("name", "") or "",
-            )
+            name = st.text_input("Nazwa projektu", value=selected.get("name", "") or "")
             use_wc_picker = st.checkbox(
                 "Wybierz Work Center z danych produkcyjnych",
                 value=False,
@@ -933,52 +837,27 @@ def render(con: sqlite3.Connection) -> None:
                     prod_work_center_map,
                     all_prod_wcs,
                 )
-                work_center_index = (
-                    all_prod_wcs.index(default_work_center)
-                    if default_work_center
-                    else 0
-                )
-                work_center = st.selectbox(
-                    "Work center",
-                    all_prod_wcs,
-                    index=work_center_index,
-                )
+                work_center_index = all_prod_wcs.index(default_work_center) if default_work_center else 0
+                work_center = st.selectbox("Work center", all_prod_wcs, index=work_center_index)
             else:
-                work_center = st.text_input(
-                    "Work center",
-                    value=selected.get("work_center", "") or "",
-                )
-            project_code = st.text_input(
-                "Project Code",
-                value=selected.get("project_code", "") or "",
-            )
+                work_center = st.text_input("Work center", value=selected.get("work_center", "") or "")
+
+            project_code = st.text_input("Project Code", value=selected.get("project_code", "") or "")
+
             no_sop = st.checkbox("Brak daty SOP", value=sop_value is None)
-            project_sop = st.date_input(
-                "Project SOP",
-                value=sop_value or date.today(),
-                disabled=no_sop,
-            )
+            project_sop = st.date_input("Project SOP", value=sop_value or date.today(), disabled=no_sop)
+
             no_eop = st.checkbox("Brak daty EOP", value=eop_value is None)
-            project_eop = st.date_input(
-                "Project EOP",
-                value=eop_value or date.today(),
-                disabled=no_eop,
-            )
+            project_eop = st.date_input("Project EOP", value=eop_value or date.today(), disabled=no_eop)
+
             if use_wc_picker and all_prod_wcs:
                 related_defaults = []
-                related_tokens = parse_work_centers(
-                    None,
-                    selected.get("related_work_center", "") or "",
-                )
+                related_tokens = parse_work_centers(None, selected.get("related_work_center", "") or "")
                 for token in related_tokens:
                     normalized = normalize_wc(token)
                     if normalized in prod_work_center_map:
                         related_defaults.append(prod_work_center_map[normalized][0])
-                related_selection = st.multiselect(
-                    "Powiązane Work Center",
-                    all_prod_wcs,
-                    default=related_defaults,
-                )
+                related_selection = st.multiselect("Powiązane Work Center", all_prod_wcs, default=related_defaults)
                 related_work_center = "; ".join(related_selection)
             else:
                 related_work_center = st.text_input(
@@ -988,9 +867,7 @@ def render(con: sqlite3.Connection) -> None:
 
             st.markdown("**Walidacja Work Center**")
             if not all_prod_wcs:
-                st.info(
-                    "Brak danych produkcyjnych w bazie – nie można zweryfikować WC."
-                )
+                st.info("Brak danych produkcyjnych w bazie – nie można zweryfikować WC.")
             else:
                 primary_label = work_center.strip() or "—"
                 related_list = parse_work_centers(None, related_work_center)
@@ -1015,35 +892,27 @@ def render(con: sqlite3.Connection) -> None:
                 _render_wc_status("Project WC (primary)", work_center)
                 for related in related_list:
                     _render_wc_status(f"Related WC ({related})", related)
+
             selected_category = selected.get("type")
             if editing and selected_category and selected_category not in PROJECT_TYPES:
                 st.caption(f"Legacy type: {selected_category}")
             category_index = PROJECT_TYPES.index("Others")
             if selected_category in PROJECT_TYPES:
                 category_index = PROJECT_TYPES.index(selected_category)
-            project_type = st.selectbox(
-                "Typ",
-                PROJECT_TYPES,
-                index=category_index,
-            )
+
+            project_type = st.selectbox("Typ", PROJECT_TYPES, index=category_index)
             owner_champion_id = st.selectbox(
                 "Champion",
                 champion_options,
-                index=champion_options.index(
-                    selected.get("owner_champion_id", "(brak)")
-                )
+                index=champion_options.index(selected.get("owner_champion_id", "(brak)"))
                 if editing and selected.get("owner_champion_id") in champion_options
                 else 0,
-                format_func=lambda cid: "(brak)"
-                if cid == "(brak)"
-                else champion_names.get(cid, cid),
+                format_func=lambda cid: "(brak)" if cid == "(brak)" else champion_names.get(cid, cid),
             )
             status = st.selectbox(
                 "Status",
                 ["active", "closed", "on_hold"],
-                index=["active", "closed", "on_hold"].index(
-                    selected.get("status") or "active"
-                ),
+                index=["active", "closed", "on_hold"].index(selected.get("status") or "active"),
             )
             submitted = st.form_submit_button("Zapisz")
 
@@ -1059,9 +928,7 @@ def render(con: sqlite3.Connection) -> None:
                     "project_eop": None if no_eop else project_eop.isoformat(),
                     "related_work_center": related_work_center.strip() or None,
                     "type": project_type,
-                    "owner_champion_id": None
-                    if owner_champion_id == "(brak)"
-                    else owner_champion_id,
+                    "owner_champion_id": None if owner_champion_id == "(brak)" else owner_champion_id,
                     "status": status,
                 }
                 if editing:
@@ -1076,15 +943,10 @@ def render(con: sqlite3.Connection) -> None:
         delete_id = st.selectbox(
             "Wybierz projekt do usunięcia",
             ["(brak)"] + [project["id"] for project in projects],
-            format_func=lambda pid: "(brak)"
-            if pid == "(brak)"
-            else projects_by_id[pid].get("name", pid),
+            format_func=lambda pid: "(brak)" if pid == "(brak)" else projects_by_id[pid].get("name", pid),
             key="delete_project_select",
         )
-        confirm_delete = st.checkbox(
-            "Potwierdzam usunięcie projektu",
-            key="delete_project_confirm",
-        )
+        confirm_delete = st.checkbox("Potwierdzam usunięcie projektu", key="delete_project_confirm")
         if st.button("Usuń", disabled=delete_id == "(brak)" or not confirm_delete):
             removed = project_repo.delete_project(delete_id)
             if removed:
@@ -1131,38 +993,23 @@ def render(con: sqlite3.Connection) -> None:
                     st.caption(f"Normalized WC: {wc_norm}")
 
                     with st.form(f"wc_inbox_create_{wc_key}"):
-                        project_name = st.text_input(
-                            "Nazwa projektu",
-                            value=wc_raw,
-                            key=f"wc_inbox_name_{wc_key}",
-                        )
-                        st.text_input(
-                            "Work center",
-                            value=wc_raw,
-                            disabled=True,
-                            key=f"wc_inbox_wc_{wc_key}",
-                        )
+                        project_name = st.text_input("Nazwa projektu", value=wc_raw, key=f"wc_inbox_name_{wc_key}")
+                        st.text_input("Work center", value=wc_raw, disabled=True, key=f"wc_inbox_wc_{wc_key}")
                         project_type = st.selectbox(
-                            "Typ",
-                            PROJECT_TYPES,
-                            index=PROJECT_TYPES.index("Others"),
-                            key=f"wc_inbox_type_{wc_key}",
+                            "Typ", PROJECT_TYPES, index=PROJECT_TYPES.index("Others"), key=f"wc_inbox_type_{wc_key}"
                         )
                         owner_champion_id = st.selectbox(
                             "Champion (opcjonalnie)",
                             champion_options,
                             index=0,
-                            format_func=lambda cid: "(brak)"
-                            if cid == "(brak)"
-                            else champion_names.get(cid, cid),
+                            format_func=lambda cid: "(brak)" if cid == "(brak)" else champion_names.get(cid, cid),
                             key=f"wc_inbox_owner_{wc_key}",
                         )
                         related_wc = st.text_input(
-                            "Powiązane Work Center (opcjonalnie)",
-                            value="",
-                            key=f"wc_inbox_related_{wc_key}",
+                            "Powiązane Work Center (opcjonalnie)", value="", key=f"wc_inbox_related_{wc_key}"
                         )
                         created = st.form_submit_button("Utwórz projekt")
+
                     if created:
                         if not project_name.strip() or not wc_raw.strip():
                             st.error("Nazwa projektu i Work center są wymagane.")
@@ -1171,9 +1018,7 @@ def render(con: sqlite3.Connection) -> None:
                                 "name": project_name.strip(),
                                 "work_center": wc_raw.strip(),
                                 "type": project_type,
-                                "owner_champion_id": None
-                                if owner_champion_id == "(brak)"
-                                else owner_champion_id,
+                                "owner_champion_id": None if owner_champion_id == "(brak)" else owner_champion_id,
                                 "status": "active",
                                 "related_work_center": related_wc.strip() or None,
                             }
@@ -1205,14 +1050,8 @@ def render(con: sqlite3.Connection) -> None:
                         st.info("Brak projektów do powiązania.")
 
                     with st.form(f"wc_inbox_ignore_{wc_key}"):
-                        confirm_ignore = st.checkbox(
-                            "Potwierdzam ignorowanie",
-                            key=f"wc_inbox_ignore_confirm_{wc_key}",
-                        )
-                        ignored = st.form_submit_button(
-                            "Ignoruj",
-                            disabled=not confirm_ignore,
-                        )
+                        confirm_ignore = st.checkbox("Potwierdzam ignorowanie", key=f"wc_inbox_ignore_confirm_{wc_key}")
+                        ignored = st.form_submit_button("Ignoruj", disabled=not confirm_ignore)
                     if ignored:
                         wc_inbox_repo.ignore(wc_norm)
                         st.success("Work Center oznaczony jako ignorowany.")
@@ -1224,10 +1063,6 @@ def render(con: sqlite3.Connection) -> None:
             st.caption("Brak wpisów w changelogu.")
         for entry in changelog_entries:
             changes = json.loads(entry["changes_json"])
-            project_name = (
-                entry.get("name") or changes.get("name") or entry.get("project_id")
-            )
-            st.markdown(
-                f"**{entry['event_at']}** · {entry['event_type']} · {project_name}"
-            )
+            project_name = entry.get("name") or changes.get("name") or entry.get("project_id")
+            st.markdown(f"**{entry['event_at']}** · {entry['event_type']} · {project_name}")
             st.caption(_format_changes(entry["event_type"], changes, champion_names))

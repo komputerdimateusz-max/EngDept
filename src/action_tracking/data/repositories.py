@@ -6,7 +6,10 @@ from datetime import date, datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-# Optional imports (don't crash if modules moved)
+# =====================================================
+# OPTIONAL IMPORTS (never crash if modules moved / missing)
+# =====================================================
+
 try:
     from action_tracking.domain.constants import ACTION_CATEGORIES as DEFAULT_ACTION_CATEGORIES
 except Exception:  # pragma: no cover
@@ -24,6 +27,65 @@ try:
 except Exception:  # pragma: no cover
     def normalize_key(value: str) -> str:
         return (value or "").strip().lower()
+
+try:
+    # preferred: shared service
+    from action_tracking.services.impact_aspects import normalize_impact_aspects  # type: ignore
+except Exception:  # pragma: no cover
+    def normalize_impact_aspects(value: Any) -> list[str]:
+        if value in (None, "", []):
+            return []
+        if isinstance(value, str):
+            v = value.strip()
+            if not v:
+                return []
+            # If it's already a JSON list string, best-effort parse
+            if v.startswith("[") and v.endswith("]"):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if str(x).strip()]
+                except Exception:
+                    pass
+            return [v]
+        if isinstance(value, (list, tuple, set)):
+            return [str(x).strip() for x in value if str(x).strip()]
+        return []
+
+try:
+    from action_tracking.services.overlay_targets import (  # type: ignore
+        parse_overlay_targets,
+        serialize_overlay_targets,
+    )
+except Exception:  # pragma: no cover
+    def parse_overlay_targets(value: Any) -> list[str]:
+        """
+        Accept: None / "" / JSON string list / list/tuple/set / comma separated string.
+        Return: list[str]
+        """
+        if value in (None, ""):
+            return []
+        if isinstance(value, str):
+            v = value.strip()
+            if not v:
+                return []
+            # JSON list?
+            if v.startswith("[") and v.endswith("]"):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if str(x).strip()]
+                except Exception:
+                    pass
+            # comma separated
+            return [t.strip() for t in v.split(",") if t.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(x).strip() for x in value if str(x).strip()]
+        return []
+
+    def serialize_overlay_targets(value: Any) -> str | None:
+        arr = parse_overlay_targets(value)
+        return json.dumps(arr, ensure_ascii=False) if arr else None
 
 
 # =====================================================
@@ -45,28 +107,103 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
 def _normalize_impact_aspects_payload(value: Any) -> str | None:
     """
     impact_aspects stored as JSON string in DB.
-    If normalize_impact_aspects exists, use it; otherwise accept list/str.
+    Accept list/str/None -> returns JSON list string or None.
     """
-    try:
-        from action_tracking.services.impact_aspects import normalize_impact_aspects
-
-        normalized = normalize_impact_aspects(value)
-        if not normalized:
-            return None
-        return json.dumps(normalized, ensure_ascii=False)
-    except Exception:
-        if value in (None, "", []):
-            return None
-        if isinstance(value, str):
-            v = value.strip()
-            if v.startswith("[") and v.endswith("]"):
-                return v
-            return json.dumps([v], ensure_ascii=False)
-        if isinstance(value, (list, tuple, set)):
-            arr = [str(x).strip() for x in value if str(x).strip()]
-            return json.dumps(sorted(set(arr)), ensure_ascii=False) if arr else None
+    normalized = normalize_impact_aspects(value)
+    if not normalized:
         return None
+    # de-dup + stable order
+    cleaned = sorted({x for x in (str(v).strip() for v in normalized) if x})
+    return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
 
+
+# =====================================================
+# DEFAULT CATEGORY RULES (fallback if category_rules missing)
+# =====================================================
+
+DEFAULT_CATEGORY_RULES: dict[str, dict[str, Any]] = {
+    "Scrap reduction": {
+        "effect_model": "SCRAP",
+        "savings_model": "AUTO_SCRAP_COST",
+        "requires_scope_link": True,
+        "is_active": True,
+        "description": "Automatyczna ocena redukcji złomu i oszczędności kosztu scrapu.",
+    },
+    "OEE improvement": {
+        "effect_model": "OEE",
+        "savings_model": "NONE",
+        "requires_scope_link": True,
+        "is_active": True,
+        "description": "Ocena zmian OEE na podstawie danych produkcyjnych (bez wyceny PLN).",
+    },
+    "Cost savings": {
+        "effect_model": "NONE",
+        "savings_model": "MANUAL_REQUIRED",
+        "requires_scope_link": False,
+        "is_active": True,
+        "description": "Oszczędności wprowadzane ręcznie przez właściciela akcji.",
+    },
+    "Vave": {
+        "effect_model": "NONE",
+        "savings_model": "MANUAL_REQUIRED",
+        "requires_scope_link": False,
+        "is_active": True,
+        "description": "Oszczędności VAVE wprowadzane ręcznie przez właściciela akcji.",
+    },
+    "PDP": {
+        "effect_model": "NONE",
+        "savings_model": "NONE",
+        "requires_scope_link": False,
+        "is_active": True,
+        "description": "Brak automatycznych obliczeń; rezultat opisujemy w treści akcji.",
+    },
+    "Development": {
+        "effect_model": "NONE",
+        "savings_model": "NONE",
+        "requires_scope_link": False,
+        "is_active": True,
+        "description": "Akcja rozwojowa bez automatycznych KPI i wyceny oszczędności.",
+    },
+}
+
+
+def _default_category_rule(category: str) -> dict[str, Any]:
+    base = DEFAULT_CATEGORY_RULES.get(category)
+    if base:
+        return {
+            "category": category,
+            "effect_model": base["effect_model"],
+            "savings_model": base["savings_model"],
+            "requires_scope_link": bool(base["requires_scope_link"]),
+            "is_active": bool(base["is_active"]),
+            "description": base.get("description"),
+            "overlay_targets": None,
+            "updated_at": None,
+        }
+    return {
+        "category": category,
+        "effect_model": "NONE",
+        "savings_model": "NONE",
+        "requires_scope_link": False,
+        "is_active": True,
+        "description": "Brak zdefiniowanej metodologii dla tej kategorii.",
+        "overlay_targets": None,
+        "updated_at": None,
+    }
+
+
+def _default_category_rules_list(include_inactive: bool = True) -> list[dict[str, Any]]:
+    # ensure we include defaults + any categories defined in constants
+    categories = list(dict.fromkeys(list(DEFAULT_ACTION_CATEGORIES) + list(DEFAULT_CATEGORY_RULES.keys())))
+    rows = [_default_category_rule(c) for c in categories]
+    if not include_inactive:
+        rows = [r for r in rows if bool(r.get("is_active", True))]
+    return rows
+
+
+# =====================================================
+# CHANGELOG READER (UI CONTRACT)
+# =====================================================
 
 def _list_changelog_generic(
     con: sqlite3.Connection,
@@ -96,16 +233,14 @@ def _list_changelog_generic(
     if not table:
         return []
 
-    # kolumny tabeli
     try:
         cur = con.execute(f"PRAGMA table_info({table})")
-        cols = [r[1] for r in cur.fetchall()]  # (cid, name, type, notnull, dflt, pk)
+        cols = [r[1] for r in cur.fetchall()]
     except sqlite3.Error:
         cols = []
     if not cols:
         return []
 
-    # wykrywanie kolumn: czas / typ zdarzenia / entity_id
     time_col: str | None = None
     for c in ("event_at", "changed_at", "created_at", "timestamp", "ts"):
         if c in cols:
@@ -190,7 +325,6 @@ def _list_changelog_generic(
         except Exception:
             return "{}"
 
-    # --- NORMALIZACJA POD UI ---
     for r in rows:
         # event_at MUST exist
         if "event_at" not in r or r.get("event_at") in (None, ""):
@@ -238,13 +372,13 @@ def _list_changelog_generic(
                     minimal["message"] = r.get("message")
                 r["changes_json"] = _ensure_str_json(minimal)
 
-        # aliasy kompatybilności (czasem UI/legacy używa tych nazw)
+        # aliases for legacy code
         if "changed_at" not in r or r.get("changed_at") in (None, ""):
             r["changed_at"] = r.get("event_at")
         if "change_type" not in r or r.get("change_type") in (None, ""):
             r["change_type"] = r.get("event_type")
 
-        # pre-parse (przydatne do debug / ewentualnie UI)
+        # pre-parse
         try:
             r["changes"] = json.loads(r["changes_json"]) if r.get("changes_json") else {}
         except Exception:
@@ -269,10 +403,15 @@ class SettingsRepository:
         self.con = con
 
     def list_action_categories(self, active_only: bool = True) -> list[dict[str, Any]]:
-        # fallback to defaults if table not present
         if not _table_exists(self.con, "action_categories"):
             return [
-                {"id": name, "name": name, "is_active": True, "sort_order": (i + 1) * 10, "created_at": None}
+                {
+                    "id": name,
+                    "name": name,
+                    "is_active": True,
+                    "sort_order": (i + 1) * 10,
+                    "created_at": None,
+                }
                 for i, name in enumerate(DEFAULT_ACTION_CATEGORIES)
             ]
 
@@ -295,29 +434,70 @@ class GlobalSettingsRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
+    # --- UI-facing (Projects / Settings pages expect these keys) ---
     def get_category_rules(self, only_active: bool = True) -> list[dict[str, Any]]:
-        if not _table_exists(self.con, "category_rules"):
-            return []
-
-        query = """
-            SELECT category AS category_label,
-                   effect_model AS effectiveness_model,
-                   savings_model,
-                   requires_scope_link,
-                   description,
-                   is_active
-            FROM category_rules
         """
-        params: list[Any] = []
-        if only_active:
-            query += " WHERE is_active = 1"
-        query += " ORDER BY category ASC"
-        cur = self.con.execute(query, params)
-        rows = [dict(r) for r in cur.fetchall()]
-        for r in rows:
-            r["requires_scope_link"] = bool(r.get("requires_scope_link"))
-            r["is_active"] = bool(r.get("is_active"))
-        return rows
+        Returns rows shaped as:
+          {
+            category_label,
+            effectiveness_model,
+            savings_model,
+            overlay_targets (list[str]),
+            overlay_targets_configured (bool),
+            requires_scope_link (bool),
+            description,
+            is_active (bool)
+          }
+        """
+        include_inactive = not only_active
+
+        if not _table_exists(self.con, "category_rules"):
+            return [self._normalize_category_rule_row(r) for r in _default_category_rules_list(include_inactive)]
+
+        # Try query WITH overlay_targets (new schema), fallback to old schema if missing column
+        try:
+            query = """
+                SELECT category AS category_label,
+                       effect_model AS effectiveness_model,
+                       savings_model,
+                       overlay_targets,
+                       requires_scope_link,
+                       description,
+                       is_active
+                FROM category_rules
+            """
+            params: list[Any] = []
+            if only_active:
+                query += " WHERE is_active = 1"
+            query += " ORDER BY category ASC"
+            cur = self.con.execute(query, params)
+            rows = [self._normalize_category_rule_row(dict(r)) for r in cur.fetchall()]
+            if not rows:
+                return [self._normalize_category_rule_row(r) for r in _default_category_rules_list(include_inactive)]
+            return rows
+        except sqlite3.Error:
+            # Old schema (no overlay_targets)
+            try:
+                query = """
+                    SELECT category AS category_label,
+                           effect_model AS effectiveness_model,
+                           savings_model,
+                           requires_scope_link,
+                           description,
+                           is_active
+                    FROM category_rules
+                """
+                params = []
+                if only_active:
+                    query += " WHERE is_active = 1"
+                query += " ORDER BY category ASC"
+                cur = self.con.execute(query, params)
+                rows = [self._normalize_category_rule_row(dict(r)) for r in cur.fetchall()]
+                if not rows:
+                    return [self._normalize_category_rule_row(r) for r in _default_category_rules_list(include_inactive)]
+                return rows
+            except sqlite3.Error:
+                return [self._normalize_category_rule_row(r) for r in _default_category_rules_list(include_inactive)]
 
     def resolve_category_rule(self, category_label: str) -> dict[str, Any] | None:
         if not category_label:
@@ -325,6 +505,221 @@ class GlobalSettingsRepository:
         rules = self.get_category_rules(only_active=True)
         rules_map = {normalize_key(r.get("category_label") or ""): r for r in rules}
         return rules_map.get(normalize_key(category_label))
+
+    # --- Admin / internal CRUD (used by configurable overlays/settings) ---
+    def list_category_rules(self, include_inactive: bool = False) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "category_rules"):
+            return _default_category_rules_list(include_inactive=True if include_inactive else False)
+
+        # Prefer new schema
+        try:
+            query = """
+                SELECT category,
+                       effect_model,
+                       savings_model,
+                       overlay_targets,
+                       requires_scope_link,
+                       is_active,
+                       description,
+                       updated_at
+                FROM category_rules
+            """
+            params: list[Any] = []
+            if not include_inactive:
+                query += " WHERE is_active = 1"
+            query += " ORDER BY category ASC"
+            cur = self.con.execute(query, params)
+            rows = [self._normalize_rule_row(dict(r)) for r in cur.fetchall()]
+            if not rows:
+                return _default_category_rules_list(include_inactive=True if include_inactive else False)
+            return rows
+        except sqlite3.Error:
+            # Old schema
+            try:
+                query = """
+                    SELECT category,
+                           effect_model,
+                           savings_model,
+                           requires_scope_link,
+                           is_active,
+                           description,
+                           updated_at
+                    FROM category_rules
+                """
+                params = []
+                if not include_inactive:
+                    query += " WHERE is_active = 1"
+                query += " ORDER BY category ASC"
+                cur = self.con.execute(query, params)
+                rows = [self._normalize_rule_row(dict(r)) for r in cur.fetchall()]
+                if not rows:
+                    return _default_category_rules_list(include_inactive=True if include_inactive else False)
+                return rows
+            except sqlite3.Error:
+                return _default_category_rules_list(include_inactive=True if include_inactive else False)
+
+    def get_category_rule(self, category: str) -> dict[str, Any] | None:
+        if not category:
+            return None
+        if not _table_exists(self.con, "category_rules"):
+            return None
+
+        # Prefer new schema
+        try:
+            cur = self.con.execute(
+                """
+                SELECT category,
+                       effect_model,
+                       savings_model,
+                       overlay_targets,
+                       requires_scope_link,
+                       is_active,
+                       description,
+                       updated_at
+                FROM category_rules
+                WHERE category = ?
+                """,
+                (category,),
+            )
+            row = cur.fetchone()
+            return self._normalize_rule_row(dict(row)) if row else None
+        except sqlite3.Error:
+            # Old schema
+            try:
+                cur = self.con.execute(
+                    """
+                    SELECT category,
+                           effect_model,
+                           savings_model,
+                           requires_scope_link,
+                           is_active,
+                           description,
+                           updated_at
+                    FROM category_rules
+                    WHERE category = ?
+                    """,
+                    (category,),
+                )
+                row = cur.fetchone()
+                return self._normalize_rule_row(dict(row)) if row else None
+            except sqlite3.Error:
+                return None
+
+    def upsert_category_rule(self, category: str, payload: dict[str, Any]) -> None:
+        clean_category = (category or "").strip()
+        if not clean_category:
+            raise ValueError("Nazwa kategorii jest wymagana.")
+
+        rule = self._normalize_rule_payload(clean_category, payload)
+
+        # Prefer new schema (overlay_targets)
+        try:
+            self.con.execute(
+                """
+                INSERT INTO category_rules (
+                    category,
+                    effect_model,
+                    savings_model,
+                    overlay_targets,
+                    requires_scope_link,
+                    is_active,
+                    description,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(category) DO UPDATE SET
+                    effect_model = excluded.effect_model,
+                    savings_model = excluded.savings_model,
+                    overlay_targets = excluded.overlay_targets,
+                    requires_scope_link = excluded.requires_scope_link,
+                    is_active = excluded.is_active,
+                    description = excluded.description,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    rule["category"],
+                    rule["effect_model"],
+                    rule["savings_model"],
+                    rule.get("overlay_targets"),
+                    1 if rule["requires_scope_link"] else 0,
+                    1 if rule["is_active"] else 0,
+                    rule.get("description"),
+                    rule["updated_at"],
+                ),
+            )
+            self.con.commit()
+            return
+        except sqlite3.Error:
+            # Old schema (no overlay_targets column)
+            self.con.execute(
+                """
+                INSERT INTO category_rules (
+                    category,
+                    effect_model,
+                    savings_model,
+                    requires_scope_link,
+                    is_active,
+                    description,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(category) DO UPDATE SET
+                    effect_model = excluded.effect_model,
+                    savings_model = excluded.savings_model,
+                    requires_scope_link = excluded.requires_scope_link,
+                    is_active = excluded.is_active,
+                    description = excluded.description,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    rule["category"],
+                    rule["effect_model"],
+                    rule["savings_model"],
+                    1 if rule["requires_scope_link"] else 0,
+                    1 if rule["is_active"] else 0,
+                    rule.get("description"),
+                    rule["updated_at"],
+                ),
+            )
+            self.con.commit()
+
+    # --------------------------
+    # Normalizers
+    # --------------------------
+    def _normalize_rule_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        overlay_targets_raw = row.get("overlay_targets")
+        row["overlay_targets"] = parse_overlay_targets(overlay_targets_raw)
+        row["overlay_targets_configured"] = overlay_targets_raw not in (None, "")
+        row["requires_scope_link"] = bool(row.get("requires_scope_link"))
+        row["is_active"] = bool(row.get("is_active"))
+        return row
+
+    def _normalize_category_rule_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        category_label = row.get("category_label") or row.get("category") or ""
+        overlay_targets_raw = row.get("overlay_targets")
+        return {
+            "category_label": category_label,
+            "effectiveness_model": row.get("effectiveness_model") or row.get("effect_model") or "NONE",
+            "savings_model": row.get("savings_model") or "NONE",
+            "overlay_targets": parse_overlay_targets(overlay_targets_raw),
+            "overlay_targets_configured": overlay_targets_raw not in (None, ""),
+            "requires_scope_link": bool(row.get("requires_scope_link")),
+            "description": row.get("description"),
+            "is_active": bool(row.get("is_active", True)),
+        }
+
+    def _normalize_rule_payload(self, category: str, payload: dict[str, Any]) -> dict[str, Any]:
+        description = (payload.get("description") or "").strip() or None
+        if description and len(description) > 500:
+            raise ValueError("Opis metodologii nie może przekraczać 500 znaków.")
+        return {
+            "category": category,
+            "effect_model": payload.get("effect_model") or "NONE",
+            "savings_model": payload.get("savings_model") or "NONE",
+            "overlay_targets": serialize_overlay_targets(payload.get("overlay_targets")),
+            "requires_scope_link": bool(payload.get("requires_scope_link")),
+            "is_active": bool(payload.get("is_active", True)),
+            "description": description,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 # =====================================================
@@ -580,7 +975,6 @@ class ActionRepository:
             except ValueError as exc_two:
                 raise ValueError(f"Invalid date for {field_name}") from exc_two
 
-    # ---- REQUIRED BY KPI PAGE ----
     def list_actions_for_kpi(
         self,
         project_id: str | None = None,
@@ -617,7 +1011,6 @@ class ActionRepository:
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
-    # ---- REQUIRED BY Champions ranking v2 ----
     def list_actions_for_ranking(
         self,
         project_id: str | None = None,
@@ -667,9 +1060,6 @@ class ActionRepository:
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
-    # =====================================================
-    # HOTFIX: REQUIRED BY projects.py (Project outcome)
-    # =====================================================
     def list_actions_for_project_outcome(
         self,
         project_id: str,
@@ -737,9 +1127,6 @@ class ActionRepository:
             r.setdefault("manual_savings_note", None)
         return rows
 
-    # =====================================================
-    # HOTFIX: CHANGELOG (used by Actions page)
-    # =====================================================
     def list_changelog(self, limit: int = 50, action_id: str | None = None) -> list[dict[str, Any]]:
         return _list_changelog_generic(
             self.con,
@@ -912,9 +1299,6 @@ class ProjectRepository:
                         norms.add(n)
         return norms
 
-    # =====================================================
-    # HOTFIX: CHANGELOG (used by Projects page)
-    # =====================================================
     def list_changelog(self, limit: int = 50, project_id: str | None = None) -> list[dict[str, Any]]:
         return _list_changelog_generic(
             self.con,
@@ -946,7 +1330,7 @@ class ChampionRepository:
         cols: set[str] = set()
         try:
             cur = self.con.execute("PRAGMA table_info(champions)")
-            cols = {r[1] for r in cur.fetchall()}  # (cid, name, type, notnull, dflt, pk)
+            cols = {r[1] for r in cur.fetchall()}
         except sqlite3.Error:
             cols = set()
 
@@ -992,9 +1376,6 @@ class ChampionRepository:
         )
         return [row["project_id"] for row in cur.fetchall()]
 
-    # =====================================================
-    # HOTFIX: CHANGELOG (used by Champions page)
-    # =====================================================
     def list_changelog(self, limit: int = 50, champion_id: str | None = None) -> list[dict[str, Any]]:
         return _list_changelog_generic(
             self.con,
@@ -1243,7 +1624,7 @@ class ProductionDataRepository:
         return [row["work_center"] for row in cur.fetchall()]
 
     def list_production_work_centers_with_stats(self) -> list[dict[str, Any]]:
-        from action_tracking.services.effectiveness import normalize_wc
+        from action_tracking.services.effectiveness import normalize_wc  # type: ignore
 
         stats: dict[str, dict[str, Any]] = {}
 
@@ -1351,7 +1732,7 @@ class WcInboxRepository:
             return
 
         try:
-            from action_tracking.services.effectiveness import normalize_wc
+            from action_tracking.services.effectiveness import normalize_wc  # type: ignore
         except Exception:
             def normalize_wc(v: Any) -> str:
                 return normalize_key(str(v or ""))
