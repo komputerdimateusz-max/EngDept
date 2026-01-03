@@ -803,56 +803,60 @@ class ActionRepository:
     def create_action(self, data: dict[str, Any]) -> str:
         action_id = data.get("id") or str(uuid4())
         payload = self._normalize_action_payload(action_id, data, existing=None)
-        self.con.execute(
-            """
-            INSERT INTO actions (
-                id,
-                project_id,
-                title,
-                description,
-                owner_champion_id,
-                priority,
-                status,
-                is_draft,
-                due_date,
-                created_at,
-                closed_at,
-                impact_type,
-                impact_value,
-                category,
-                manual_savings_amount,
-                manual_savings_currency,
-                manual_savings_note,
-                source,
-                source_message_id,
-                submitted_by_email,
-                submitted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                payload["id"],
-                payload["project_id"],
-                payload["title"],
-                payload["description"],
-                payload["owner_champion_id"],
-                payload["priority"],
-                payload["status"],
-                payload["is_draft"],
-                payload["due_date"],
-                payload["created_at"],
-                payload["closed_at"],
-                payload["impact_type"],
-                payload["impact_value"],
-                payload["category"],
-                payload["manual_savings_amount"],
-                payload["manual_savings_currency"],
-                payload["manual_savings_note"],
-                payload["source"],
-                payload["source_message_id"],
-                payload["submitted_by_email"],
-                payload["submitted_at"],
-            ),
-        )
+        cols = [
+            "id",
+            "project_id",
+            "title",
+            "description",
+            "owner_champion_id",
+            "priority",
+            "status",
+            "is_draft",
+            "due_date",
+            "created_at",
+            "closed_at",
+            "impact_type",
+            "impact_value",
+            "category",
+            "manual_savings_amount",
+            "manual_savings_currency",
+            "manual_savings_note",
+            "source",
+            "source_message_id",
+            "submitted_by_email",
+            "submitted_at",
+        ]
+        vals = [
+            payload["id"],
+            payload["project_id"],
+            payload["title"],
+            payload["description"],
+            payload["owner_champion_id"],
+            payload["priority"],
+            payload["status"],
+            payload["is_draft"],
+            payload["due_date"],
+            payload["created_at"],
+            payload["closed_at"],
+            payload["impact_type"],
+            payload["impact_value"],
+            payload["category"],
+            payload["manual_savings_amount"],
+            payload["manual_savings_currency"],
+            payload["manual_savings_note"],
+            payload["source"],
+            payload["source_message_id"],
+            payload["submitted_by_email"],
+            payload["submitted_at"],
+        ]
+        if len(cols) != len(vals):
+            raise ValueError(
+                "Mismatch between action insert columns and values: "
+                f"{len(cols)} cols vs {len(vals)} values."
+            )
+        placeholders = ", ".join(["?"] * len(cols))
+        sql = f"INSERT INTO actions ({', '.join(cols)}) VALUES ({placeholders})"
+        self.con.execute(sql, tuple(vals))
         self._log_changelog(
             action_id,
             "CREATE",

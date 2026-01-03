@@ -353,6 +353,36 @@ def render(con: sqlite3.Connection) -> None:
 
     if editing and is_draft:
         st.info("Wybrana akcja jest szkicem. Uzupełnij wymagane pola, aby ją zakończyć.")
+        selected_category = selected.get("category")
+        category_options_form = list(active_categories)
+        legacy_category = None
+        if selected_category and selected_category not in active_categories:
+            legacy_category = selected_category
+            category_options_form.append(selected_category)
+
+        def _format_category_option(option: str) -> str:
+            if legacy_category and option == legacy_category:
+                return f"(legacy: {option})"
+            return option
+
+        category = st.selectbox(
+            "Kategoria",
+            category_options_form,
+            index=category_options_form.index(selected_category)
+            if selected_category in category_options_form
+            else 0,
+            format_func=_format_category_option,
+            key="draft_action_category_select",
+        )
+        rule = _resolve_rule(category, warn=True)
+        st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
+        st.caption(
+            "Metoda obliczeń: "
+            f"Skuteczność = {rule.get('effectiveness_model')}, "
+            f"Oszczędności = {rule.get('savings_model')}, "
+            f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
+        )
+        st.caption("Zmiana kategorii odświeża metodę liczenia i wymagane pola.")
         with st.form("complete_draft_form"):
             title = st.text_input(
                 "Krótka nazwa",
@@ -363,34 +393,6 @@ def render(con: sqlite3.Connection) -> None:
                 "Opis",
                 value=selected.get("description", "") or "",
                 max_chars=500,
-            )
-            selected_category = selected.get("category")
-            category_options_form = list(active_categories)
-            legacy_category = None
-            if selected_category and selected_category not in active_categories:
-                legacy_category = selected_category
-                category_options_form.append(selected_category)
-
-            def _format_category_option(option: str) -> str:
-                if legacy_category and option == legacy_category:
-                    return f"(legacy: {option})"
-                return option
-
-            category = st.selectbox(
-                "Kategoria",
-                category_options_form,
-                index=category_options_form.index(selected_category)
-                if selected_category in category_options_form
-                else 0,
-                format_func=_format_category_option,
-            )
-            rule = _resolve_rule(category, warn=True)
-            st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
-            st.caption(
-                "Metoda obliczeń: "
-                f"Skuteczność = {rule.get('effectiveness_model')}, "
-                f"Oszczędności = {rule.get('savings_model')}, "
-                f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
             )
 
             project_ids = [p["id"] for p in projects]
@@ -516,6 +518,36 @@ def render(con: sqlite3.Connection) -> None:
             except ValueError as exc:
                 st.error(str(exc))
     else:
+        selected_category = selected.get("category")
+        category_options_form = list(active_categories)
+        legacy_category = None
+        if selected_category and selected_category not in active_categories:
+            legacy_category = selected_category
+            category_options_form.append(selected_category)
+
+        def _format_category_option(option: str) -> str:
+            if legacy_category and option == legacy_category:
+                return f"(legacy: {option})"
+            return option
+
+        category = st.selectbox(
+            "Kategoria",
+            category_options_form,
+            index=category_options_form.index(selected_category)
+            if selected_category in category_options_form
+            else 0,
+            format_func=_format_category_option,
+            key="action_category_select",
+        )
+        rule = _resolve_rule(category, warn=True)
+        st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
+        st.caption(
+            "Metoda obliczeń: "
+            f"Skuteczność = {rule.get('effectiveness_model')}, "
+            f"Oszczędności = {rule.get('savings_model')}, "
+            f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
+        )
+        st.caption("Zmiana kategorii odświeża metodę liczenia i wymagane pola.")
         with st.form("action_form"):
             title = st.text_input(
                 "Krótka nazwa",
@@ -526,34 +558,6 @@ def render(con: sqlite3.Connection) -> None:
                 "Opis",
                 value=selected.get("description", "") or "",
                 max_chars=500,
-            )
-            selected_category = selected.get("category")
-            category_options_form = list(active_categories)
-            legacy_category = None
-            if selected_category and selected_category not in active_categories:
-                legacy_category = selected_category
-                category_options_form.append(selected_category)
-
-            def _format_category_option(option: str) -> str:
-                if legacy_category and option == legacy_category:
-                    return f"(legacy: {option})"
-                return option
-
-            category = st.selectbox(
-                "Kategoria",
-                category_options_form,
-                index=category_options_form.index(selected_category)
-                if selected_category in category_options_form
-                else 0,
-                format_func=_format_category_option,
-            )
-            rule = _resolve_rule(category, warn=True)
-            st.info(rule.get("description") or "Brak opisu metodologii dla tej kategorii.")
-            st.caption(
-                "Metoda obliczeń: "
-                f"Skuteczność = {rule.get('effectiveness_model')}, "
-                f"Oszczędności = {rule.get('savings_model')}, "
-                f"Wymaga powiązania z WC = {'tak' if rule.get('requires_scope_link') else 'nie'}."
             )
 
             project_ids = [p["id"] for p in projects]
