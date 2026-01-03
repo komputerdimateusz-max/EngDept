@@ -40,6 +40,26 @@ def _daily_sum(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
     return df.groupby("metric_date", as_index=False)[value_col].sum()
 
 
+def _apply_weekend_filter(
+    df: pd.DataFrame,
+    remove_sat: bool,
+    remove_sun: bool,
+) -> pd.DataFrame:
+    if df.empty or "metric_date" not in df.columns:
+        return df
+    temp = df.copy()
+    if not pd.api.types.is_datetime64_any_dtype(temp["metric_date"]):
+        temp["metric_date"] = pd.to_datetime(temp["metric_date"], errors="coerce")
+    temp = temp.dropna(subset=["metric_date"])
+    weekday = temp["metric_date"].dt.weekday
+    mask = pd.Series(True, index=temp.index)
+    if remove_sat:
+        mask &= weekday != 5
+    if remove_sun:
+        mask &= weekday != 6
+    return temp.loc[mask]
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Explorer (Produkcja)")
     repo = ProductionDataRepository(con)
@@ -133,13 +153,33 @@ def render(con: sqlite3.Connection) -> None:
     if not kpi_df.empty:
         kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"])
 
+    filter_col1, filter_col2 = st.columns(2)
+    remove_saturdays = filter_col1.checkbox(
+        "Usuń soboty",
+        value=False,
+        key="explorer_remove_sat",
+    )
+    remove_sundays = filter_col2.checkbox(
+        "Usuń niedziele",
+        value=False,
+        key="explorer_remove_sun",
+    )
+
     if "Scrap qty" in selected_metrics:
         st.subheader("Scrap qty (dziennie)")
         if scrap_df.empty:
             st.info("Brak danych scrap qty.")
         else:
             daily_scrap_qty = _daily_sum(scrap_df, "scrap_qty")
-            st.line_chart(daily_scrap_qty.set_index("metric_date")["scrap_qty"])
+            daily_scrap_qty = _apply_weekend_filter(
+                daily_scrap_qty,
+                remove_saturdays,
+                remove_sundays,
+            )
+            if daily_scrap_qty.empty:
+                st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
+            else:
+                st.line_chart(daily_scrap_qty.set_index("metric_date")["scrap_qty"])
 
     if "Scrap PLN" in selected_metrics:
         st.subheader("Scrap PLN (dziennie)")
@@ -151,7 +191,15 @@ def render(con: sqlite3.Connection) -> None:
                 st.info("Brak danych scrap PLN.")
             else:
                 daily_scrap_pln = _daily_sum(pln_df, "scrap_cost_amount")
-                st.line_chart(daily_scrap_pln.set_index("metric_date")["scrap_cost_amount"])
+                daily_scrap_pln = _apply_weekend_filter(
+                    daily_scrap_pln,
+                    remove_saturdays,
+                    remove_sundays,
+                )
+                if daily_scrap_pln.empty:
+                    st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
+                else:
+                    st.line_chart(daily_scrap_pln.set_index("metric_date")["scrap_cost_amount"])
 
     if "OEE %" in selected_metrics:
         st.subheader("OEE % (dziennie)")
@@ -159,7 +207,15 @@ def render(con: sqlite3.Connection) -> None:
             st.info("Brak danych OEE.")
         else:
             daily_oee = _weighted_daily_average(kpi_df, "oee_pct")
-            st.line_chart(daily_oee.set_index("metric_date")["oee_pct"])
+            daily_oee = _apply_weekend_filter(
+                daily_oee,
+                remove_saturdays,
+                remove_sundays,
+            )
+            if daily_oee.empty:
+                st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
+            else:
+                st.line_chart(daily_oee.set_index("metric_date")["oee_pct"])
 
     if "Performance %" in selected_metrics:
         st.subheader("Performance % (dziennie)")
@@ -167,7 +223,15 @@ def render(con: sqlite3.Connection) -> None:
             st.info("Brak danych Performance.")
         else:
             daily_perf = _weighted_daily_average(kpi_df, "performance_pct")
-            st.line_chart(daily_perf.set_index("metric_date")["performance_pct"])
+            daily_perf = _apply_weekend_filter(
+                daily_perf,
+                remove_saturdays,
+                remove_sundays,
+            )
+            if daily_perf.empty:
+                st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
+            else:
+                st.line_chart(daily_perf.set_index("metric_date")["performance_pct"])
 
     st.subheader("Dane dzienne (audit)")
     kpi_audit = pd.DataFrame(
@@ -208,6 +272,12 @@ def render(con: sqlite3.Connection) -> None:
         scrap_audit = scrap_qty.merge(scrap_pln, on=["metric_date", "work_center"], how="left")
 
     audit_df = pd.merge(kpi_audit, scrap_audit, on=["metric_date", "work_center"], how="outer")
+    audit_df_empty = audit_df.empty
+    audit_df = _apply_weekend_filter(
+        audit_df,
+        remove_saturdays,
+        remove_sundays,
+    )
     if not audit_df.empty:
         audit_df = audit_df.sort_values(["metric_date", "work_center"]).reset_index(drop=True)
         audit_df["metric_date"] = audit_df["metric_date"].dt.date.astype(str)
@@ -220,4 +290,7 @@ def render(con: sqlite3.Connection) -> None:
             mime="text/csv",
         )
     else:
-        st.info("Brak danych do tabeli audit.")
+        if audit_df_empty:
+            st.info("Brak danych do tabeli audit.")
+        else:
+            st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
