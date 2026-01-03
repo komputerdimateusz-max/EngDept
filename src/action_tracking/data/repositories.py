@@ -1333,6 +1333,34 @@ class ProjectRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
+    def create_project(self, data: dict[str, Any]) -> str:
+        if not _table_exists(self.con, "projects"):
+            raise ValueError("projects table missing")
+
+        project_id = data.get("id") or str(uuid4())
+        payload = self._normalize_project_payload(project_id, data)
+
+        try:
+            cur = self.con.execute("PRAGMA table_info(projects)")
+            cols = {r[1] for r in cur.fetchall()}
+        except sqlite3.Error:
+            cols = set()
+        if not cols:
+            raise ValueError("projects table has no columns")
+
+        insert_cols = [c for c in payload.keys() if c in cols]
+        if not insert_cols:
+            raise ValueError("projects table has no insertable columns")
+
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        values = [payload[c] for c in insert_cols]
+        self.con.execute(
+            f"INSERT INTO projects ({', '.join(insert_cols)}) VALUES ({placeholders})",
+            values,
+        )
+        self.con.commit()
+        return project_id
+
     def list_projects(self, include_counts: bool = True) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "projects"):
             return []
@@ -1408,6 +1436,64 @@ class ProjectRepository:
             limit=limit,
             entity_id=project_id,
         )
+
+    def _normalize_project_payload(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        name = (data.get("name") or "").strip()
+        work_center = (data.get("work_center") or "").strip()
+        if not name:
+            raise ValueError("name is required")
+        if not work_center:
+            raise ValueError("work_center is required")
+
+        created_at = data.get("created_at") or date.today().isoformat()
+        created_date = self._parse_date(created_at, "created_at")
+        status = (data.get("status") or "active").strip() or "active"
+        closed_at = data.get("closed_at") or None
+        if status == "closed":
+            closed_at = closed_at or date.today().isoformat()
+            closed_date = self._parse_date(closed_at, "closed_at")
+            if closed_date < created_date:
+                raise ValueError("closed_at < created_at")
+            closed_at = closed_date.isoformat()
+        else:
+            closed_at = None
+
+        project_sop = data.get("project_sop") or None
+        if project_sop:
+            project_sop = self._parse_date(project_sop, "project_sop").isoformat()
+
+        project_eop = data.get("project_eop") or None
+        if project_eop:
+            project_eop = self._parse_date(project_eop, "project_eop").isoformat()
+
+        return {
+            "id": project_id,
+            "name": name,
+            "type": (data.get("type") or "custom").strip() or "custom",
+            "owner_champion_id": (data.get("owner_champion_id") or "").strip() or None,
+            "status": status,
+            "created_at": created_date.isoformat(),
+            "closed_at": closed_at,
+            "work_center": work_center,
+            "project_code": (data.get("project_code") or "").strip() or None,
+            "project_sop": project_sop,
+            "project_eop": project_eop,
+            "related_work_center": (data.get("related_work_center") or "").strip() or None,
+        }
+
+    @staticmethod
+    def _parse_date(value: Any, field_name: str) -> date:
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError:
+            try:
+                return datetime.fromisoformat(str(value)).date()
+            except ValueError as exc_two:
+                raise ValueError(f"Invalid date for {field_name}") from exc_two
 
 
 # =====================================================
