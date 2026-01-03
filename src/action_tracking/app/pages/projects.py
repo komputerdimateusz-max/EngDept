@@ -114,6 +114,19 @@ def _mean_or_none(series: pd.Series | None) -> float | None:
     return float(value)
 
 
+def _weighted_or_mean(values: pd.Series, weights: pd.Series | None) -> float | None:
+    if values.empty:
+        return None
+    if weights is None or weights.empty:
+        return _mean_or_none(values)
+    weights = weights.fillna(0)
+    valid_weights = weights.where(values.notna(), 0)
+    if valid_weights.sum() > 0:
+        weighted_values = values.fillna(0) * weights
+        return float(weighted_values.sum() / valid_weights.sum())
+    return _mean_or_none(values)
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Projekty")
 
@@ -382,8 +395,20 @@ def render(con: sqlite3.Connection) -> None:
     if not kpi_df.empty:
         kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"])
         kpi_daily = (
-            kpi_df.groupby("metric_date", as_index=False)
-            .agg(oee_avg=("oee_pct", "mean"), performance_avg=("performance_pct", "mean"))
+            kpi_df.groupby("metric_date")
+            .apply(
+                lambda group: pd.Series(
+                    {
+                        "oee_avg": _weighted_or_mean(
+                            group["oee_pct"], group.get("worktime_min")
+                        ),
+                        "performance_avg": _weighted_or_mean(
+                            group["performance_pct"], group.get("worktime_min")
+                        ),
+                    }
+                )
+            )
+            .reset_index()
             .sort_values("metric_date")
         )
     else:

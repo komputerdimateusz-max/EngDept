@@ -1115,9 +1115,14 @@ class ProductionDataRepository:
                 row.get("id") or str(uuid4()),
                 row["metric_date"],
                 row["work_center"],
+                row.get("worktime_min"),
                 row.get("oee_pct"),
                 row.get("performance_pct"),
-                row.get("created_at") or now,
+                row.get("availability_pct"),
+                row.get("quality_pct"),
+                row.get("source_file"),
+                row.get("imported_at") or now,
+                row.get("created_at") or row.get("imported_at") or now,
             )
             for row in rows
         ]
@@ -1127,13 +1132,24 @@ class ProductionDataRepository:
                 id,
                 metric_date,
                 work_center,
+                worktime_min,
                 oee_pct,
                 performance_pct,
+                availability_pct,
+                quality_pct,
+                source_file,
+                imported_at,
                 created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(metric_date, work_center) DO UPDATE SET
+                worktime_min = excluded.worktime_min,
                 oee_pct = excluded.oee_pct,
-                performance_pct = excluded.performance_pct
+                performance_pct = excluded.performance_pct,
+                availability_pct = excluded.availability_pct,
+                quality_pct = excluded.quality_pct,
+                source_file = excluded.source_file,
+                imported_at = excluded.imported_at,
+                created_at = excluded.created_at
             """,
             payload,
         )
@@ -1191,8 +1207,11 @@ class ProductionDataRepository:
         query = """
             SELECT metric_date,
                    work_center,
+                   worktime_min,
                    oee_pct,
-                   performance_pct
+                   performance_pct,
+                   availability_pct,
+                   quality_pct
             FROM production_kpi_daily
         """
         filters: list[str] = []

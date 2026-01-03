@@ -26,6 +26,11 @@ KPI_REQUIRED_COLUMNS = [
     "PERFORMANCE [%]",
 ]
 
+KPI_OPTIONAL_COLUMNS = [
+    "AVAILABILITY [%]",
+    "QUALITY [%]",
+]
+
 
 DATE_FORMATS = ["%Y%m%d", "%Y-%m-%d", "%d.%m.%Y"]
 
@@ -61,6 +66,11 @@ def _parse_date_value(value: Any) -> str | None:
     return None
 
 
+def _normalize_work_center(value: Any) -> str:
+    text = str(value or "").replace("\u00a0", " ")
+    return " ".join(text.strip().split())
+
+
 def _read_production_csv(file_data: bytes) -> pd.DataFrame:
     return pd.read_csv(
         BytesIO(file_data),
@@ -85,7 +95,7 @@ def _prepare_scrap_rows(
     ok_s_qty_col = column_map["OK S. QTY [pcs]"]
     scrap_value_col = column_map["SCRAP VALUE [pln]"]
     df["metric_date"] = df[date_col].apply(_parse_date_value)
-    df["work_center"] = df[project_col].astype(str).str.strip()
+    df["work_center"] = df[project_col].apply(_normalize_work_center)
     valid_mask = df["metric_date"].notna() & (df["work_center"] != "")
     skipped = int((~valid_mask).sum())
     df = df.loc[valid_mask].copy()
@@ -147,51 +157,98 @@ def _prepare_scrap_rows(
 def _prepare_kpi_rows(
     df: pd.DataFrame,
     column_map: dict[str, str],
+    source_file: str | None = None,
 ) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
     df = df.copy()
     df["metric_date"] = df[column_map["DATE"]].apply(_parse_date_value)
-    df["work_center"] = df[column_map["FULL PROJECT"]].astype(str).str.strip()
+    df["work_center"] = df[column_map["FULL PROJECT"]].apply(_normalize_work_center)
     valid_mask = df["metric_date"].notna() & (df["work_center"] != "")
     skipped = int((~valid_mask).sum())
     df = df.loc[valid_mask].copy()
 
-    df["worktime"] = pd.to_numeric(
+    df["worktime_min"] = pd.to_numeric(
         df[column_map["WORKTIME  [min]"]], errors="coerce"
     ).fillna(0)
-    df["oee"] = pd.to_numeric(
+    df["oee_pct"] = pd.to_numeric(
         df[column_map["OEE [%]"]], errors="coerce"
-    ).fillna(0)
-    df["performance"] = pd.to_numeric(
+    )
+    df["performance_pct"] = pd.to_numeric(
         df[column_map["PERFORMANCE [%]"]], errors="coerce"
-    ).fillna(0)
+    )
 
-    df["oee_weighted"] = df["oee"] * df["worktime"]
-    df["performance_weighted"] = df["performance"] * df["worktime"]
+    availability_col = column_map.get("AVAILABILITY [%]")
+    quality_col = column_map.get("QUALITY [%]")
+    if availability_col:
+        df["availability_pct"] = pd.to_numeric(df[availability_col], errors="coerce")
+    else:
+        df["availability_pct"] = pd.Series([pd.NA] * len(df), dtype="float")
+    if quality_col:
+        df["quality_pct"] = pd.to_numeric(df[quality_col], errors="coerce")
+    else:
+        df["quality_pct"] = pd.Series([pd.NA] * len(df), dtype="float")
+
+    def _weighted_columns(metric: str) -> None:
+        df[f"{metric}_weighted"] = df[metric].fillna(0) * df["worktime_min"]
+        df[f"{metric}_weight"] = df["worktime_min"].where(df[metric].notna(), 0)
+
+    for metric in ("oee_pct", "performance_pct", "availability_pct", "quality_pct"):
+        _weighted_columns(metric)
 
     grouped = (
         df.groupby(["metric_date", "work_center"], dropna=False)
         .agg(
-            total_worktime=("worktime", "sum"),
-            oee_weighted=("oee_weighted", "sum"),
-            performance_weighted=("performance_weighted", "sum"),
+            total_worktime=("worktime_min", "sum"),
+            oee_weighted=("oee_pct_weighted", "sum"),
+            oee_weight=("oee_pct_weight", "sum"),
+            oee_mean=("oee_pct", "mean"),
+            performance_weighted=("performance_pct_weighted", "sum"),
+            performance_weight=("performance_pct_weight", "sum"),
+            performance_mean=("performance_pct", "mean"),
+            availability_weighted=("availability_pct_weighted", "sum"),
+            availability_weight=("availability_pct_weight", "sum"),
+            availability_mean=("availability_pct", "mean"),
+            quality_weighted=("quality_pct_weighted", "sum"),
+            quality_weight=("quality_pct_weight", "sum"),
+            quality_mean=("quality_pct", "mean"),
         )
         .reset_index()
     )
 
     rows: list[dict[str, Any]] = []
     for _, row in grouped.iterrows():
-        total_worktime = row["total_worktime"]
-        oee_pct = None
-        performance_pct = None
-        if total_worktime > 0:
-            oee_pct = float(row["oee_weighted"] / total_worktime)
-            performance_pct = float(row["performance_weighted"] / total_worktime)
+        def _resolve_metric(weighted: float, weight: float, mean_value: float) -> float | None:
+            if weight > 0:
+                return float(weighted / weight)
+            if pd.isna(mean_value):
+                return None
+            return float(mean_value)
+
+        oee_pct = _resolve_metric(row["oee_weighted"], row["oee_weight"], row["oee_mean"])
+        performance_pct = _resolve_metric(
+            row["performance_weighted"],
+            row["performance_weight"],
+            row["performance_mean"],
+        )
+        availability_pct = _resolve_metric(
+            row["availability_weighted"],
+            row["availability_weight"],
+            row["availability_mean"],
+        )
+        quality_pct = _resolve_metric(
+            row["quality_weighted"],
+            row["quality_weight"],
+            row["quality_mean"],
+        )
         rows.append(
             {
                 "metric_date": row["metric_date"],
                 "work_center": row["work_center"],
+                "worktime_min": float(row["total_worktime"]),
                 "oee_pct": oee_pct,
                 "performance_pct": performance_pct,
+                "availability_pct": availability_pct,
+                "quality_pct": quality_pct,
+                "source_file": source_file,
             }
         )
     return rows, skipped, {}
@@ -201,6 +258,7 @@ def _render_import_tab(
     *,
     label: str,
     required_columns: list[str],
+    optional_columns: list[str] | None,
     prepare_rows: callable,
     on_import: callable,
 ) -> None:
@@ -209,7 +267,8 @@ def _render_import_tab(
         return
 
     df = _read_production_csv(uploaded_file.getvalue())
-    column_map = {col: _col(df, col) for col in required_columns}
+    optional_columns = optional_columns or []
+    column_map = {col: _col(df, col) for col in required_columns + optional_columns}
     if label == "Scrap CSV":
         st.write("Detected columns:", list(df.columns))
         preview_columns = [
@@ -240,10 +299,18 @@ def _render_import_tab(
         return
 
     if st.button("Import / Update", key=f"import-{label}"):
-        rows, skipped, debug_payload = prepare_rows(
-            df,
-            {key: value for key, value in column_map.items() if value is not None},
-        )
+        column_selection = {key: value for key, value in column_map.items() if value is not None}
+        if label == "OEE / Performance CSV":
+            rows, skipped, debug_payload = prepare_rows(
+                df,
+                column_selection,
+                uploaded_file.name,
+            )
+        else:
+            rows, skipped, debug_payload = prepare_rows(
+                df,
+                column_selection,
+            )
         if label == "Scrap CSV":
             aggregated_df = debug_payload.get("aggregated_df")
             if aggregated_df is not None:
@@ -289,6 +356,7 @@ def render(con: sqlite3.Connection) -> None:
         _render_import_tab(
             label="Scrap CSV",
             required_columns=SCRAP_REQUIRED_COLUMNS,
+            optional_columns=None,
             prepare_rows=_prepare_scrap_rows,
             on_import=repo.upsert_scrap_daily,
         )
@@ -297,6 +365,7 @@ def render(con: sqlite3.Connection) -> None:
         _render_import_tab(
             label="OEE / Performance CSV",
             required_columns=KPI_REQUIRED_COLUMNS,
+            optional_columns=KPI_OPTIONAL_COLUMNS,
             prepare_rows=_prepare_kpi_rows,
             on_import=repo.upsert_production_kpi_daily,
         )
