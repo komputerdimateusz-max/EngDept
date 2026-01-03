@@ -321,6 +321,26 @@ def _resolve_work_center_default(
     return options[0] if options else ""
 
 
+def _apply_weekend_filter(
+    df: pd.DataFrame,
+    remove_sat: bool,
+    remove_sun: bool,
+) -> pd.DataFrame:
+    if df.empty or "metric_date" not in df.columns:
+        return df
+    temp = df.copy()
+    if not pd.api.types.is_datetime64_any_dtype(temp["metric_date"]):
+        temp["metric_date"] = pd.to_datetime(temp["metric_date"], errors="coerce")
+    temp = temp.dropna(subset=["metric_date"])
+    weekday = temp["metric_date"].dt.weekday
+    mask = pd.Series(True, index=temp.index)
+    if remove_sat:
+        mask &= weekday != 5
+    if remove_sun:
+        mask &= weekday != 6
+    return temp.loc[mask]
+
+
 
 def render(con: sqlite3.Connection) -> None:
     st.header("Projekty")
@@ -548,6 +568,30 @@ def render(con: sqlite3.Connection) -> None:
             outcome_available = False
 
     if outcome_available:
+        remove_saturdays = st.session_state.get("remove_saturdays", False)
+        remove_sundays = st.session_state.get("remove_sundays", False)
+
+        scrap_daily_f = _apply_weekend_filter(
+            scrap_daily,
+            remove_saturdays,
+            remove_sundays,
+        )
+        kpi_daily_f = _apply_weekend_filter(
+            kpi_daily,
+            remove_saturdays,
+            remove_sundays,
+        )
+        merged_daily_f = _apply_weekend_filter(
+            merged_daily,
+            remove_saturdays,
+            remove_sundays,
+        )
+
+        if merged_daily_f.empty:
+            st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
+            outcome_available = False
+
+    if outcome_available:
         baseline_from, baseline_to, after_from, after_to, used_halves = _window_bounds(
             selected_from,
             selected_to,
@@ -557,15 +601,15 @@ def render(con: sqlite3.Connection) -> None:
                 "Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after)."
             )
 
-        baseline_mask = (merged_daily["metric_date"].dt.date >= baseline_from) & (
-            merged_daily["metric_date"].dt.date <= baseline_to
+        baseline_mask = (merged_daily_f["metric_date"].dt.date >= baseline_from) & (
+            merged_daily_f["metric_date"].dt.date <= baseline_to
         )
-        after_mask = (merged_daily["metric_date"].dt.date >= after_from) & (
-            merged_daily["metric_date"].dt.date <= after_to
+        after_mask = (merged_daily_f["metric_date"].dt.date >= after_from) & (
+            merged_daily_f["metric_date"].dt.date <= after_to
         )
 
-        baseline_slice = merged_daily.loc[baseline_mask]
-        after_slice = merged_daily.loc[after_mask]
+        baseline_slice = merged_daily_f.loc[baseline_mask]
+        after_slice = merged_daily_f.loc[after_mask]
 
         baseline_scrap_qty = _mean_or_none(baseline_slice.get("scrap_qty_sum"))
         after_scrap_qty = _mean_or_none(after_slice.get("scrap_qty_sum"))
@@ -642,11 +686,15 @@ def render(con: sqlite3.Connection) -> None:
                     markers_df = markers_df.sort_values("closed_at").tail(20)
                     st.caption("Pokazano 20 ostatnich zamkniętych akcji.")
 
-        chart_cols = st.columns(2)
-        if not scrap_daily.empty:
+        chart_cols = st.columns([1, 1, 0.4])
+        with chart_cols[2]:
+            st.checkbox("Usuń soboty", value=False, key="remove_saturdays")
+            st.checkbox("Usuń niedziele", value=False, key="remove_sundays")
+
+        if not scrap_daily_f.empty:
             chart_cols[0].altair_chart(
                 _line_chart_with_markers(
-                    scrap_daily,
+                    scrap_daily_f,
                     "scrap_qty_sum",
                     "Scrap qty",
                     "Scrap qty (suma)",
@@ -657,7 +705,7 @@ def render(con: sqlite3.Connection) -> None:
             )
             chart_cols[1].altair_chart(
                 _line_chart_with_markers(
-                    scrap_daily,
+                    scrap_daily_f,
                     "scrap_pln_sum",
                     "Scrap PLN",
                     "Scrap PLN (suma)",
@@ -670,10 +718,10 @@ def render(con: sqlite3.Connection) -> None:
             st.info("Brak danych scrap (PLN) w wybranym zakresie.")
 
         chart_cols = st.columns(2)
-        if not kpi_daily.empty:
+        if not kpi_daily_f.empty:
             chart_cols[0].altair_chart(
                 _line_chart_with_markers(
-                    kpi_daily,
+                    kpi_daily_f,
                     "oee_avg",
                     "OEE (%)",
                     "OEE (średnia, %)",
@@ -684,7 +732,7 @@ def render(con: sqlite3.Connection) -> None:
             )
             chart_cols[1].altair_chart(
                 _line_chart_with_markers(
-                    kpi_daily,
+                    kpi_daily_f,
                     "performance_avg",
                     "Performance (%)",
                     "Performance (średnia, %)",
@@ -739,13 +787,13 @@ def render(con: sqlite3.Connection) -> None:
             st.dataframe(action_table, use_container_width=True)
 
         st.subheader("Dzienny podgląd (audit)")
-        if merged_daily.empty:
+        if merged_daily_f.empty:
             st.caption("Brak danych do wyświetlenia w tabeli.")
         else:
-            merged_daily = merged_daily.sort_values("metric_date")
-            if len(merged_daily) > 180:
-                merged_daily = merged_daily.tail(180)
-            audit_rows = merged_daily.rename(
+            merged_daily_f = merged_daily_f.sort_values("metric_date")
+            if len(merged_daily_f) > 180:
+                merged_daily_f = merged_daily_f.tail(180)
+            audit_rows = merged_daily_f.rename(
                 columns={
                     "metric_date": "metric_date",
                     "scrap_qty_sum": "scrap_qty_sum",
