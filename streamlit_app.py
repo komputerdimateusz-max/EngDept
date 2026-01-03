@@ -21,6 +21,7 @@ from action_tracking.app.pages import (
     projects,
     settings,
     production_import,
+    production_explorer,
 )
 
 st.set_page_config(page_title="engdept", layout="wide")
@@ -37,6 +38,7 @@ st.sidebar.title("engdept")
 
 PAGES = {
     "Explorer (Produkcja)": lambda: explorer.render(con),
+    "Production Explorer": lambda: production_explorer.render(con),
     "Import danych produkcyjnych": lambda: production_import.render(con),
     "KPI": lambda: kpi.render(con),
     "Akcje": lambda: actions.render(con),

@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS actions (
   closed_at TEXT,
   impact_type TEXT,
   impact_value REAL,
+  impact_aspects TEXT,
   category TEXT,
   manual_savings_amount REAL,
   manual_savings_currency TEXT,
@@ -187,12 +188,14 @@ CREATE TABLE IF NOT EXISTS email_notifications_log (
 );
 """
 
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(db_path.as_posix())
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON;")
     return con
+
 
 def _get_user_version(con: sqlite3.Connection) -> int:
     row = con.execute("PRAGMA user_version;").fetchone()
@@ -526,6 +529,7 @@ def _migrate_to_v12(con: sqlite3.Connection) -> None:
 
 
 def _migrate_to_v13(con: sqlite3.Connection) -> None:
+    # 1) New Work Center detection inbox (post-import review)
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS wc_inbox (
@@ -548,6 +552,33 @@ def _migrate_to_v13(con: sqlite3.Connection) -> None:
         ON wc_inbox (status);
         """
     )
+
+    # 2) Action impact aspects (what KPI dimensions this action affects)
+    if not _column_exists(con, "actions", "impact_aspects"):
+        con.execute("ALTER TABLE actions ADD COLUMN impact_aspects TEXT;")
+
+    # Optional backfill based on category rules (if table exists)
+    if _table_exists(con, "category_rules"):
+        backfills = [
+            ("SCRAP", '["SCRAP"]'),
+            ("OEE", '["OEE"]'),
+            ("PERFORMANCE", '["PERFORMANCE"]'),
+        ]
+        for effect_model, payload in backfills:
+            con.execute(
+                """
+                UPDATE actions
+                SET impact_aspects = ?
+                WHERE impact_aspects IS NULL
+                  AND category IN (
+                    SELECT category
+                    FROM category_rules
+                    WHERE effect_model = ?
+                  )
+                """,
+                (payload, effect_model),
+            )
+
     _set_user_version(con, 13)
 
 
@@ -683,6 +714,7 @@ def init_db(con: sqlite3.Connection) -> None:
     _seed_action_categories(con)
     _seed_category_rules(con)
     con.commit()
+
 
 def table_count(con: sqlite3.Connection, table: str) -> int:
     cur = con.execute(f"SELECT COUNT(1) AS n FROM {table}")
