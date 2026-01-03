@@ -475,34 +475,42 @@ class ActionRepository:
         date_to: date | None = None,
     ) -> list[dict[str, Any]]:
         query = """
-            SELECT id,
-                   owner_champion_id,
-                   project_id,
-                   category,
-                   status,
-                   created_at,
-                   due_date,
-                   closed_at,
-                   manual_savings_amount,
-                   manual_savings_currency,
-                   manual_savings_note
-            FROM actions
-            WHERE created_at IS NOT NULL
+            SELECT a.id,
+                   a.title,
+                   a.owner_champion_id,
+                   a.project_id,
+                   p.name AS project_name,
+                   a.category,
+                   a.status,
+                   a.created_at,
+                   a.due_date,
+                   a.closed_at,
+                   a.manual_savings_amount,
+                   a.manual_savings_currency,
+                   a.manual_savings_note,
+                   ae.metric AS effectiveness_metric,
+                   ae.delta AS effectiveness_delta
+            FROM actions a
+            LEFT JOIN projects p ON p.id = a.project_id
+            LEFT JOIN action_effectiveness ae ON ae.action_id = a.id
+            WHERE a.created_at IS NOT NULL
         """
         filters: list[str] = []
         params: list[Any] = []
         if project_id:
-            filters.append("project_id = ?")
+            filters.append("a.project_id = ?")
             params.append(project_id)
         if category:
-            filters.append("category = ?")
+            filters.append("a.category = ?")
             params.append(category)
         if date_to:
-            filters.append("date(created_at) <= date(?)")
+            filters.append("date(a.created_at) <= date(?)")
             params.append(date_to.isoformat())
         if date_from:
-            filters.append("(closed_at IS NULL OR date(closed_at) >= date(?))")
-            params.append(date_from.isoformat())
+            filters.append(
+                "(date(a.created_at) >= date(?) OR (a.closed_at IS NOT NULL AND date(a.closed_at) >= date(?)))"
+            )
+            params.extend([date_from.isoformat(), date_from.isoformat()])
         if filters:
             query += " AND " + " AND ".join(filters)
         cur = self.con.execute(query, params)

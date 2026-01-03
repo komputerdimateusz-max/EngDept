@@ -17,6 +17,7 @@ from action_tracking.app.pages import (
     kpi,
     actions,
     champions,
+    champions_ranking,
     projects,
     settings,
     production_import,
@@ -40,6 +41,7 @@ PAGES = {
     "KPI": lambda: kpi.render(con),
     "Akcje": lambda: actions.render(con),
     "Champions": lambda: champions.render(con),
+    "Champion Ranking v2": lambda: champions_ranking.render(con),
     "Projekty": lambda: projects.render(con),
     "Ustawienia Globalne": lambda: settings.render(con),
 }
