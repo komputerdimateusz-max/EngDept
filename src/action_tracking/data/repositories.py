@@ -1666,6 +1666,58 @@ class ChampionRepository:
         )
         return [row["project_id"] for row in cur.fetchall()]
 
+    def set_assigned_projects(self, champion_id: str, project_ids: list[str]) -> None:
+        if not _table_exists(self.con, "champion_projects"):
+            return
+
+        try:
+            cur = self.con.execute("PRAGMA table_info(champion_projects)")
+            columns_info = cur.fetchall()
+        except sqlite3.Error:
+            return
+
+        column_names = {row[1] for row in columns_info}
+        if "champion_id" not in column_names or "project_id" not in column_names:
+            return
+
+        required_columns = [
+            row[1]
+            for row in columns_info
+            if row[1] not in {"champion_id", "project_id"}
+            and bool(row[3])
+            and row[4] is None
+            and not bool(row[5])
+        ]
+        if required_columns:
+            return
+
+        cleaned_ids = [
+            str(project_id).strip()
+            for project_id in project_ids
+            if project_id is not None and str(project_id).strip()
+        ]
+        unique_ids = list(dict.fromkeys(cleaned_ids))
+
+        _configure_sqlite_connection(self.con)
+        try:
+            self.con.execute("BEGIN IMMEDIATE")
+            self.con.execute(
+                "DELETE FROM champion_projects WHERE champion_id = ?",
+                (champion_id,),
+            )
+            if unique_ids:
+                self.con.executemany(
+                    """
+                    INSERT INTO champion_projects (champion_id, project_id)
+                    VALUES (?, ?)
+                    """,
+                    [(champion_id, project_id) for project_id in unique_ids],
+                )
+            self.con.execute("COMMIT")
+        except Exception:
+            _rollback_safely(self.con)
+            raise
+
     def list_changelog(self, limit: int = 50, champion_id: str | None = None) -> list[dict[str, Any]]:
         return _list_changelog_generic(
             self.con,
