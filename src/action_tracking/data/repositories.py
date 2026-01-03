@@ -254,6 +254,45 @@ class ActionRepository:
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
+    def list_actions_for_project_outcome(
+        self,
+        project_id: str,
+        date_from: date | str,
+        date_to: date | str,
+    ) -> list[dict[str, Any]]:
+        start = date_from.isoformat() if isinstance(date_from, date) else str(date_from)
+        end = date_to.isoformat() if isinstance(date_to, date) else str(date_to)
+        query = """
+            SELECT a.id,
+                   a.title,
+                   a.category,
+                   a.status,
+                   a.created_at,
+                   a.due_date,
+                   a.closed_at,
+                   a.owner_champion_id,
+                   CASE
+                       WHEN TRIM(COALESCE(ch.first_name, '')) != ''
+                         OR TRIM(COALESCE(ch.last_name, '')) != ''
+                           THEN TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, ''))
+                       WHEN TRIM(COALESCE(ch.name, '')) != '' THEN ch.name
+                       WHEN TRIM(COALESCE(ch.email, '')) != '' THEN ch.email
+                       ELSE NULL
+                   END AS owner_name
+            FROM actions a
+            LEFT JOIN champions ch ON ch.id = a.owner_champion_id
+            WHERE a.project_id = ?
+              AND (
+                (a.created_at IS NOT NULL AND date(a.created_at) BETWEEN date(?) AND date(?))
+                OR (a.closed_at IS NOT NULL AND date(a.closed_at) BETWEEN date(?) AND date(?))
+                OR (a.due_date IS NOT NULL AND date(a.due_date) BETWEEN date(?) AND date(?))
+              )
+            ORDER BY a.closed_at DESC, a.created_at DESC
+        """
+        params = [project_id, start, end, start, end, start, end]
+        cur = self.con.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
+
     def list_action_changelog(
         self,
         limit: int = 50,

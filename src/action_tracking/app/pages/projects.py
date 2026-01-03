@@ -10,13 +10,16 @@ import pandas as pd
 import streamlit as st
 
 from action_tracking.data.repositories import (
+    ActionRepository,
     ChampionRepository,
+    EffectivenessRepository,
     ProductionDataRepository,
     ProjectRepository,
 )
 from action_tracking.domain.constants import PROJECT_TYPES
 from action_tracking.services.effectiveness import (
     normalize_wc,
+    parse_date,
     parse_work_centers,
     suggest_work_centers,
 )
@@ -118,6 +121,107 @@ def _mean_or_none(series: pd.Series | None) -> float | None:
     return float(value)
 
 
+def _format_action_date(value: Any) -> str:
+    parsed = parse_date(value)
+    return parsed.isoformat() if parsed else "—"
+
+
+def _short_action_id(action_id: str | None) -> str:
+    if not action_id:
+        return ""
+    return action_id[:6]
+
+
+def _effectiveness_style(
+    row: dict[str, Any] | None,
+) -> tuple[str, str]:
+    if not row:
+        return "Not computed", "#9e9e9e"
+    classification = row.get("classification")
+    label_map = {
+        "effective": ("Effective", "#2ca02c"),
+        "no_scrap": ("Effective", "#2ca02c"),
+        "no_change": ("Neutral", "#9e9e9e"),
+        "insufficient_data": ("Neutral", "#9e9e9e"),
+        "unknown": ("Neutral", "#9e9e9e"),
+        "worse": ("Ineffective", "#d62728"),
+    }
+    return label_map.get(classification, ("Neutral", "#9e9e9e"))
+
+
+def _effectiveness_delta(
+    row: dict[str, Any] | None,
+    metric: str,
+) -> float | None:
+    if not row:
+        return None
+    if row.get("metric") != metric:
+        return None
+    delta = row.get("delta")
+    if isinstance(delta, (int, float)):
+        return float(delta)
+    return None
+
+
+def _format_delta(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:+.2f}"
+
+
+def _actions_sort_key(action_row: dict[str, Any]) -> tuple[int, int, int]:
+    closed_date = parse_date(action_row.get("closed_at"))
+    created_date = parse_date(action_row.get("created_at"))
+    closed_flag = 0 if closed_date else 1
+    closed_ord = -closed_date.toordinal() if closed_date else 10**9
+    created_ord = -created_date.toordinal() if created_date else 10**9
+    return closed_flag, closed_ord, created_ord
+
+
+def _line_chart_with_markers(
+    data: pd.DataFrame,
+    y_field: str,
+    y_title: str,
+    title: str,
+    markers_df: pd.DataFrame,
+    show_markers: bool,
+) -> alt.Chart:
+    base = (
+        alt.Chart(data)
+        .mark_line()
+        .encode(
+            x=alt.X("metric_date:T", title="Data"),
+            y=alt.Y(f"{y_field}:Q", title=y_title),
+        )
+        .properties(title=title)
+    )
+    if not show_markers or markers_df.empty:
+        return base
+    marker_colors = ["#2ca02c", "#9e9e9e", "#d62728"]
+    marker_labels = ["Effective", "Neutral", "Ineffective"]
+    marker_layer = (
+        alt.Chart(markers_df)
+        .mark_rule()
+        .encode(
+            x=alt.X("closed_at:T"),
+            color=alt.Color(
+                "effect_label:N",
+                scale=alt.Scale(domain=marker_labels, range=marker_colors),
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("action_label:N", title="Akcja"),
+                alt.Tooltip("closed_at:T", title="Zamknięta"),
+                alt.Tooltip("owner:N", title="Owner"),
+                alt.Tooltip("effect_label:N", title="Skuteczność"),
+                alt.Tooltip("delta_scrap_qty:N", title="Δ scrap qty"),
+                alt.Tooltip("delta_scrap_pln:N", title="Δ scrap PLN"),
+            ],
+        )
+    )
+    return base + marker_layer
+
+
 def _weighted_or_mean(values: pd.Series, weights: pd.Series | None) -> float | None:
     if values.empty:
         return None
@@ -162,6 +266,8 @@ def render(con: sqlite3.Connection) -> None:
 
     project_repo = ProjectRepository(con)
     champion_repo = ChampionRepository(con)
+    action_repo = ActionRepository(con)
+    effectiveness_repo = EffectivenessRepository(con)
     production_repo = ProductionDataRepository(con)
 
     champions = champion_repo.list_champions()
@@ -465,7 +571,6 @@ def render(con: sqlite3.Connection) -> None:
 
     if not scrap_rows_all and not kpi_rows:
         st.info("Brak danych produkcyjnych dla wybranego zakresu.")
-        return
 
     non_pln_currencies = {
         row.get("scrap_cost_currency")
@@ -517,6 +622,45 @@ def render(con: sqlite3.Connection) -> None:
         )
     else:
         kpi_daily = pd.DataFrame(columns=["metric_date", "oee_avg", "performance_avg"])
+
+    actions = action_repo.list_actions_for_project_outcome(
+        selected_project_id,
+        selected_from,
+        selected_to,
+    )
+    action_ids = [str(row.get("id")) for row in actions]
+    effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(action_ids)
+
+    closed_markers: list[dict[str, Any]] = []
+    for action in actions:
+        action_id = str(action.get("id") or "")
+        owner = action.get("owner_name") or champion_names.get(
+            action.get("owner_champion_id"), "—"
+        )
+        effect_row = effectiveness_map.get(action_id)
+        effect_label, _ = _effectiveness_style(effect_row)
+        title = action.get("title") or ""
+        short_id = _short_action_id(action_id)
+        action_label = f"{title} ({short_id})" if short_id else title
+        closed_date = parse_date(action.get("closed_at"))
+        if closed_date and selected_from <= closed_date <= selected_to:
+            closed_markers.append(
+                {
+                    "closed_at": pd.to_datetime(closed_date),
+                    "action_label": action_label,
+                    "owner": owner or "—",
+                    "effect_label": "Neutral" if effect_label == "Not computed" else effect_label,
+                    "delta_scrap_qty": _format_delta(
+                        _effectiveness_delta(effect_row, "scrap_qty")
+                    ),
+                    "delta_scrap_pln": _format_delta(
+                        _effectiveness_delta(effect_row, "scrap_cost")
+                        or _effectiveness_delta(effect_row, "scrap_pln")
+                    ),
+                }
+            )
+
+    markers_df = pd.DataFrame(closed_markers)
 
     merged_daily = pd.merge(scrap_daily, kpi_daily, on="metric_date", how="outer").sort_values(
         "metric_date"
@@ -582,26 +726,48 @@ def render(con: sqlite3.Connection) -> None:
         f"Baseline: {_format_metric_value(baseline_perf, '{:.1f}%')}"
     )
 
+    marker_count = len(markers_df)
+    show_markers_default = marker_count > 0 and marker_count <= 20
+    show_markers = st.checkbox(
+        "Pokaż markery zamknięcia akcji",
+        value=show_markers_default,
+        disabled=marker_count == 0,
+    )
+    if marker_count == 0:
+        st.caption("Brak zamkniętych akcji w wybranym zakresie dat.")
+    if marker_count > 20:
+        st.warning(
+            "W zakresie jest dużo zamkniętych akcji — aby zachować czytelność, "
+            "markery są domyślnie ukryte."
+        )
+        if show_markers:
+            show_all_markers = st.checkbox("Pokaż wszystkie markery", value=False)
+            if not show_all_markers:
+                markers_df = markers_df.sort_values("closed_at").tail(20)
+                st.caption("Pokazano 20 ostatnich zamkniętych akcji.")
+
     chart_cols = st.columns(2)
     if not scrap_daily.empty:
         chart_cols[0].altair_chart(
-            alt.Chart(scrap_daily)
-            .mark_line()
-            .encode(
-                x=alt.X("metric_date:T", title="Data"),
-                y=alt.Y("scrap_qty_sum:Q", title="Scrap qty"),
-            )
-            .properties(title="Scrap qty (suma)"),
+            _line_chart_with_markers(
+                scrap_daily,
+                "scrap_qty_sum",
+                "Scrap qty",
+                "Scrap qty (suma)",
+                markers_df,
+                show_markers,
+            ),
             use_container_width=True,
         )
         chart_cols[1].altair_chart(
-            alt.Chart(scrap_daily)
-            .mark_line()
-            .encode(
-                x=alt.X("metric_date:T", title="Data"),
-                y=alt.Y("scrap_pln_sum:Q", title="Scrap PLN"),
-            )
-            .properties(title="Scrap PLN (suma)"),
+            _line_chart_with_markers(
+                scrap_daily,
+                "scrap_pln_sum",
+                "Scrap PLN",
+                "Scrap PLN (suma)",
+                markers_df,
+                show_markers,
+            ),
             use_container_width=True,
         )
     else:
@@ -610,27 +776,71 @@ def render(con: sqlite3.Connection) -> None:
     chart_cols = st.columns(2)
     if not kpi_daily.empty:
         chart_cols[0].altair_chart(
-            alt.Chart(kpi_daily)
-            .mark_line()
-            .encode(
-                x=alt.X("metric_date:T", title="Data"),
-                y=alt.Y("oee_avg:Q", title="OEE%"),
-            )
-            .properties(title="OEE% (średnia)"),
+            _line_chart_with_markers(
+                kpi_daily,
+                "oee_avg",
+                "OEE%",
+                "OEE% (średnia)",
+                markers_df,
+                show_markers,
+            ),
             use_container_width=True,
         )
         chart_cols[1].altair_chart(
-            alt.Chart(kpi_daily)
-            .mark_line()
-            .encode(
-                x=alt.X("metric_date:T", title="Data"),
-                y=alt.Y("performance_avg:Q", title="Performance%"),
-            )
-            .properties(title="Performance% (średnia)"),
+            _line_chart_with_markers(
+                kpi_daily,
+                "performance_avg",
+                "Performance%",
+                "Performance% (średnia)",
+                markers_df,
+                show_markers,
+            ),
             use_container_width=True,
         )
     else:
         st.info("Brak danych KPI w wybranym zakresie.")
+
+    st.caption(
+        "Markery pokazują daty zamknięcia akcji. Kolor markera odzwierciedla "
+        "skuteczność scrap (jeśli policzona): zielony = effective, szary = neutral/unknown, "
+        "czerwony = ineffective."
+    )
+
+    st.subheader("Akcje w wybranym zakresie")
+    if not actions:
+        st.caption("Brak akcji w wybranym zakresie.")
+    else:
+        action_table: list[dict[str, Any]] = []
+        for action in sorted(actions, key=_actions_sort_key):
+            action_id = str(action.get("id") or "")
+            owner = action.get("owner_name") or champion_names.get(
+                action.get("owner_champion_id"), "—"
+            )
+            effect_row = effectiveness_map.get(action_id)
+            effect_label, _ = _effectiveness_style(effect_row)
+            title = action.get("title") or ""
+            short_id = _short_action_id(action_id)
+            action_label = f"{title} ({short_id})" if short_id else title
+            action_table.append(
+                {
+                    "Zamknięta": _format_action_date(action.get("closed_at")),
+                    "Akcja": action_label,
+                    "Kategoria": action.get("category") or "—",
+                    "Status": action.get("status") or "—",
+                    "Termin": _format_action_date(action.get("due_date")),
+                    "Owner": owner or "—",
+                    "Skuteczność": effect_label,
+                    "Δ scrap qty": _format_delta(
+                        _effectiveness_delta(effect_row, "scrap_qty")
+                    ),
+                    "Δ scrap PLN": _format_delta(
+                        _effectiveness_delta(effect_row, "scrap_cost")
+                        or _effectiveness_delta(effect_row, "scrap_pln")
+                    ),
+                    "Utworzono": _format_action_date(action.get("created_at")),
+                }
+            )
+        st.dataframe(action_table, use_container_width=True)
 
     st.subheader("Dzienny podgląd (audit)")
     if merged_daily.empty:
