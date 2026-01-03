@@ -159,6 +159,16 @@ CREATE TABLE IF NOT EXISTS category_rules (
   description TEXT,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS email_notifications_log (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  notification_type TEXT NOT NULL,
+  recipient_email TEXT NOT NULL,
+  action_id TEXT,
+  payload_json TEXT,
+  unique_key TEXT NOT NULL UNIQUE
+);
 """
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -482,6 +492,23 @@ def _migrate_to_v11(con: sqlite3.Connection) -> None:
     _set_user_version(con, 11)
 
 
+def _migrate_to_v12(con: sqlite3.Connection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS email_notifications_log (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL,
+          notification_type TEXT NOT NULL,
+          recipient_email TEXT NOT NULL,
+          action_id TEXT,
+          payload_json TEXT,
+          unique_key TEXT NOT NULL UNIQUE
+        );
+        """
+    )
+    _set_user_version(con, 12)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "action_categories"):
         return
@@ -607,6 +634,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v10(con)
     if current_version < 11:
         _migrate_to_v11(con)
+    if current_version < 12:
+        _migrate_to_v12(con)
     _seed_action_categories(con)
     _seed_category_rules(con)
     con.commit()

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 
 import pandas as pd
 import streamlit as st
 
-from action_tracking.data.repositories import GlobalSettingsRepository, SettingsRepository
+from action_tracking.data.repositories import (
+    ChampionRepository,
+    GlobalSettingsRepository,
+    NotificationRepository,
+    SettingsRepository,
+)
+from action_tracking.integrations.email_sender import smtp_config_status
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -14,6 +22,79 @@ def render(con: sqlite3.Connection) -> None:
 
     repo = SettingsRepository(con)
     rules_repo = GlobalSettingsRepository(con)
+    champion_repo = ChampionRepository(con)
+    notification_repo = NotificationRepository(con)
+
+    st.subheader("Powiadomienia email")
+    notifications_enabled = os.getenv("ACTION_TRACKING_EMAIL_NOTIFICATIONS_ENABLED")
+    enabled_flag = (notifications_enabled or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    st.checkbox(
+        "Włącz powiadomienia email (env)",
+        value=enabled_flag,
+        disabled=True,
+        help="Ustaw ACTION_TRACKING_EMAIL_NOTIFICATIONS_ENABLED w środowisku.",
+    )
+
+    status = smtp_config_status()
+    if status["configured"]:
+        smtp_config = status["config"] or {}
+        masked_user = (smtp_config.get("user") or "").replace("@", " [at] ")
+        masked_from = (smtp_config.get("from_address") or "").replace("@", " [at] ")
+        st.success("SMTP skonfigurowane.")
+        st.markdown(
+            "\n".join(
+                [
+                    f"- Host: {smtp_config.get('host')}",
+                    f"- Port: {smtp_config.get('port')}",
+                    f"- TLS: {smtp_config.get('tls')}",
+                    f"- User: {masked_user or 'brak'}",
+                    f"- From: {masked_from}",
+                ]
+            )
+        )
+    else:
+        missing = ", ".join(status["missing"])
+        st.warning(f"SMTP nie jest skonfigurowane. Braki: {missing}")
+
+    champions = champion_repo.list_champions()
+    missing_email = [ch for ch in champions if ch.get("active") and not ch.get("email")]
+    if missing_email:
+        st.info("Champions bez adresu email (pomijani w powiadomieniach):")
+        st.write([row.get("display_name") or row.get("id") for row in missing_email])
+
+    logs = notification_repo.list_recent(limit=50)
+    if logs:
+        def _payload_count(payload_json: str | None) -> int:
+            if not payload_json:
+                return 0
+            try:
+                payload = json.loads(payload_json)
+            except json.JSONDecodeError:
+                return 0
+            if isinstance(payload, dict):
+                if payload.get("action_ids"):
+                    return len(payload["action_ids"])
+                return int(payload.get("overdue_count") or 0) + int(payload.get("open_count") or 0)
+            return 0
+
+        for row in logs:
+            row["action_count"] = _payload_count(row.get("payload_json"))
+        logs_df = pd.DataFrame(logs)
+        logs_df = logs_df[
+            ["created_at", "notification_type", "recipient_email", "action_count"]
+        ].rename(
+            columns={
+                "created_at": "Data",
+                "notification_type": "Typ",
+                "recipient_email": "Odbiorca",
+                "action_count": "Liczba akcji",
+            }
+        )
+        st.dataframe(logs_df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("Brak logów powiadomień email.")
+
+    st.divider()
 
     st.subheader("Kategorie akcji")
     categories = repo.list_action_categories(active_only=False)
