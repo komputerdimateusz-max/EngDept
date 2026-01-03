@@ -77,11 +77,12 @@ def _list_changelog_generic(
     """
     Uniwersalny reader changelogów.
 
-    HOTFIX (kontrakt UI):
-      - UI oczekuje entry["changes_json"] (string JSON), np. w projects.py:
-          changes = json.loads(entry["changes_json"])
-      - dlatego ZAWSZE zwracamy klucz "changes_json" (nawet gdy DB ma payload_json lub inne kolumny).
+    Kontrakt UI (pages/champions.py, pages/projects.py, pages/actions.py):
+      - entry["event_at"]
+      - entry["event_type"]
+      - entry["changes_json"]  (JSON string)
 
+    Dlatego ZAWSZE zwracamy te klucze, nawet jeśli DB ma inne nazwy kolumn.
     Jeśli tabela/kolumny nie istnieją -> [] (bez crasha UI).
     """
     if not table_candidates:
@@ -104,14 +105,19 @@ def _list_changelog_generic(
     if not cols:
         return []
 
-    # czas
+    # wykrywanie kolumn: czas / typ zdarzenia / entity_id
     time_col: str | None = None
-    for c in ("changed_at", "created_at", "timestamp", "ts", "event_at"):
+    for c in ("event_at", "changed_at", "created_at", "timestamp", "ts"):
         if c in cols:
             time_col = c
             break
 
-    # entity id
+    event_type_col: str | None = None
+    for c in ("event_type", "change_type", "action", "event", "type", "entity_type"):
+        if c in cols:
+            event_type_col = c
+            break
+
     entity_col: str | None = None
     for c in ("entity_id", "object_id", "record_id", "champion_id", "project_id", "action_id"):
         if c in cols:
@@ -125,20 +131,24 @@ def _list_changelog_generic(
         "champion_id",
         "project_id",
         "action_id",
+        "event_type",
         "change_type",
         "field",
         "old_value",
         "new_value",
         "summary",
         "message",
-        "changes_json",   # <- jeśli istnieje, super
-        "payload_json",   # <- fallback
+        "changes_json",
+        "payload_json",
         "user_email",
         "changed_by",
         "created_by",
         "source",
+        "event_at",
         "changed_at",
         "created_at",
+        "timestamp",
+        "ts",
     ]
     selected_cols = [c for c in preferred if c in cols]
     select_sql = ", ".join(selected_cols) if selected_cols else "*"
@@ -164,29 +174,57 @@ def _list_changelog_generic(
     except sqlite3.Error:
         return []
 
+    def _ensure_str_json(value: Any) -> str:
+        if value is None:
+            return "{}"
+        if isinstance(value, str):
+            s = value.strip()
+            if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+                return s
+            try:
+                return json.dumps({"message": s}, ensure_ascii=False)
+            except Exception:
+                return "{}"
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return "{}"
+
     # --- NORMALIZACJA POD UI ---
     for r in rows:
-        # changed_at fallback
-        if "changed_at" not in r or r.get("changed_at") in (None, ""):
-            if "created_at" in r and r.get("created_at") not in (None, ""):
-                r["changed_at"] = r.get("created_at")
+        # event_at MUST exist
+        if "event_at" not in r or r.get("event_at") in (None, ""):
+            if r.get("changed_at") not in (None, ""):
+                r["event_at"] = r.get("changed_at")
+            elif r.get("created_at") not in (None, ""):
+                r["event_at"] = r.get("created_at")
+            elif r.get("timestamp") not in (None, ""):
+                r["event_at"] = r.get("timestamp")
+            elif r.get("ts") not in (None, ""):
+                r["event_at"] = r.get("ts")
             else:
-                r["changed_at"] = None
+                r["event_at"] = None
+
+        # event_type MUST exist
+        if "event_type" not in r or r.get("event_type") in (None, ""):
+            if r.get("change_type") not in (None, ""):
+                r["event_type"] = r.get("change_type")
+            elif r.get("entity_type") not in (None, ""):
+                r["event_type"] = r.get("entity_type")
+            elif r.get("field") not in (None, ""):
+                r["event_type"] = f"field_change:{r.get('field')}"
+            elif r.get("summary") not in (None, ""):
+                r["event_type"] = "summary"
+            elif r.get("message") not in (None, ""):
+                r["event_type"] = "message"
+            else:
+                r["event_type"] = "change"
 
         # changes_json MUST exist
         if "changes_json" not in r or r.get("changes_json") in (None, ""):
-            # prefer payload_json jeśli jest
-            if "payload_json" in r and r.get("payload_json"):
-                pj = r.get("payload_json")
-                if isinstance(pj, str):
-                    r["changes_json"] = pj
-                else:
-                    try:
-                        r["changes_json"] = json.dumps(pj, ensure_ascii=False)
-                    except Exception:
-                        r["changes_json"] = "{}"
+            if r.get("payload_json") not in (None, ""):
+                r["changes_json"] = _ensure_str_json(r.get("payload_json"))
             else:
-                # zbuduj minimalny JSON z dostępnych pól
                 minimal: dict[str, Any] = {}
                 if r.get("field") is not None:
                     minimal["field"] = r.get("field")
@@ -194,24 +232,26 @@ def _list_changelog_generic(
                     minimal["old_value"] = r.get("old_value")
                 if "new_value" in r:
                     minimal["new_value"] = r.get("new_value")
-                if r.get("message"):
-                    minimal["message"] = r.get("message")
                 if r.get("summary"):
                     minimal["summary"] = r.get("summary")
+                if r.get("message"):
+                    minimal["message"] = r.get("message")
+                r["changes_json"] = _ensure_str_json(minimal)
 
-                try:
-                    r["changes_json"] = json.dumps(minimal or {}, ensure_ascii=False)
-                except Exception:
-                    r["changes_json"] = "{}"
+        # aliasy kompatybilności (czasem UI/legacy używa tych nazw)
+        if "changed_at" not in r or r.get("changed_at") in (None, ""):
+            r["changed_at"] = r.get("event_at")
+        if "change_type" not in r or r.get("change_type") in (None, ""):
+            r["change_type"] = r.get("event_type")
 
-        # (opcjonalnie) pre-parse dla UI/debug
+        # pre-parse (przydatne do debug / ewentualnie UI)
         try:
             r["changes"] = json.loads(r["changes_json"]) if r.get("changes_json") else {}
         except Exception:
             r["changes"] = {}
 
-        # zachowaj kompatybilność ze starszym kodem, który używał "payload"
-        if "payload" not in r and "payload_json" in r and r.get("payload_json"):
+        # legacy "payload"
+        if "payload" not in r and r.get("payload_json"):
             try:
                 r["payload"] = json.loads(r["payload_json"])
             except Exception:
@@ -629,7 +669,6 @@ class ActionRepository:
 
     # =====================================================
     # HOTFIX: REQUIRED BY projects.py (Project outcome)
-    # Fixes: AttributeError: 'ActionRepository' object has no attribute 'list_actions_for_project_outcome'
     # =====================================================
     def list_actions_for_project_outcome(
         self,
