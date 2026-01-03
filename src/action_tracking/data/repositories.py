@@ -475,6 +475,88 @@ class ActionRepository:
         cur = self.con.execute(query, params)
         return [dict(r) for r in cur.fetchall()]
 
+    # =====================================================
+    # HOTFIX: REQUIRED BY projects.py (Project outcome)
+    # Fixes: AttributeError: 'ActionRepository' object has no attribute 'list_actions_for_project_outcome'
+    # =====================================================
+    def list_actions_for_project_outcome(
+        self,
+        project_id: str,
+        date_from: date | str | None = None,
+        date_to: date | str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Returns actions for a given project, scoped to a date window.
+        We include rows when ANY of the relevant dates is within [date_from, date_to]:
+          - created_at OR closed_at OR due_date
+        This is used by Projects page to compute outcomes/summary.
+        """
+        if not project_id:
+            return []
+        if not _table_exists(self.con, "actions"):
+            return []
+
+        def _d(v: date | str | None) -> str | None:
+            if v is None:
+                return None
+            return v.isoformat() if isinstance(v, date) else str(v)
+
+        df = _d(date_from)
+        dt = _d(date_to)
+
+        query = """
+            SELECT a.id,
+                   a.title,
+                   a.description,
+                   a.category,
+                   a.status,
+                   a.created_at,
+                   a.due_date,
+                   a.closed_at,
+                   a.owner_champion_id,
+                   TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS owner_name,
+                   a.impact_type,
+                   a.impact_value,
+                   a.impact_aspects,
+                   a.manual_savings_amount,
+                   a.manual_savings_currency,
+                   a.manual_savings_note
+            FROM actions a
+            LEFT JOIN champions ch ON ch.id = a.owner_champion_id
+            WHERE a.project_id = ?
+              AND a.is_draft = 0
+        """
+        params: list[Any] = [project_id]
+
+        # If no dates provided -> return all project actions (still filtered by is_draft=0).
+        if df or dt:
+            # default open bounds if only one side provided
+            df = df or "0001-01-01"
+            dt = dt or "9999-12-31"
+            query += """
+              AND (
+                    (a.created_at IS NOT NULL AND date(a.created_at) BETWEEN date(?) AND date(?))
+                 OR (a.closed_at  IS NOT NULL AND date(a.closed_at)  BETWEEN date(?) AND date(?))
+                 OR (a.due_date   IS NOT NULL AND date(a.due_date)   BETWEEN date(?) AND date(?))
+              )
+            """
+            params.extend([df, dt, df, dt, df, dt])
+
+        query += " ORDER BY a.closed_at DESC, a.created_at DESC"
+
+        cur = self.con.execute(query, params)
+        rows = [dict(r) for r in cur.fetchall()]
+
+        # Ensure keys expected by UI exist (even if NULL in DB)
+        for r in rows:
+            r.setdefault("owner_name", None)
+            r.setdefault("impact_aspects", None)
+            r.setdefault("manual_savings_amount", None)
+            r.setdefault("manual_savings_currency", None)
+            r.setdefault("manual_savings_note", None)
+
+        return rows
+
 
 # =====================================================
 # EFFECTIVENESS
