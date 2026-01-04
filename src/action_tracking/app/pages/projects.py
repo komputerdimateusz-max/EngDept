@@ -31,6 +31,14 @@ from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_LABELS,
     default_overlay_targets,
 )
+from action_tracking.services.production_outcome import (
+    apply_weekend_filter,
+    compute_baseline_after_metrics,
+    format_metric_value,
+    load_daily_frames,
+    metric_delta_label,
+    scrap_delta_badge,
+)
 
 FIELD_LABELS = {
     "name": "Nazwa projektu",
@@ -84,94 +92,6 @@ def _format_changes(
         parts.append(f"{label}: {_format_value(field, value, champion_names)}")
     return "; ".join(parts) if parts else "Brak danych."
 
-
-def _window_bounds(
-    date_from: date,
-    date_to: date,
-) -> tuple[date, date, date, date, bool]:
-    total_days = (date_to - date_from).days + 1
-    if total_days < 28:
-        mid = date_from + timedelta(days=(total_days - 1) // 2)
-        baseline_to = mid
-        after_from = mid + timedelta(days=1)
-        return date_from, baseline_to, after_from, date_to, True
-    return date_from, date_from + timedelta(days=13), date_to - timedelta(days=13), date_to, False
-
-
-def _format_metric_value(value: float | None, fmt: str) -> str:
-    if value is None:
-        return "—"
-    return fmt.format(value)
-
-
-def _metric_delta_label(
-    baseline: float | None,
-    after: float | None,
-    fmt: str,
-) -> str:
-    if baseline is None or after is None:
-        return "—"
-    delta = after - baseline
-    if baseline == 0:
-        pct_label = "n/a"
-    else:
-        pct_label = f"{delta / baseline:+.1%}"
-    return f"{fmt.format(delta)} ({pct_label})"
-
-
-def _scrap_delta_badge(
-    baseline: float | None,
-    after: float | None,
-    unit_fmt: str,
-) -> str:
-    if baseline is None or after is None:
-        text = "—"
-        color = "#616161"
-        return _scrap_delta_badge_html(text, color)
-    delta = after - baseline
-    if delta == 0:
-        text = "→ 0"
-        color = "#616161"
-        return _scrap_delta_badge_html(text, color)
-    if delta < 0:
-        arrow = "↓"
-        sign = "-"
-        color = "#2e7d32"
-    else:
-        arrow = "↑"
-        sign = "+"
-        color = "#c62828"
-    if baseline == 0:
-        pct_label = "n/a"
-    else:
-        pct_label = f"{delta / baseline:+.1%}"
-    value_label = f"{sign}{unit_fmt.format(abs(delta))}"
-    text = f"{arrow} {value_label} ({pct_label})"
-    return _scrap_delta_badge_html(text, color)
-
-
-def _scrap_delta_badge_html(text: str, color: str) -> str:
-    return (
-        "<span style=\""
-        "padding: 0.15rem 0.5rem; "
-        "border-radius: 999px; "
-        "display: inline-block; "
-        "font-size: 0.9rem; "
-        f"color: {color}; "
-        f"border: 1px solid {color}; "
-        "\">"
-        f"{text}"
-        "</span>"
-    )
-
-
-def _mean_or_none(series: pd.Series | None) -> float | None:
-    if series is None or series.empty:
-        return None
-    value = series.mean()
-    if pd.isna(value):
-        return None
-    return float(value)
 
 
 def _format_action_date(value: Any) -> str:
@@ -306,33 +226,6 @@ def _project_matches_work_centers(
     return any(normalize_key(center) in work_center_keys for center in centers)
 
 
-def _weighted_or_mean(values: pd.Series, weights: pd.Series | None) -> float | None:
-    if values.empty:
-        return None
-    if weights is None or weights.empty:
-        return _mean_or_none(values)
-    weights = weights.fillna(0)
-    valid_weights = weights.where(values.notna(), 0)
-    if valid_weights.sum() > 0:
-        weighted_values = values.fillna(0) * weights
-        return float(weighted_values.sum() / valid_weights.sum())
-    return _mean_or_none(values)
-
-
-def _as_percent_series(series: pd.Series) -> tuple[pd.Series, str]:
-    if series.empty:
-        return series, "unknown"
-    numeric = series.dropna()
-    if numeric.empty:
-        return series, "unknown"
-    median_value = float(numeric.median())
-    if median_value <= 1.5:
-        scaled = series * 100
-        if not scaled.dropna().empty and float(scaled.max()) > 1000:
-            return series, "percent"
-        return scaled, "fraction"
-    return series, "percent"
-
 
 def _build_work_center_map(work_centers: list[str]) -> dict[str, list[str]]:
     mapping: dict[str, list[str]] = {}
@@ -359,24 +252,29 @@ def _resolve_work_center_default(
     return options[0] if options else ""
 
 
-def _apply_weekend_filter(
-    df: pd.DataFrame,
-    remove_sat: bool,
-    remove_sun: bool,
-) -> pd.DataFrame:
-    if df.empty or "metric_date" not in df.columns:
-        return df
-    temp = df.copy()
-    if not pd.api.types.is_datetime64_any_dtype(temp["metric_date"]):
-        temp["metric_date"] = pd.to_datetime(temp["metric_date"], errors="coerce")
-    temp = temp.dropna(subset=["metric_date"])
-    weekday = temp["metric_date"].dt.weekday
-    mask = pd.Series(True, index=temp.index)
-    if remove_sat:
-        mask &= weekday != 5
-    if remove_sun:
-        mask &= weekday != 6
-    return temp.loc[mask]
+def _collect_portfolio_work_centers(
+    projects: list[dict[str, Any]],
+    include_related: bool,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    work_centers: list[str] = []
+    missing_wc_projects: list[dict[str, Any]] = []
+    for project in projects:
+        primary_wc = project.get("work_center")
+        related_wc = project.get("related_work_center") if include_related else None
+        centers = parse_work_centers(primary_wc, related_wc)
+        if not centers:
+            missing_wc_projects.append(project)
+            continue
+        work_centers.extend(centers)
+    deduped = []
+    seen = set()
+    for center in work_centers:
+        normalized = normalize_key(center)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(center)
+    return deduped, missing_wc_projects
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -407,7 +305,6 @@ def render(con: sqlite3.Connection) -> None:
 
     production_stats = production_repo.list_production_work_centers_with_stats()
     production_stats_by_norm = {row["wc_norm"]: row for row in production_stats if row.get("wc_norm")}
-    wc_inbox_repo.upsert_from_production(production_stats, project_wc_norms)
 
     st.subheader("Outcome projektu (produkcja)")
     outcome_available = True
@@ -419,16 +316,28 @@ def render(con: sqlite3.Connection) -> None:
         today = date.today()
         default_from = today - timedelta(days=90)
 
+        mode = st.radio("Widok", ["Projekt", "Champion"], horizontal=True)
         selector_col1, selector_col2, selector_col3, selector_col4 = st.columns(4)
         project_ids = [p["id"] for p in projects]
-        selected_project_id = selector_col1.selectbox(
-            "Projekt",
-            project_ids,
-            format_func=lambda pid: projects_by_id[pid].get("name", pid),
-        )
-        if selected_project_id not in projects_by_id and project_ids:
-            selected_project_id = project_ids[0]
-            st.info("Wybrany projekt nie istnieje — pokazuję pierwszy dostępny.")
+        champion_ids = [c["id"] for c in champions]
+
+        selected_project_id = ""
+        selected_champion_id = ""
+        if mode == "Projekt":
+            selected_project_id = selector_col1.selectbox(
+                "Projekt",
+                project_ids,
+                format_func=lambda pid: projects_by_id[pid].get("name", pid),
+            )
+            if selected_project_id not in projects_by_id and project_ids:
+                selected_project_id = project_ids[0]
+                st.info("Wybrany projekt nie istnieje — pokazuję pierwszy dostępny.")
+        else:
+            selected_champion_id = selector_col1.selectbox(
+                "Champion",
+                champion_ids,
+                format_func=lambda cid: champion_names.get(cid, cid),
+            )
         selected_from = selector_col2.date_input("Data od", value=default_from)
         selected_to = selector_col3.date_input("Data do", value=today)
         include_related = selector_col4.checkbox("Uwzględnij powiązane Work Center", value=True)
@@ -438,94 +347,96 @@ def render(con: sqlite3.Connection) -> None:
             st.error("Zakres dat jest nieprawidłowy (Data od > Data do).")
             outcome_available = False
 
-    if outcome_available:
-        selected_project = projects_by_id.get(selected_project_id, {})
-        primary_wc = selected_project.get("work_center")
-        if not (primary_wc and str(primary_wc).strip()):
-            st.error("Projekt nie ma przypisanego Work Center.")
-            outcome_available = False
+    selected_projects: list[dict[str, Any]] = []
+    work_centers: list[str] = []
+    missing_wc_projects: list[dict[str, Any]] = []
 
     if outcome_available:
-        related_wc = selected_project.get("related_work_center") if include_related else None
-        work_centers = parse_work_centers(primary_wc, related_wc)
-        if not work_centers:
-            st.error("Nie znaleziono Work Center dla projektu.")
-            outcome_available = False
+        if mode == "Projekt":
+            selected_project = projects_by_id.get(selected_project_id, {})
+            selected_projects = [selected_project] if selected_project else []
+            primary_wc = selected_project.get("work_center")
+            if not (primary_wc and str(primary_wc).strip()):
+                st.error("Projekt nie ma przypisanego Work Center.")
+                outcome_available = False
+            else:
+                related_wc = selected_project.get("related_work_center") if include_related else None
+                work_centers = parse_work_centers(primary_wc, related_wc)
+                if not work_centers:
+                    st.error("Nie znaleziono Work Center dla projektu.")
+                    outcome_available = False
+        else:
+            if not champion_ids:
+                st.info("Brak championów do analizy.")
+                outcome_available = False
+            else:
+                selected_projects = [
+                    project for project in projects if project.get("owner_champion_id") == selected_champion_id
+                ]
+                if not selected_projects:
+                    st.info("Wybrany champion nie ma przypisanych projektów.")
+                    outcome_available = False
+                else:
+                    work_centers, missing_wc_projects = _collect_portfolio_work_centers(
+                        selected_projects,
+                        include_related,
+                    )
+                    if missing_wc_projects:
+                        missing_names = ", ".join(
+                            sorted({project.get("name") or project.get("id") for project in missing_wc_projects})
+                        )
+                        st.warning(f"Pomijam projekty bez Work Center: {missing_names}.")
+                    if not work_centers:
+                        st.info("Brak Work Center do agregacji dla portfela.")
+                        outcome_available = False
 
     if outcome_available:
-        scrap_rows_all = production_repo.list_scrap_daily(
+        if mode == "Champion":
+            summary_rows = [
+                {
+                    "Projekt": project.get("name"),
+                    "Work center": project.get("work_center") or "—",
+                    "Powiązane WC": project.get("related_work_center") or "—",
+                    "Status": project.get("status") or "—",
+                }
+                for project in selected_projects
+            ]
+            st.caption(f"Liczba projektów w portfelu: {len(selected_projects)}")
+            st.dataframe(summary_rows, use_container_width=True)
+
+        scrap_daily, kpi_daily, merged_daily = load_daily_frames(
+            production_repo,
             work_centers,
             selected_from,
             selected_to,
-            currency=None,
+            currency="PLN",
         )
-        kpi_rows = production_repo.list_kpi_daily(work_centers, selected_from, selected_to)
 
-        if not scrap_rows_all and not kpi_rows:
+        if scrap_daily.empty and kpi_daily.empty:
             st.info("Brak danych produkcyjnych dla wybranego zakresu.")
             outcome_available = False
 
     if outcome_available:
-        non_pln_currencies = {
-            row.get("scrap_cost_currency")
-            for row in scrap_rows_all
-            if row.get("scrap_cost_currency") and row.get("scrap_cost_currency") != "PLN"
-        }
+        non_pln_currencies = scrap_daily.attrs.get("non_pln_currencies", [])
         if non_pln_currencies:
             st.info(
                 "Dostępne są dane scrap w innych walutach (pominięto): "
                 + ", ".join(sorted(non_pln_currencies))
             )
 
-        scrap_rows = [row for row in scrap_rows_all if row.get("scrap_cost_currency") == "PLN"]
+        oee_scale = kpi_daily.attrs.get("oee_scale", "unknown")
+        perf_scale = kpi_daily.attrs.get("perf_scale", "unknown")
 
-        scrap_df = pd.DataFrame(scrap_rows)
-        if not scrap_df.empty:
-            scrap_df["metric_date"] = pd.to_datetime(scrap_df["metric_date"], errors="coerce")
-            scrap_df = scrap_df.dropna(subset=["metric_date"])
-            scrap_daily = (
-                scrap_df.groupby("metric_date", as_index=False)
-                .agg(scrap_qty_sum=("scrap_qty", "sum"), scrap_pln_sum=("scrap_cost_amount", "sum"))
-                .sort_values("metric_date")
-            )
+        if mode == "Champion":
+            action_project_ids = sorted({project.get("id") for project in selected_projects if project.get("id")})
         else:
-            scrap_daily = pd.DataFrame(columns=["metric_date", "scrap_qty_sum", "scrap_pln_sum"])
-
-        kpi_df = pd.DataFrame(kpi_rows)
-        if not kpi_df.empty:
-            kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"], errors="coerce")
-            kpi_df = kpi_df.dropna(subset=["metric_date"])
-            kpi_daily = (
-                kpi_df.groupby("metric_date")
-                .apply(
-                    lambda group: pd.Series(
-                        {
-                            "oee_avg": _weighted_or_mean(group["oee_pct"], group.get("worktime_min")),
-                            "performance_avg": _weighted_or_mean(
-                                group["performance_pct"], group.get("worktime_min")
-                            ),
-                        }
-                    )
+            action_project_ids = [selected_project_id]
+            if include_related:
+                work_center_keys = {normalize_key(center) for center in work_centers if center}
+                action_project_ids = (
+                    [p["id"] for p in projects if _project_matches_work_centers(p, work_center_keys)]
+                    or [selected_project_id]
                 )
-                .reset_index()
-                .sort_values("metric_date")
-            )
-        else:
-            kpi_daily = pd.DataFrame(columns=["metric_date", "oee_avg", "performance_avg"])
-
-        oee_scale = "unknown"
-        perf_scale = "unknown"
-        if not kpi_daily.empty:
-            kpi_daily["oee_avg"], oee_scale = _as_percent_series(kpi_daily["oee_avg"])
-            kpi_daily["performance_avg"], perf_scale = _as_percent_series(kpi_daily["performance_avg"])
-
-        action_project_ids = [selected_project_id]
-        if include_related:
-            work_center_keys = {normalize_key(center) for center in work_centers if center}
-            action_project_ids = (
-                [p["id"] for p in projects if _project_matches_work_centers(p, work_center_keys)]
-                or [selected_project_id]
-            )
 
         actions_map: dict[str, dict[str, Any]] = {}
         for project_id in action_project_ids:
@@ -571,8 +482,6 @@ def render(con: sqlite3.Connection) -> None:
 
         markers_df = pd.DataFrame(closed_markers)
 
-        merged_daily = pd.merge(scrap_daily, kpi_daily, on="metric_date", how="outer").sort_values("metric_date")
-
         if "metric_date" not in merged_daily.columns:
             st.info("Brak danych produkcyjnych dla wybranego zakresu.")
             outcome_available = False
@@ -596,60 +505,56 @@ def render(con: sqlite3.Connection) -> None:
         remove_saturdays = filter_cols[1].checkbox("Usuń soboty", value=False, key="remove_saturdays")
         remove_sundays = filter_cols[2].checkbox("Usuń niedziele", value=False, key="remove_sundays")
 
-        scrap_daily_f = _apply_weekend_filter(scrap_daily, remove_saturdays, remove_sundays)
-        kpi_daily_f = _apply_weekend_filter(kpi_daily, remove_saturdays, remove_sundays)
-        merged_daily_f = _apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
+        scrap_daily_f = apply_weekend_filter(scrap_daily, remove_saturdays, remove_sundays)
+        kpi_daily_f = apply_weekend_filter(kpi_daily, remove_saturdays, remove_sundays)
+        merged_daily_f = apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
 
         if merged_daily_f.empty:
             st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
             outcome_available = False
 
     if outcome_available:
-        baseline_from, baseline_to, after_from, after_to, used_halves = _window_bounds(selected_from, selected_to)
-        if used_halves:
+        metrics = compute_baseline_after_metrics(merged_daily_f, selected_from, selected_to)
+        if metrics.get("used_halves"):
             st.warning("Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after).")
 
-        baseline_mask = (merged_daily_f["metric_date"].dt.date >= baseline_from) & (
-            merged_daily_f["metric_date"].dt.date <= baseline_to
-        )
-        after_mask = (merged_daily_f["metric_date"].dt.date >= after_from) & (
-            merged_daily_f["metric_date"].dt.date <= after_to
-        )
-
-        baseline_slice = merged_daily_f.loc[baseline_mask]
-        after_slice = merged_daily_f.loc[after_mask]
-
-        baseline_scrap_qty = _mean_or_none(baseline_slice.get("scrap_qty_sum"))
-        after_scrap_qty = _mean_or_none(after_slice.get("scrap_qty_sum"))
-        baseline_scrap_pln = _mean_or_none(baseline_slice.get("scrap_pln_sum"))
-        after_scrap_pln = _mean_or_none(after_slice.get("scrap_pln_sum"))
-        baseline_oee = _mean_or_none(baseline_slice.get("oee_avg"))
-        after_oee = _mean_or_none(after_slice.get("oee_avg"))
-        baseline_perf = _mean_or_none(baseline_slice.get("performance_avg"))
-        after_perf = _mean_or_none(after_slice.get("performance_avg"))
+        baseline_scrap_qty = metrics.get("baseline_scrap_qty")
+        after_scrap_qty = metrics.get("after_scrap_qty")
+        baseline_scrap_pln = metrics.get("baseline_scrap_pln")
+        after_scrap_pln = metrics.get("after_scrap_pln")
+        baseline_oee = metrics.get("baseline_oee")
+        after_oee = metrics.get("after_oee")
+        baseline_perf = metrics.get("baseline_perf")
+        after_perf = metrics.get("after_perf")
 
         kpi_cols = st.columns(4)
-        kpi_cols[0].metric("Śr. scrap qty/dzień", _format_metric_value(after_scrap_qty, "{:.2f}"))
-        kpi_cols[0].markdown(_scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"), unsafe_allow_html=True)
-        kpi_cols[0].caption(f"Baseline: {_format_metric_value(baseline_scrap_qty, '{:.2f}')}")
+        kpi_cols[0].metric("Śr. scrap qty/dzień", format_metric_value(after_scrap_qty, "{:.2f}"))
+        kpi_cols[0].markdown(
+            scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"),
+            unsafe_allow_html=True,
+        )
+        kpi_cols[0].caption(f"Baseline: {format_metric_value(baseline_scrap_qty, '{:.2f}')}")
 
-        kpi_cols[1].metric("Śr. scrap PLN/dzień", _format_metric_value(after_scrap_pln, "{:.2f}"))
-        kpi_cols[1].markdown(_scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"), unsafe_allow_html=True)
-        kpi_cols[1].caption(f"Baseline: {_format_metric_value(baseline_scrap_pln, '{:.2f}')}")
+        kpi_cols[1].metric("Śr. scrap PLN/dzień", format_metric_value(after_scrap_pln, "{:.2f}"))
+        kpi_cols[1].markdown(
+            scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"),
+            unsafe_allow_html=True,
+        )
+        kpi_cols[1].caption(f"Baseline: {format_metric_value(baseline_scrap_pln, '{:.2f}')}")
 
         kpi_cols[2].metric(
             "Śr. OEE%",
-            _format_metric_value(after_oee, "{:.1f}%"),
-            delta=_metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
+            format_metric_value(after_oee, "{:.1f}%"),
+            delta=metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
         )
-        kpi_cols[2].caption(f"Baseline: {_format_metric_value(baseline_oee, '{:.1f}%')}")
+        kpi_cols[2].caption(f"Baseline: {format_metric_value(baseline_oee, '{:.1f}%')}")
 
         kpi_cols[3].metric(
             "Śr. Performance%",
-            _format_metric_value(after_perf, "{:.1f}%"),
-            delta=_metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
+            format_metric_value(after_perf, "{:.1f}%"),
+            delta=metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
         )
-        kpi_cols[3].caption(f"Baseline: {_format_metric_value(baseline_perf, '{:.1f}%')}")
+        kpi_cols[3].caption(f"Baseline: {format_metric_value(baseline_perf, '{:.1f}%')}")
 
         st.caption("Dla scrap spadek = poprawa.")
         if oee_scale != "unknown" or perf_scale != "unknown":
