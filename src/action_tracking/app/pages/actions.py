@@ -22,6 +22,7 @@ from action_tracking.services.effectiveness import (
     parse_date,
     parse_work_centers,
 )
+from action_tracking.services.kpi_delta import compute_kpi_pp_delta, compute_scrap_delta
 from action_tracking.services.impact_aspects import (
     IMPACT_ASPECT_LABELS,
     IMPACT_ASPECTS,
@@ -317,7 +318,8 @@ def render(con: sqlite3.Connection) -> None:
     def _format_effectiveness(action: dict[str, Any]) -> tuple[str, str]:
         category = action.get("category") or ""
         rule = _resolve_rule(category)
-        if rule.get("effectiveness_model") == "NONE" or action.get("status") != "done":
+        effectiveness_model = rule.get("effectiveness_model")
+        if effectiveness_model == "NONE" or action.get("status") != "done":
             return "—", "—"
         if not action.get("closed_at"):
             return "—", "—"
@@ -334,11 +336,20 @@ def render(con: sqlite3.Connection) -> None:
             "unknown": "❔ unknown",
         }
         label = label_map.get(classification, "—")
-        pct_change = row.get("pct_change")
-        pct_label = "—"
-        if isinstance(pct_change, (int, float)):
-            pct_label = f"{pct_change:.0%}"
-        return label, pct_label
+        baseline_avg = row.get("baseline_avg")
+        after_avg = row.get("after_avg")
+        delta_label = "—"
+        if effectiveness_model == "SCRAP":
+            delta = compute_scrap_delta(after_avg, baseline_avg)
+            delta_pct = delta.get("delta_pct")
+            if isinstance(delta_pct, (int, float)):
+                delta_label = f"{delta_pct:+.0f}%"
+        elif effectiveness_model in {"OEE", "PERFORMANCE"}:
+            delta = compute_kpi_pp_delta(after_avg, baseline_avg)
+            delta_pp = delta.get("delta_pp")
+            if isinstance(delta_pp, (int, float)):
+                delta_label = f"{delta_pp:+.1f} pp"
+        return label, delta_label
 
     table_rows: list[dict[str, Any]] = []
     for row in rows:
