@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 import sqlite3
 from typing import Any
 
 import streamlit as st
 
-from action_tracking.data.repositories import ChampionRepository, ProjectRepository
+from action_tracking.data.repositories import (
+    ActionRepository,
+    ChampionRepository,
+    ProjectRepository,
+)
 
 
 FIELD_LABELS = {
@@ -44,33 +48,151 @@ def _format_changes(event_type: str, changes: dict[str, Any]) -> str:
     return "; ".join(parts) if parts else "Brak danych."
 
 
-def _format_assigned_projects(assigned_names: list[str], max_names: int = 4) -> str:
-    if not assigned_names:
-        return "—"
-    total = len(assigned_names)
-    shown = assigned_names[:max_names]
-    label = "; ".join(shown)
-    if total <= max_names:
-        return f"{total}: {label}"
-    return f"{total}: {label} +{total - max_names}"
+def _format_project_type_counts(type_counts: dict[str, int]) -> str:
+    return " | ".join(
+        [
+            f"SL: {type_counts.get('SL', 0)}",
+            f"RL: {type_counts.get('RL', 0)}",
+            f"FL: {type_counts.get('FL', 0)}",
+            f"Other: {type_counts.get('Other', 0)}",
+        ]
+    )
+
+
+def _parse_date(value: Any) -> date | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        try:
+            return datetime.fromisoformat(str(value)).date()
+        except ValueError:
+            return None
 
 
 def render(con: sqlite3.Connection) -> None:
-    st.header("Champions")
-
     repo = ChampionRepository(con)
     project_repo = ProjectRepository(con)
+    action_repo = ActionRepository(con)
 
     projects = project_repo.list_projects()
-    project_names = {project["id"]: project["name"] for project in projects}
+    project_names = {project["id"]: project.get("name") or project["id"] for project in projects}
+    projects_by_id = {project["id"]: project for project in projects}
 
     champions = repo.list_champions()
     champions_by_id = {champion["id"]: champion for champion in champions}
 
+    selected_focus = st.selectbox(
+        "Wybierz championa",
+        ["(brak)"] + [champion["id"] for champion in champions],
+        index=0,
+        format_func=lambda cid: "(brak)"
+        if cid == "(brak)"
+        else champions_by_id[cid]["display_name"],
+    )
+
+    st.header("Champions")
+
+    if selected_focus and selected_focus != "(brak)":
+        assigned_ids = repo.get_assigned_projects_with_fallback(selected_focus)
+        champion_projects = [
+            projects_by_id[pid] for pid in assigned_ids if pid in projects_by_id
+        ]
+
+        st.subheader("Projekty championa")
+        project_rows = []
+        for project in champion_projects:
+            project_rows.append(
+                {
+                    "Projekt": project.get("name") or project.get("id") or "—",
+                    "Typ": project.get("type") or "—",
+                    "Status": project.get("status") or "—",
+                    "Work Center": project.get("work_center") or "—",
+                }
+            )
+        if project_rows:
+            st.dataframe(project_rows, use_container_width=True)
+        else:
+            st.caption("Brak przypisanych projektów.")
+
+        st.subheader("Akcje otwarte / opóźnione")
+        all_actions = action_repo.list_actions(
+            champion_id=selected_focus,
+            is_draft=False,
+        )
+        open_actions = [
+            action
+            for action in all_actions
+            if (action.get("status") or "").lower() not in {"done", "cancelled"}
+        ]
+        today = date.today()
+
+        def _open_sort_key(action: dict[str, Any]) -> tuple[int, date]:
+            due = _parse_date(action.get("due_date"))
+            is_overdue = bool(due and due < today)
+            created = _parse_date(action.get("created_at")) or date.max
+            return (0 if is_overdue else 1, created)
+
+        open_actions_sorted = sorted(open_actions, key=_open_sort_key)
+        open_rows = []
+        for action in open_actions_sorted:
+            project_name = action.get("project_name") or project_names.get(
+                action.get("project_id"), "—"
+            )
+            open_rows.append(
+                {
+                    "Tytuł": action.get("title") or "—",
+                    "Projekt": project_name,
+                    "Status": action.get("status") or "—",
+                    "Termin": action.get("due_date") or "—",
+                    "Data utworzenia": action.get("created_at") or "—",
+                }
+            )
+        if open_rows:
+            st.dataframe(open_rows, use_container_width=True)
+        else:
+            st.caption("Brak otwartych akcji.")
+
+        st.subheader("Akcje zamknięte")
+        with st.expander("Akcje zamknięte", expanded=False):
+            closed_actions = [
+                action
+                for action in all_actions
+                if (action.get("status") or "").lower() in {"done", "cancelled"}
+            ]
+            closed_rows = []
+            for action in closed_actions:
+                project_name = action.get("project_name") or project_names.get(
+                    action.get("project_id"), "—"
+                )
+                closed_rows.append(
+                    {
+                        "Tytuł": action.get("title") or "—",
+                        "Projekt": project_name,
+                        "Status": action.get("status") or "—",
+                        "Termin": action.get("due_date") or "—",
+                        "Data zamknięcia": action.get("closed_at") or "—",
+                    }
+                )
+            if closed_rows:
+                st.dataframe(closed_rows, use_container_width=True)
+            else:
+                st.caption("Brak zamkniętych akcji.")
+
     table_rows = []
     for champion in champions:
         assigned_ids = repo.get_assigned_projects_with_fallback(champion["id"])
-        assigned_names = [project_names.get(pid, pid) for pid in assigned_ids]
+        assigned_projects = [projects_by_id[pid] for pid in assigned_ids if pid in projects_by_id]
+        type_counts = {"SL": 0, "RL": 0, "FL": 0, "Other": 0}
+        for project in assigned_projects:
+            raw_type = (project.get("type") or "").strip().upper()
+            if raw_type in {"SL", "RL", "FL"}:
+                type_counts[raw_type] += 1
+            else:
+                type_counts["Other"] += 1
         table_rows.append(
             {
                 "Imię": champion["first_name"],
@@ -79,7 +201,8 @@ def render(con: sqlite3.Connection) -> None:
                 "Data zatrudnienia": champion["hire_date"],
                 "Stanowisko": champion["position"],
                 "Aktywny": "Tak" if int(champion["active"]) == 1 else "Nie",
-                "Przypisane projekty": _format_assigned_projects(assigned_names),
+                "Liczba projektów": len(assigned_ids),
+                "Typy projektów": _format_project_type_counts(type_counts),
             }
         )
 

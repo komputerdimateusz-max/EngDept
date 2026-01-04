@@ -157,7 +157,7 @@ def _impact_score(impact_pln: float, max_pln: float, missing_manual: int) -> flo
 
 
 def render(con: sqlite3.Connection) -> None:
-    st.title("Champion Ranking v2")
+    st.title("Champions ranking")
     st.caption("Transparentny ranking championów oparty o reguły kategorii i okna czasowe.")
 
     action_repo = ActionRepository(con)
