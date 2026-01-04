@@ -1,0 +1,313 @@
+from __future__ import annotations
+
+from datetime import date, timedelta
+import sqlite3
+from typing import Any
+from urllib.parse import quote
+
+import pandas as pd
+import streamlit as st
+
+from action_tracking.data.repositories import (
+    ChampionRepository,
+    ProductionDataRepository,
+    ProjectRepository,
+)
+from action_tracking.services.effectiveness import parse_work_centers
+from action_tracking.services.kpi_delta import compute_kpi_pp_delta, compute_scrap_delta
+from action_tracking.services.normalize import normalize_key
+from action_tracking.services.production_outcome import (
+    apply_weekend_filter,
+    compute_baseline_current_metrics,
+    format_metric_value,
+    load_daily_frames,
+)
+
+IMPORTANCE_ORDER = {
+    "High Runner": 0,
+    "Mid Runner": 1,
+    "Low Runner": 2,
+    "Spare parts": 3,
+}
+
+
+def _build_work_center_map(work_centers: list[str]) -> dict[str, list[str]]:
+    mapping: dict[str, list[str]] = {}
+    for work_center in work_centers:
+        normalized = normalize_key(work_center)
+        if not normalized:
+            continue
+        mapping.setdefault(normalized, [])
+        if work_center not in mapping[normalized]:
+            mapping[normalized].append(work_center)
+    return mapping
+
+
+def _resolve_project_work_centers(
+    project: dict[str, Any],
+    work_center_map: dict[str, list[str]],
+    include_related: bool,
+) -> list[str]:
+    centers = parse_work_centers(
+        project.get("work_center"),
+        project.get("related_work_center") if include_related else None,
+    )
+    resolved: list[str] = []
+    for center in centers:
+        normalized = normalize_key(center)
+        if not normalized:
+            continue
+        if normalized in work_center_map:
+            for candidate in work_center_map[normalized]:
+                if candidate not in resolved:
+                    resolved.append(candidate)
+    return resolved
+
+
+def _format_scrap_cell(current: float | None, baseline: float | None) -> tuple[str, float | None]:
+    current_label = format_metric_value(current, "{:.2f}")
+    delta = compute_scrap_delta(current, baseline)
+    delta_abs = delta.get("delta_abs")
+    delta_pct = delta.get("delta_pct")
+    if delta_abs is None:
+        return current_label, None
+    pct_label = "n/a" if delta_pct is None else f"{delta_pct:+.1f}%"
+    return f"{current_label} ({delta_abs:+.2f}, {pct_label})", delta_pct
+
+
+def _format_kpi_cell(current: float | None, baseline: float | None) -> tuple[str, float | None]:
+    current_label = format_metric_value(current, "{:.1f}%")
+    delta = compute_kpi_pp_delta(current, baseline)
+    delta_pp = delta.get("delta_pp")
+    if delta_pp is None:
+        return current_label, None
+    return f"{current_label} ({delta_pp:+.1f} pp)", delta_pp
+
+
+def _set_query_params(params: dict[str, str | None]) -> None:
+    clean_params = {k: v for k, v in params.items() if v}
+    if hasattr(st, "query_params"):
+        st.query_params.clear()
+        for key, value in clean_params.items():
+            st.query_params[key] = value
+    else:
+        st.experimental_set_query_params(**clean_params)
+
+
+def render(con: sqlite3.Connection) -> None:
+    st.header("High risk WorkCenter")
+
+    production_repo = ProductionDataRepository(con)
+    project_repo = ProjectRepository(con)
+    champion_repo = ChampionRepository(con)
+
+    projects = project_repo.list_projects(include_counts=True)
+    champions = champion_repo.list_champions()
+    champion_names = {c["id"]: c["display_name"] for c in champions}
+
+    wc_lists = production_repo.list_distinct_work_centers()
+    all_work_centers = sorted(
+        set(wc_lists.get("scrap_work_centers", []) + wc_lists.get("kpi_work_centers", []))
+    )
+    work_center_map = _build_work_center_map(all_work_centers)
+
+    today = date.today()
+    default_from = today - timedelta(days=90)
+
+    filter_col1, filter_col2, filter_col3 = st.columns([1.2, 1.2, 1.6])
+    selected_from = filter_col1.date_input("Data od", value=default_from)
+    selected_to = filter_col2.date_input("Data do", value=today)
+    include_related = filter_col3.checkbox(
+        "Uwzględnij powiązane Work Center",
+        value=True,
+    )
+
+    weekend_col1, weekend_col2 = st.columns(2)
+    remove_saturdays = weekend_col1.checkbox("Usuń soboty", value=False)
+    remove_sundays = weekend_col2.checkbox("Usuń niedziele", value=False)
+
+    threshold_col1, threshold_col2, threshold_col3 = st.columns(3)
+    oee_threshold = threshold_col1.slider("OEE spadek (pp)", min_value=1, max_value=10, value=3)
+    perf_threshold = threshold_col2.slider("Performance spadek (pp)", min_value=1, max_value=10, value=3)
+    scrap_threshold = threshold_col3.slider("Scrap wzrost (%)", min_value=1, max_value=50, value=10)
+
+    sort_options = [
+        "Priorytet (importance)",
+        "Liczba ryzyk",
+        "Scrap Δ%",
+        "OEE Δ pp",
+        "Performance Δ pp",
+    ]
+    sort_choice = st.selectbox("Sortuj wg", sort_options, index=0)
+
+    if selected_from > selected_to:
+        st.error("Zakres dat jest nieprawidłowy (Data od > Data do).")
+        return
+
+    if not all_work_centers:
+        st.info("Brak danych produkcyjnych do analizy.")
+        return
+
+    rows: list[dict[str, Any]] = []
+    no_wc_count = 0
+
+    for project in projects:
+        work_centers = _resolve_project_work_centers(project, work_center_map, include_related)
+        if not work_centers:
+            no_wc_count += 1
+            continue
+
+        _scrap_daily, _kpi_daily, merged_daily = load_daily_frames(
+            production_repo,
+            work_centers,
+            selected_from,
+            selected_to,
+            currency="PLN",
+        )
+        filtered_daily = apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
+        metrics = compute_baseline_current_metrics(filtered_daily, selected_from, selected_to)
+
+        baseline_scrap_qty = metrics.get("baseline_scrap_qty")
+        current_scrap_qty = metrics.get("current_scrap_qty")
+        baseline_scrap_pln = metrics.get("baseline_scrap_pln")
+        current_scrap_pln = metrics.get("current_scrap_pln")
+        baseline_oee = metrics.get("baseline_oee")
+        current_oee = metrics.get("current_oee")
+        baseline_perf = metrics.get("baseline_perf")
+        current_perf = metrics.get("current_perf")
+
+        scrap_label, scrap_delta_pct = _format_scrap_cell(current_scrap_qty, baseline_scrap_qty)
+        scrap_pln_label, scrap_pln_delta_pct = _format_scrap_cell(
+            current_scrap_pln, baseline_scrap_pln
+        )
+        oee_label, oee_delta_pp = _format_kpi_cell(current_oee, baseline_oee)
+        perf_label, perf_delta_pp = _format_kpi_cell(current_perf, baseline_perf)
+
+        risk_flags: list[str] = []
+        if oee_delta_pp is not None and oee_delta_pp < -float(oee_threshold):
+            risk_flags.append("OEE↓")
+        if perf_delta_pp is not None and perf_delta_pp < -float(perf_threshold):
+            risk_flags.append("Perf↓")
+        scrap_risk = False
+        if scrap_delta_pct is not None:
+            scrap_risk = scrap_delta_pct > float(scrap_threshold)
+        elif scrap_pln_delta_pct is not None:
+            scrap_risk = scrap_pln_delta_pct > float(scrap_threshold)
+        if scrap_risk:
+            risk_flags.append("Scrap↑")
+
+        if not risk_flags:
+            continue
+
+        importance = project.get("importance") or "Mid Runner"
+        owner_id = project.get("owner_champion_id")
+        owner_name = champion_names.get(owner_id) if owner_id else "—"
+
+        rows.append(
+            {
+                "project_id": project.get("id"),
+                "project_name": project.get("name") or project.get("id"),
+                "importance": importance,
+                "importance_order": IMPORTANCE_ORDER.get(importance, 99),
+                "owner_champion_id": owner_id,
+                "owner_name": owner_name or "—",
+                "scrap_label": scrap_label,
+                "scrap_pln_label": scrap_pln_label,
+                "oee_label": oee_label,
+                "perf_label": perf_label,
+                "risk_flags": ", ".join(risk_flags),
+                "risk_count": len(risk_flags),
+                "scrap_delta_pct": scrap_delta_pct,
+                "oee_delta_pp": oee_delta_pp,
+                "perf_delta_pp": perf_delta_pp,
+                "work_centers": work_centers,
+            }
+        )
+
+    if no_wc_count:
+        st.caption(f"Pominięto projekty bez Work Center: {no_wc_count}.")
+
+    if not rows:
+        st.info("Brak projektów spełniających kryteria ryzyka.")
+        return
+
+    if sort_choice == "Liczba ryzyk":
+        rows = sorted(rows, key=lambda r: (r["risk_count"], -r["importance_order"]), reverse=True)
+    elif sort_choice == "Scrap Δ%":
+        rows = sorted(
+            rows,
+            key=lambda r: (
+                r["scrap_delta_pct"] if r["scrap_delta_pct"] is not None else -9999
+            ),
+            reverse=True,
+        )
+    elif sort_choice == "OEE Δ pp":
+        rows = sorted(
+            rows,
+            key=lambda r: (
+                r["oee_delta_pp"] if r["oee_delta_pp"] is not None else 9999
+            ),
+        )
+    elif sort_choice == "Performance Δ pp":
+        rows = sorted(
+            rows,
+            key=lambda r: (
+                r["perf_delta_pp"] if r["perf_delta_pp"] is not None else 9999
+            ),
+        )
+    else:
+        rows = sorted(rows, key=lambda r: (r["importance_order"], r["project_name"] or ""))
+
+    sample_metrics = compute_baseline_current_metrics(
+        pd.DataFrame(columns=["metric_date"]),
+        selected_from,
+        selected_to,
+    )
+    current_days = sample_metrics.get("current_days") or 0
+    st.caption(
+        "Definicja trendu: baseline = średnia z historii (maks. 90 dni) bez ostatnich "
+        f"{current_days} dni; current = średnia z ostatnich {current_days} dni."
+    )
+
+    header = st.columns([2.6, 1.2, 1.6, 1.6, 1.6, 1.4, 1.6, 1.2, 1.0])
+    header[0].markdown("**Projekt**")
+    header[1].markdown("**Importance**")
+    header[2].markdown("**Champion**")
+    header[3].markdown("**Scrap avg**")
+    header[4].markdown("**Scrap PLN avg**")
+    header[5].markdown("**OEE avg**")
+    header[6].markdown("**Performance avg**")
+    header[7].markdown("**Ryzyko**")
+    header[8].markdown("**Akcja**")
+
+    for row in rows:
+        project_id = row["project_id"]
+        project_name = row["project_name"]
+        project_link = (
+            f"?page={quote('Production Explorer')}&project_id={quote(str(project_id))}"
+        )
+        cols = st.columns([2.6, 1.2, 1.6, 1.6, 1.6, 1.4, 1.6, 1.2, 1.0])
+        cols[0].markdown(f"[{project_name}]({project_link})")
+        cols[1].markdown(row["importance"])
+        cols[2].markdown(row["owner_name"])
+        cols[3].markdown(row["scrap_label"])
+        cols[4].markdown(row["scrap_pln_label"])
+        cols[5].markdown(row["oee_label"])
+        cols[6].markdown(row["perf_label"])
+        cols[7].markdown(row["risk_flags"])
+
+        if cols[8].button("Dodaj akcję", key=f"add_action_{project_id}"):
+            st.session_state["prefill_action_project_id"] = project_id
+            if row["owner_champion_id"]:
+                st.session_state["prefill_action_owner_champion_id"] = row["owner_champion_id"]
+            st.session_state["prefill_action_work_center"] = ", ".join(row["work_centers"])
+            st.session_state["prefill_action_applied"] = False
+            st.session_state["sidebar_page"] = "Akcje"
+            _set_query_params(
+                {
+                    "page": "Akcje",
+                    "prefill_action_project_id": str(project_id),
+                    "prefill_action_owner_champion_id": str(row["owner_champion_id"] or ""),
+                }
+            )
+            st.rerun()

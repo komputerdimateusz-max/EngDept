@@ -13,7 +13,7 @@ from action_tracking.data.repositories import (
     ProjectRepository,
     WcInboxRepository,
 )
-from action_tracking.domain.constants import PROJECT_TYPES
+from action_tracking.domain.constants import PROJECT_IMPORTANCE, PROJECT_TYPES
 from action_tracking.services.effectiveness import normalize_wc, parse_work_centers, suggest_work_centers
 
 FIELD_LABELS = {
@@ -24,6 +24,7 @@ FIELD_LABELS = {
     "project_eop": "Project EOP",
     "related_work_center": "Powiązane Work Center",
     "type": "Typ",
+    "importance": "Importance",
     "owner_champion_id": "Champion",
     "status": "Status",
     "created_at": "Utworzono",
@@ -130,11 +131,13 @@ def render(con: sqlite3.Connection) -> None:
             open_count = project.get("actions_open") or 0
             pct_closed = project.get("pct_closed")
             pct_label = f"{pct_closed:.1f}%" if pct_closed is not None else "—"
+            importance = project.get("importance") or "Mid Runner"
             table_rows.append(
                 {
                     "Nazwa projektu": project.get("name"),
                     "Work center": project.get("work_center"),
                     "Typ": project.get("type"),
+                    "Importance": importance,
                     "Champion": project.get("owner_champion_name")
                     or champion_names.get(project.get("owner_champion_id"), "—"),
                     "Status": project.get("status"),
@@ -237,6 +240,16 @@ def render(con: sqlite3.Connection) -> None:
                 category_index = PROJECT_TYPES.index(selected_category)
 
             project_type = st.selectbox("Typ", PROJECT_TYPES, index=category_index)
+
+            importance_value = selected.get("importance") or "Mid Runner"
+            if importance_value not in PROJECT_IMPORTANCE:
+                importance_value = "Mid Runner"
+            importance_index = PROJECT_IMPORTANCE.index(importance_value)
+            importance = st.selectbox(
+                "Importance",
+                PROJECT_IMPORTANCE,
+                index=importance_index,
+            )
             owner_champion_id = st.selectbox(
                 "Champion",
                 champion_options,
@@ -264,6 +277,7 @@ def render(con: sqlite3.Connection) -> None:
                     "project_eop": None if no_eop else project_eop.isoformat(),
                     "related_work_center": related_work_center.strip() or None,
                     "type": project_type,
+                    "importance": importance,
                     "owner_champion_id": None if owner_champion_id == "(brak)" else owner_champion_id,
                     "status": status,
                 }
@@ -334,6 +348,12 @@ def render(con: sqlite3.Connection) -> None:
                         project_type = st.selectbox(
                             "Typ", PROJECT_TYPES, index=PROJECT_TYPES.index("Others"), key=f"wc_inbox_type_{wc_key}"
                         )
+                        importance = st.selectbox(
+                            "Importance",
+                            PROJECT_IMPORTANCE,
+                            index=PROJECT_IMPORTANCE.index("Mid Runner"),
+                            key=f"wc_inbox_importance_{wc_key}",
+                        )
                         owner_champion_id = st.selectbox(
                             "Champion (opcjonalnie)",
                             champion_options,
@@ -354,6 +374,7 @@ def render(con: sqlite3.Connection) -> None:
                                 "name": project_name.strip(),
                                 "work_center": wc_raw.strip(),
                                 "type": project_type,
+                                "importance": importance,
                                 "owner_champion_id": None if owner_champion_id == "(brak)" else owner_champion_id,
                                 "status": "active",
                                 "related_work_center": related_wc.strip() or None,

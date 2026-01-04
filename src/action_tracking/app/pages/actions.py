@@ -127,6 +127,14 @@ def _default_aspects_from_rule(rule: dict[str, Any]) -> list[str]:
     return []
 
 
+def _get_query_param(key: str) -> str | None:
+    params = st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
+    value = params.get(key)
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Akcje")
 
@@ -137,6 +145,15 @@ def render(con: sqlite3.Connection) -> None:
     champion_repo = ChampionRepository(con)
     settings_repo = SettingsRepository(con)
     rules_repo = GlobalSettingsRepository(con)
+
+    prefill_project_id = _get_query_param("prefill_action_project_id")
+    prefill_owner_id = _get_query_param("prefill_action_owner_champion_id")
+    if prefill_project_id:
+        st.session_state["prefill_action_project_id"] = prefill_project_id
+    if prefill_owner_id:
+        st.session_state["prefill_action_owner_champion_id"] = prefill_owner_id
+    if prefill_project_id or prefill_owner_id:
+        st.session_state["prefill_action_applied"] = False
 
     projects = project_repo.list_projects(include_counts=True)
     project_names = {
@@ -383,12 +400,18 @@ def render(con: sqlite3.Connection) -> None:
         return
 
     action_options = ["(nowa)"] + [a["id"] for a in all_actions]
+    if st.session_state.get("prefill_action_project_id") and not st.session_state.get(
+        "prefill_action_applied"
+    ):
+        st.session_state["action_edit_select"] = "(nowa)"
+        st.session_state["prefill_action_applied"] = True
     selected_action = st.selectbox(
         "Wybierz akcję do edycji",
         action_options,
         format_func=lambda aid: "(nowa)"
         if aid == "(nowa)"
         else _format_action_label(actions_by_id[aid], project_names),
+        key="action_edit_select",
     )
 
     editing = selected_action != "(nowa)"
@@ -455,18 +478,32 @@ def render(con: sqlite3.Connection) -> None:
             )
 
             project_ids = [p["id"] for p in projects]
+            prefill_project = (
+                st.session_state.get("prefill_action_project_id")
+                if not editing
+                else None
+            )
             project_id = st.selectbox(
                 "Projekt",
                 project_ids,
-                index=project_ids.index(selected.get("project_id"))
+                index=project_ids.index(prefill_project)
+                if prefill_project in project_ids
+                else project_ids.index(selected.get("project_id"))
                 if selected.get("project_id") in project_ids
                 else 0,
                 format_func=lambda pid: project_names.get(pid, pid),
             )
 
             owner_options = ["(brak)"] + [c["id"] for c in champions]
+            prefill_owner = (
+                st.session_state.get("prefill_action_owner_champion_id")
+                if not editing
+                else None
+            )
             owner_default = (
-                owner_options.index(selected.get("owner_champion_id"))
+                owner_options.index(prefill_owner)
+                if prefill_owner in owner_options
+                else owner_options.index(selected.get("owner_champion_id"))
                 if selected.get("owner_champion_id") in owner_options
                 else 0
             )

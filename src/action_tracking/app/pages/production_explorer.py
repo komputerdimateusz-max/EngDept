@@ -160,6 +160,46 @@ def _project_matches_work_center(project: dict[str, Any], target_key: str) -> bo
     return any(normalize_key(center) == target_key for center in centers)
 
 
+def _get_query_param(key: str) -> str | None:
+    params = st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
+    value = params.get(key)
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def _build_work_center_map(work_centers: list[str]) -> dict[str, list[str]]:
+    mapping: dict[str, list[str]] = {}
+    for work_center in work_centers:
+        normalized = normalize_key(work_center)
+        if not normalized:
+            continue
+        mapping.setdefault(normalized, [])
+        if work_center not in mapping[normalized]:
+            mapping[normalized].append(work_center)
+    return mapping
+
+
+def _resolve_project_work_centers(
+    project: dict[str, Any],
+    work_center_map: dict[str, list[str]],
+) -> list[str]:
+    centers = parse_work_centers(
+        project.get("work_center"),
+        project.get("related_work_center"),
+    )
+    resolved: list[str] = []
+    for center in centers:
+        normalized = normalize_key(center)
+        if not normalized:
+            continue
+        if normalized in work_center_map:
+            for candidate in work_center_map[normalized]:
+                if candidate not in resolved:
+                    resolved.append(candidate)
+    return resolved
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Production Explorer")
     production_repo = ProductionDataRepository(con)
@@ -167,31 +207,63 @@ def render(con: sqlite3.Connection) -> None:
     action_repo = ActionRepository(con)
     rules_repo = GlobalSettingsRepository(con)
 
+    projects = project_repo.list_projects(include_counts=True)
+    projects_by_id = {p["id"]: p for p in projects}
+    project_names = {p["id"]: p.get("name") or p.get("id") for p in projects}
+
     wc_lists = production_repo.list_distinct_work_centers()
     all_work_centers = sorted(
         set(wc_lists.get("scrap_work_centers", []) + wc_lists.get("kpi_work_centers", []))
     )
+    work_center_map = _build_work_center_map(all_work_centers)
 
     today = date.today()
     default_from = today - timedelta(days=90)
 
-    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns(
-        [2.2, 1.4, 1.4, 1.2, 1.2]
+    preselected_project_id = _get_query_param("project_id")
+    if preselected_project_id:
+        st.session_state["production_explorer_selected_project_id"] = preselected_project_id
+    selected_project_state = st.session_state.get("production_explorer_selected_project_id")
+
+    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5, filter_col6 = st.columns(
+        [1.4, 2.2, 1.4, 1.4, 1.2, 1.2]
     )
-    selected_work_centers = filter_col1.multiselect(
+    project_options = ["Wszystkie"] + [p["id"] for p in projects]
+    project_index = 0
+    if selected_project_state in project_options:
+        project_index = project_options.index(selected_project_state)
+    selected_project = filter_col1.selectbox(
+        "Projekt",
+        project_options,
+        index=project_index,
+        format_func=lambda pid: "Wszystkie" if pid == "Wszystkie" else project_names.get(pid, pid),
+    )
+
+    if selected_project == "Wszystkie":
+        st.session_state.pop("production_explorer_selected_project_id", None)
+        selected_project_row = None
+    else:
+        st.session_state["production_explorer_selected_project_id"] = selected_project
+        selected_project_row = projects_by_id.get(selected_project)
+
+    project_work_centers: list[str] = []
+    if selected_project_row:
+        project_work_centers = _resolve_project_work_centers(selected_project_row, work_center_map)
+
+    selected_work_centers = filter_col2.multiselect(
         "Work Center",
         all_work_centers,
-        default=all_work_centers,
+        default=project_work_centers or all_work_centers,
     )
-    selected_from = filter_col2.date_input("Data od", value=default_from)
-    selected_to = filter_col3.date_input("Data do", value=today)
-    granularity = filter_col4.radio(
+    selected_from = filter_col3.date_input("Data od", value=default_from)
+    selected_to = filter_col4.date_input("Data do", value=today)
+    granularity = filter_col5.radio(
         "Granularność",
         ["Dziennie", "Tygodniowo"],
         index=0,
         horizontal=True,
     )
-    currency = filter_col5.selectbox(
+    currency = filter_col6.selectbox(
         "Waluta",
         ["PLN", "All currencies"],
         index=0,
@@ -205,6 +277,8 @@ def render(con: sqlite3.Connection) -> None:
         st.error("Zakres dat jest nieprawidłowy (Data od > Data do).")
         return
 
+    if selected_project_row and not project_work_centers:
+        st.warning("Wybrany projekt nie ma Work Center dostępnego w danych produkcyjnych.")
     if not selected_work_centers:
         st.info("Wybierz Work Center, aby zobaczyć dane.")
         return

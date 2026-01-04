@@ -168,6 +168,76 @@ def compute_baseline_after_metrics(
     }
 
 
+def compute_baseline_current_metrics(
+    merged_daily: pd.DataFrame,
+    date_from: date,
+    date_to: date,
+) -> dict[str, Any]:
+    total_days = (date_to - date_from).days + 1
+    if total_days < 14:
+        current_days = 4
+    elif total_days < 28:
+        current_days = 7
+    else:
+        current_days = 14
+
+    current_to = date_to
+    current_from = max(date_from, current_to - timedelta(days=current_days - 1))
+    baseline_to = current_from - timedelta(days=1)
+    baseline_from = None
+    if baseline_to >= date_from:
+        baseline_from = max(date_from, baseline_to - timedelta(days=89))
+
+    if merged_daily.empty or "metric_date" not in merged_daily.columns:
+        return {
+            "baseline_from": baseline_from,
+            "baseline_to": baseline_to if baseline_from else None,
+            "current_from": current_from,
+            "current_to": current_to,
+            "current_days": current_days,
+            "baseline_scrap_qty": None,
+            "current_scrap_qty": None,
+            "baseline_scrap_pln": None,
+            "current_scrap_pln": None,
+            "baseline_oee": None,
+            "current_oee": None,
+            "baseline_perf": None,
+            "current_perf": None,
+        }
+
+    data = merged_daily.copy()
+    data["metric_date"] = pd.to_datetime(data["metric_date"], errors="coerce")
+    data = data.dropna(subset=["metric_date"])
+
+    baseline_mask = (
+        data["metric_date"].dt.date >= baseline_from
+    ) & (data["metric_date"].dt.date <= baseline_to) if baseline_from else pd.Series(
+        False, index=data.index
+    )
+    current_mask = (data["metric_date"].dt.date >= current_from) & (
+        data["metric_date"].dt.date <= current_to
+    )
+
+    baseline_slice = data.loc[baseline_mask] if baseline_from else pd.DataFrame()
+    current_slice = data.loc[current_mask]
+
+    return {
+        "baseline_from": baseline_from,
+        "baseline_to": baseline_to if baseline_from else None,
+        "current_from": current_from,
+        "current_to": current_to,
+        "current_days": current_days,
+        "baseline_scrap_qty": _mean_or_none(baseline_slice.get("scrap_qty_sum")),
+        "current_scrap_qty": _mean_or_none(current_slice.get("scrap_qty_sum")),
+        "baseline_scrap_pln": _mean_or_none(baseline_slice.get("scrap_pln_sum")),
+        "current_scrap_pln": _mean_or_none(current_slice.get("scrap_pln_sum")),
+        "baseline_oee": _mean_or_none(baseline_slice.get("oee_avg")),
+        "current_oee": _mean_or_none(current_slice.get("oee_avg")),
+        "baseline_perf": _mean_or_none(baseline_slice.get("performance_avg")),
+        "current_perf": _mean_or_none(current_slice.get("performance_avg")),
+    }
+
+
 def format_metric_value(value: float | None, fmt: str) -> str:
     if value is None:
         return "—"

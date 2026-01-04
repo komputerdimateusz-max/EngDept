@@ -8,3 +8,10 @@ ACTION_CATEGORIES: tuple[str, ...] = (
 )
 
 PROJECT_TYPES: tuple[str, ...] = ("SL", "RL", "FL", "Others")
+
+PROJECT_IMPORTANCE: tuple[str, ...] = (
+    "High Runner",
+    "Mid Runner",
+    "Low Runner",
+    "Spare parts",
+)

@@ -23,6 +23,7 @@ from action_tracking.app.pages import (
     settings,
     production_import,
     production_explorer,
+    high_risk_workcenter,
 )
 
 st.set_page_config(page_title="engdept", layout="wide")
@@ -60,6 +61,7 @@ st.sidebar.markdown(
 
 PAGES = {
     "Production Explorer": lambda: production_explorer.render(con),
+    "High risk WorkCenter": lambda: high_risk_workcenter.render(con),
     "KPI": lambda: kpi.render(con),
     "Akcje": lambda: actions.render(con),
     "Champions ranking": lambda: champions_ranking.render(con),
@@ -70,7 +72,20 @@ PAGES = {
     "Import danych produkcyjnych": lambda: production_import.render(con),
 }
 
-selected = st.sidebar.radio("Strony", list(PAGES.keys()), index=0)
+params = st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
+page_param = params.get("page")
+if isinstance(page_param, list):
+    page_param = page_param[0] if page_param else None
+if page_param in PAGES:
+    st.session_state["sidebar_page"] = page_param
+
+page_labels = list(PAGES.keys())
+default_index = 0
+current_page = st.session_state.get("sidebar_page")
+if current_page in page_labels:
+    default_index = page_labels.index(current_page)
+
+selected = st.sidebar.radio("Strony", page_labels, index=default_index, key="sidebar_page")
 
 # --- Render selected page ---
 PAGES[selected]()

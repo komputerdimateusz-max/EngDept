@@ -2188,6 +2188,9 @@ class ProjectRepository:
                 payload["status"] = (data.get("status") or "active").strip() or "active"
             if "created_at" in cols:
                 payload["created_at"] = datetime.now(timezone.utc).isoformat()
+            if "importance" in cols:
+                importance = (data.get("importance") or "").strip()
+                payload["importance"] = importance or None
 
         insert_cols = [c for c in payload.keys() if c in cols]
         if not insert_cols:
@@ -2245,6 +2248,9 @@ class ProjectRepository:
             payload["related_work_center"] = (data.get("related_work_center") or "").strip() or None
         if "type" in data_keys and "type" in cols:
             payload["type"] = (data.get("type") or "custom").strip() or "custom"
+        if "importance" in data_keys and "importance" in cols:
+            importance = (data.get("importance") or "").strip()
+            payload["importance"] = importance or None
         if "owner_champion_id" in data_keys and "owner_champion_id" in cols:
             payload["owner_champion_id"] = (data.get("owner_champion_id") or "").strip() or None
         if "created_at" in data_keys and "created_at" in cols:
@@ -2346,6 +2352,7 @@ class ProjectRepository:
                 "id",
                 "name",
                 "type",
+                "importance",
                 "owner_champion_id",
                 "status",
                 "created_at",
@@ -2467,6 +2474,7 @@ class ProjectRepository:
             "id": project_id,
             "name": name,
             "type": (data.get("type") or "custom").strip() or "custom",
+            "importance": (data.get("importance") or "Mid Runner").strip() or "Mid Runner",
             "owner_champion_id": (data.get("owner_champion_id") or "").strip() or None,
             "status": status,
             "created_at": created_date.isoformat(),
