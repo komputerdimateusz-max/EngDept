@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS actions (
   id TEXT PRIMARY KEY,
   project_id TEXT,
+  analysis_id TEXT,
   title TEXT NOT NULL,
   description TEXT,
   owner_champion_id TEXT,
@@ -186,6 +187,45 @@ CREATE TABLE IF NOT EXISTS email_notifications_log (
   action_id TEXT,
   payload_json TEXT,
   unique_key TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS analyses (
+  id TEXT PRIMARY KEY,
+  project_id TEXT,
+  champion_id TEXT,
+  tool_type TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  created_at TEXT NOT NULL,
+  closed_at TEXT,
+  template_json TEXT NOT NULL,
+  FOREIGN KEY(project_id) REFERENCES projects(id),
+  FOREIGN KEY(champion_id) REFERENCES champions(id)
+);
+
+CREATE TABLE IF NOT EXISTS analysis_actions (
+  id TEXT PRIMARY KEY,
+  analysis_id TEXT NOT NULL,
+  action_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  due_date TEXT,
+  owner_champion_id TEXT,
+  added_action_id TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(analysis_id) REFERENCES analyses(id),
+  FOREIGN KEY(owner_champion_id) REFERENCES champions(id),
+  FOREIGN KEY(added_action_id) REFERENCES actions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_actions_analysis
+  ON analysis_actions (analysis_id);
+
+CREATE TABLE IF NOT EXISTS analysis_changelog (
+  id TEXT PRIMARY KEY,
+  analysis_id TEXT,
+  event_type TEXT NOT NULL,
+  event_at TEXT NOT NULL,
+  changes_json TEXT NOT NULL
 );
 """
 
@@ -592,6 +632,63 @@ def _migrate_to_v14(con: sqlite3.Connection) -> None:
     _set_user_version(con, 14)
 
 
+def _migrate_to_v15(con: sqlite3.Connection) -> None:
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analyses (
+          id TEXT PRIMARY KEY,
+          project_id TEXT,
+          champion_id TEXT,
+          tool_type TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'open',
+          created_at TEXT NOT NULL,
+          closed_at TEXT,
+          template_json TEXT NOT NULL,
+          FOREIGN KEY(project_id) REFERENCES projects(id),
+          FOREIGN KEY(champion_id) REFERENCES champions(id)
+        );
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analysis_actions (
+          id TEXT PRIMARY KEY,
+          analysis_id TEXT NOT NULL,
+          action_type TEXT NOT NULL,
+          title TEXT NOT NULL,
+          description TEXT,
+          due_date TEXT,
+          owner_champion_id TEXT,
+          added_action_id TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(analysis_id) REFERENCES analyses(id),
+          FOREIGN KEY(owner_champion_id) REFERENCES champions(id),
+          FOREIGN KEY(added_action_id) REFERENCES actions(id)
+        );
+        """
+    )
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_analysis_actions_analysis
+          ON analysis_actions (analysis_id);
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analysis_changelog (
+          id TEXT PRIMARY KEY,
+          analysis_id TEXT,
+          event_type TEXT NOT NULL,
+          event_at TEXT NOT NULL,
+          changes_json TEXT NOT NULL
+        );
+        """
+    )
+    if _table_exists(con, "actions") and not _column_exists(con, "actions", "analysis_id"):
+        con.execute("ALTER TABLE actions ADD COLUMN analysis_id TEXT;")
+    _set_user_version(con, 15)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "action_categories"):
         return
@@ -723,6 +820,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v13(con)
     if current_version < 14:
         _migrate_to_v14(con)
+    if current_version < 15:
+        _migrate_to_v15(con)
     _seed_action_categories(con)
     _seed_category_rules(con)
     con.commit()

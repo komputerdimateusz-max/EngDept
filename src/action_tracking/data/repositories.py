@@ -1198,6 +1198,7 @@ class ActionRepository:
         cols = [
             "id",
             "project_id",
+            "analysis_id",
             "title",
             "description",
             "owner_champion_id",
@@ -1277,6 +1278,7 @@ class ActionRepository:
         # Build UPDATE dynamically
         allowed_cols = [
             "project_id",
+            "analysis_id",
             "title",
             "description",
             "owner_champion_id",
@@ -1364,6 +1366,7 @@ class ActionRepository:
         return {
             "id": action_id,
             "project_id": (data.get("project_id") or "").strip() or None,
+            "analysis_id": (data.get("analysis_id") or "").strip() or None,
             "title": (data.get("title") or "").strip(),
             "description": (data.get("description") or "").strip() or None,
             "owner_champion_id": (data.get("owner_champion_id") or "").strip() or None,
@@ -1647,6 +1650,386 @@ class ActionRepository:
             r.setdefault("manual_savings_currency", None)
             r.setdefault("manual_savings_note", None)
         return rows
+
+
+class AnalysisRepository:
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+
+    def list_analyses(self) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "analyses"):
+            return []
+        analysis_cols = _table_columns(self.con, "analyses")
+        if not analysis_cols:
+            return []
+
+        select_cols = [f"a.{c}" for c in analysis_cols]
+        if "id" not in analysis_cols:
+            select_cols.append("a.rowid AS id")
+
+        joins: list[str] = []
+        project_name_select = "NULL AS project_name"
+        work_center_select = "NULL AS work_center"
+        if _table_exists(self.con, "projects") and "project_id" in analysis_cols:
+            project_cols = _table_columns(self.con, "projects")
+            if "id" in project_cols:
+                joins.append("LEFT JOIN projects p ON p.id = a.project_id")
+                if "name" in project_cols:
+                    project_name_select = "p.name AS project_name"
+                if "work_center" in project_cols:
+                    work_center_select = "p.work_center AS work_center"
+
+        champion_name_select = "NULL AS champion_name"
+        if _table_exists(self.con, "champions") and "champion_id" in analysis_cols:
+            champion_cols = _table_columns(self.con, "champions")
+            if "id" in champion_cols:
+                joins.append("LEFT JOIN champions ch ON ch.id = a.champion_id")
+                champion_name_select = (
+                    "TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS champion_name"
+                )
+
+        select_sql = ", ".join(
+            select_cols + [project_name_select, work_center_select, champion_name_select]
+        )
+        base_query = f"""
+            SELECT {select_sql}
+            FROM analyses a
+            {' '.join(joins)}
+        """
+
+        order_clauses: list[str] = []
+        if "status" in analysis_cols:
+            order_clauses.append("CASE WHEN a.status = 'closed' THEN 1 ELSE 0 END")
+        if "created_at" in analysis_cols:
+            order_clauses.append("a.created_at DESC")
+        if not order_clauses:
+            order_clauses.append("a.rowid DESC")
+        base_query += " ORDER BY " + ", ".join(order_clauses)
+
+        try:
+            cur = self.con.execute(base_query)
+            rows = [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
+        for row in rows:
+            row.setdefault("project_name", None)
+            row.setdefault("work_center", None)
+            row.setdefault("champion_name", None)
+        return rows
+
+    def create_analysis(self, data: dict[str, Any]) -> str:
+        analysis_id = data.get("id") or str(uuid4())
+        if not _table_exists(self.con, "analyses"):
+            return analysis_id
+        analysis_cols = _table_columns(self.con, "analyses")
+        if not analysis_cols:
+            return analysis_id
+
+        payload = self._normalize_analysis_payload(analysis_id, data)
+
+        cols = [
+            "id",
+            "project_id",
+            "champion_id",
+            "tool_type",
+            "status",
+            "created_at",
+            "closed_at",
+            "template_json",
+        ]
+        insert_cols = [c for c in cols if c in analysis_cols]
+        if not insert_cols:
+            return analysis_id
+
+        vals = [payload.get(c) for c in insert_cols]
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        _configure_sqlite_connection(self.con)
+        try:
+            self.con.execute(
+                f"INSERT INTO analyses ({', '.join(insert_cols)}) VALUES ({placeholders})",
+                vals,
+            )
+            self.con.commit()
+        except sqlite3.Error:
+            return analysis_id
+
+        self._log_changelog(analysis_id, "CREATE", payload)
+        return analysis_id
+
+    def update_analysis(self, analysis_id: str, data: dict[str, Any]) -> None:
+        if not analysis_id:
+            return
+        if not _table_exists(self.con, "analyses"):
+            return
+        analysis_cols = _table_columns(self.con, "analyses")
+        if not analysis_cols:
+            return
+
+        try:
+            cur = self.con.execute("SELECT * FROM analyses WHERE id = ?", (analysis_id,))
+            existing_row = cur.fetchone()
+        except sqlite3.Error:
+            return
+        if not existing_row:
+            return
+
+        existing = dict(existing_row)
+        merged: dict[str, Any] = dict(existing)
+        merged.update(data or {})
+        payload = self._normalize_analysis_payload(analysis_id, merged)
+
+        allowed_cols = [
+            "project_id",
+            "champion_id",
+            "tool_type",
+            "status",
+            "created_at",
+            "closed_at",
+            "template_json",
+        ]
+        updates = {k: payload.get(k) for k in allowed_cols if k in analysis_cols}
+        if not updates:
+            return
+
+        changes: dict[str, Any] = {}
+        for key, value in updates.items():
+            if existing.get(key) != value:
+                changes[key] = {"from": existing.get(key), "to": value}
+
+        if not changes:
+            return
+
+        sets = [f"{col} = ?" for col in updates.keys()]
+        params = list(updates.values())
+        params.append(analysis_id)
+        try:
+            self.con.execute(
+                f"UPDATE analyses SET {', '.join(sets)} WHERE id = ?",
+                params,
+            )
+            self.con.commit()
+        except sqlite3.Error:
+            return
+
+        self._log_changelog(analysis_id, "UPDATE", changes)
+
+    def delete_analysis(self, analysis_id: str) -> None:
+        if not analysis_id:
+            return
+        if not _table_exists(self.con, "analyses"):
+            return
+        with self.con:
+            if _table_exists(self.con, "analysis_actions"):
+                self.con.execute(
+                    "DELETE FROM analysis_actions WHERE analysis_id = ?",
+                    (analysis_id,),
+                )
+            if _table_exists(self.con, "analysis_changelog"):
+                self.con.execute(
+                    "DELETE FROM analysis_changelog WHERE analysis_id = ?",
+                    (analysis_id,),
+                )
+            self.con.execute("DELETE FROM analyses WHERE id = ?", (analysis_id,))
+        self._log_changelog(analysis_id, "DELETE", {"id": analysis_id})
+
+    def list_analysis_actions(self, analysis_id: str) -> list[dict[str, Any]]:
+        if not analysis_id:
+            return []
+        if not _table_exists(self.con, "analysis_actions"):
+            return []
+        action_cols = _table_columns(self.con, "analysis_actions")
+        if not action_cols:
+            return []
+
+        select_cols = [f"aa.{c}" for c in action_cols]
+        if "id" not in action_cols:
+            select_cols.append("aa.rowid AS id")
+
+        joins: list[str] = []
+        owner_name_select = "NULL AS owner_name"
+        if _table_exists(self.con, "champions") and "owner_champion_id" in action_cols:
+            champion_cols = _table_columns(self.con, "champions")
+            if "id" in champion_cols:
+                joins.append("LEFT JOIN champions ch ON ch.id = aa.owner_champion_id")
+                owner_name_select = (
+                    "TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS owner_name"
+                )
+
+        select_sql = ", ".join(select_cols + [owner_name_select])
+        base_query = f"""
+            SELECT {select_sql}
+            FROM analysis_actions aa
+            {' '.join(joins)}
+            WHERE aa.analysis_id = ?
+        """
+        if "created_at" in action_cols:
+            base_query += " ORDER BY aa.created_at ASC"
+        else:
+            base_query += " ORDER BY aa.rowid ASC"
+
+        try:
+            cur = self.con.execute(base_query, (analysis_id,))
+            rows = [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
+        for row in rows:
+            row.setdefault("owner_name", None)
+        return rows
+
+    def create_analysis_action(self, analysis_id: str, data: dict[str, Any]) -> str:
+        action_id = data.get("id") or str(uuid4())
+        if not analysis_id:
+            return action_id
+        if not _table_exists(self.con, "analysis_actions"):
+            return action_id
+        cols = _table_columns(self.con, "analysis_actions")
+        if not cols:
+            return action_id
+
+        title = (data.get("title") or "").strip()
+        if "title" in cols and not title:
+            raise ValueError("title is required")
+        action_type = (data.get("action_type") or "").strip()
+        if "action_type" in cols and not action_type:
+            raise ValueError("action_type is required")
+
+        due_date = data.get("due_date") or None
+        if due_date:
+            due_date = self._parse_date(due_date, "due_date").isoformat()
+
+        payload = {
+            "id": action_id,
+            "analysis_id": analysis_id,
+            "action_type": action_type,
+            "title": title,
+            "description": (data.get("description") or "").strip() or None,
+            "due_date": due_date,
+            "owner_champion_id": (data.get("owner_champion_id") or "").strip() or None,
+            "added_action_id": (data.get("added_action_id") or "").strip() or None,
+            "created_at": self._parse_date(
+                data.get("created_at") or date.today().isoformat(), "created_at"
+            ).isoformat(),
+        }
+
+        insert_cols = [c for c in payload.keys() if c in cols]
+        if not insert_cols:
+            return action_id
+        vals = [payload.get(c) for c in insert_cols]
+        placeholders = ", ".join(["?"] * len(insert_cols))
+        _configure_sqlite_connection(self.con)
+        try:
+            self.con.execute(
+                f"INSERT INTO analysis_actions ({', '.join(insert_cols)}) VALUES ({placeholders})",
+                vals,
+            )
+            self.con.commit()
+        except sqlite3.Error:
+            return action_id
+        return action_id
+
+    def mark_analysis_action_added(self, analysis_action_id: str, action_id: str) -> None:
+        if not analysis_action_id or not action_id:
+            return
+        if not _table_exists(self.con, "analysis_actions"):
+            return
+        cols = _table_columns(self.con, "analysis_actions")
+        if "added_action_id" not in cols:
+            return
+        try:
+            self.con.execute(
+                "UPDATE analysis_actions SET added_action_id = ? WHERE id = ?",
+                (action_id, analysis_action_id),
+            )
+            self.con.commit()
+        except sqlite3.Error:
+            return
+
+    def list_changelog(self, limit: int = 50, analysis_id: str | None = None) -> list[dict[str, Any]]:
+        return _list_changelog_generic(
+            self.con,
+            [
+                "analysis_changelog",
+                "analyses_changelog",
+                "changelog_analyses",
+                "changelog",
+            ],
+            "analysis_id",
+            analysis_id,
+            limit,
+        )
+
+    def _normalize_analysis_payload(self, analysis_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        created_at = data.get("created_at") or date.today().isoformat()
+        created_date = self._parse_date(created_at, "created_at")
+        status = (data.get("status") or "open").strip() or "open"
+        closed_at = data.get("closed_at") or None
+        if status == "closed":
+            closed_at = closed_at or date.today().isoformat()
+            closed_date = self._parse_date(closed_at, "closed_at")
+            if closed_date < created_date:
+                raise ValueError("closed_at < created_at")
+        else:
+            closed_at = None
+
+        template_json = data.get("template_json")
+        if isinstance(template_json, (dict, list)):
+            template_json = json.dumps(template_json, ensure_ascii=False)
+        template_json = (template_json or "").strip()
+        if not template_json:
+            template_json = json.dumps({}, ensure_ascii=False)
+
+        return {
+            "id": analysis_id,
+            "project_id": (data.get("project_id") or "").strip() or None,
+            "champion_id": (data.get("champion_id") or "").strip() or None,
+            "tool_type": (data.get("tool_type") or "").strip() or "5WHY",
+            "status": status,
+            "created_at": created_date.isoformat(),
+            "closed_at": closed_at,
+            "template_json": template_json,
+        }
+
+    @staticmethod
+    def _parse_date(value: Any, field_name: str) -> date:
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError:
+            try:
+                return datetime.fromisoformat(str(value)).date()
+            except ValueError as exc_two:
+                raise ValueError(f"Invalid date for {field_name}") from exc_two
+
+    def _log_changelog(self, analysis_id: str, event_type: str, changes: dict[str, Any]) -> None:
+        if not _table_exists(self.con, "analysis_changelog"):
+            return
+        columns = _table_columns(self.con, "analysis_changelog")
+        required = {"id", "analysis_id", "event_type", "event_at", "changes_json"}
+        if not required.issubset(columns):
+            return
+        payload = {
+            "id": str(uuid4()),
+            "analysis_id": analysis_id,
+            "event_type": event_type,
+            "event_at": datetime.now(timezone.utc).isoformat(),
+            "changes_json": json.dumps(changes, ensure_ascii=False),
+        }
+        try:
+            self.con.execute(
+                """
+                INSERT INTO analysis_changelog (id, analysis_id, event_type, event_at, changes_json)
+                VALUES (:id, :analysis_id, :event_type, :event_at, :changes_json)
+                """,
+                payload,
+            )
+            self.con.commit()
+        except sqlite3.Error:
+            _rollback_safely(self.con)
 
     def list_changelog(self, limit: int = 50, action_id: str | None = None) -> list[dict[str, Any]]:
         return _list_changelog_generic(
