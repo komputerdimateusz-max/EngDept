@@ -171,8 +171,10 @@ Fallback exists only for robustness.
 - Projects CRUD with:
   - required work center
   - future analytics fields (SOP, EOP, related WC)
+  - importance classification (High/Mid/Low Runner, Spare parts)
   - audit changelog
 - SQLite schema versioning using PRAGMA user_version
+- High risk WorkCenter view with trend flags + deep-links to Production Explorer/Actions
 
 ---
 

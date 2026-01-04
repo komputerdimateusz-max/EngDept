@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS projects (
   project_sop TEXT,
   project_eop TEXT,
   related_work_center TEXT,
+  importance TEXT,
   FOREIGN KEY(owner_champion_id) REFERENCES champions(id)
 );
 
@@ -689,6 +690,12 @@ def _migrate_to_v15(con: sqlite3.Connection) -> None:
     _set_user_version(con, 15)
 
 
+def _migrate_to_v16(con: sqlite3.Connection) -> None:
+    if _table_exists(con, "projects") and not _column_exists(con, "projects", "importance"):
+        con.execute("ALTER TABLE projects ADD COLUMN importance TEXT;")
+    _set_user_version(con, 16)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "action_categories"):
         return
@@ -822,6 +829,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v14(con)
     if current_version < 15:
         _migrate_to_v15(con)
+    if current_version < 16:
+        _migrate_to_v16(con)
     _seed_action_categories(con)
     _seed_category_rules(con)
     con.commit()
