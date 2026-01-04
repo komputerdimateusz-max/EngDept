@@ -268,10 +268,4 @@ def _as_percent_series(series: pd.Series) -> tuple[pd.Series, str]:
     numeric = series.dropna()
     if numeric.empty:
         return series, "unknown"
-    median_value = float(numeric.median())
-    if median_value <= 1.5:
-        scaled = series * 100
-        if not scaled.dropna().empty and float(scaled.max()) > 1000:
-            return series, "percent"
-        return scaled, "fraction"
     return series, "percent"

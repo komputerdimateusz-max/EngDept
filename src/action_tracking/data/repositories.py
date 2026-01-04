@@ -6,6 +6,8 @@ from datetime import date, datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from action_tracking.services.metrics_scale import normalize_percent
+
 # =====================================================
 # OPTIONAL IMPORTS (never crash if modules moved / missing)
 # =====================================================
@@ -153,15 +155,7 @@ def _normalize_impact_aspects_payload(value: Any) -> str | None:
 
 
 def _normalize_percent(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if 0 <= number <= 1:
-        return number * 100
-    return number
+    return normalize_percent(value)
 
 
 def _normalize_int(value: Any, default: int | None = None) -> int | None:
@@ -3121,6 +3115,45 @@ class ProductionDataRepository:
             row["availability_pct"] = _normalize_percent(row.get("availability_pct"))
             row["quality_pct"] = _normalize_percent(row.get("quality_pct"))
         return rows
+
+    def rescale_kpi_daily_percent(self) -> dict[str, int]:
+        if not _table_exists(self.con, "production_kpi_daily"):
+            return {}
+        cols = _table_columns(self.con, "production_kpi_daily")
+        if not cols:
+            return {}
+        _configure_sqlite_connection(self.con)
+        scale_targets = [
+            col
+            for col in ("performance_pct", "oee_pct", "availability_pct", "quality_pct")
+            if col in cols
+        ]
+        if not scale_targets:
+            return {}
+        stats: dict[str, int] = {}
+        for col in scale_targets:
+            cur = self.con.execute(
+                f"""
+                SELECT COUNT(*) AS count_rows
+                FROM production_kpi_daily
+                WHERE {col} IS NOT NULL
+                  AND {col} BETWEEN 0 AND 1.5
+                """
+            )
+            row = cur.fetchone()
+            to_scale = int(row[0]) if row else 0
+            stats[col] = to_scale
+            if to_scale:
+                self.con.execute(
+                    f"""
+                    UPDATE production_kpi_daily
+                    SET {col} = {col} * 100
+                    WHERE {col} IS NOT NULL
+                      AND {col} BETWEEN 0 AND 1.5
+                    """
+                )
+        self.con.commit()
+        return stats
 
     def list_distinct_work_centers(self) -> dict[str, list[str]]:
         scrap_work_centers: list[str] = []

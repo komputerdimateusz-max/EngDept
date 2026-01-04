@@ -9,6 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from action_tracking.data.repositories import ProductionDataRepository
+from action_tracking.services.metrics_scale import detect_percent_scale, normalize_percent
 
 SCRAP_REQUIRED_COLUMNS = [
     "DATE",
@@ -187,6 +188,20 @@ def _prepare_kpi_rows(
     else:
         df["quality_pct"] = pd.Series([pd.NA] * len(df), dtype="float")
 
+    scale_counts: dict[str, dict[str, int]] = {}
+    for metric in ("oee_pct", "performance_pct", "availability_pct", "quality_pct"):
+        counts = {"fraction": 0, "percent": 0, "invalid": 0}
+        if metric in df.columns:
+            for value in df[metric].dropna():
+                scale = detect_percent_scale(value)
+                if scale == "fraction":
+                    counts["fraction"] += 1
+                elif scale == "percent":
+                    counts["percent"] += 1
+                elif scale == "invalid":
+                    counts["invalid"] += 1
+        scale_counts[metric] = counts
+
     def _weighted_columns(metric: str) -> None:
         df[f"{metric}_weighted"] = df[metric].fillna(0) * df["worktime_min"]
         df[f"{metric}_weight"] = df["worktime_min"].where(df[metric].notna(), 0)
@@ -223,21 +238,29 @@ def _prepare_kpi_rows(
                 return None
             return float(mean_value)
 
-        oee_pct = _resolve_metric(row["oee_weighted"], row["oee_weight"], row["oee_mean"])
-        performance_pct = _resolve_metric(
-            row["performance_weighted"],
-            row["performance_weight"],
-            row["performance_mean"],
+        oee_pct = normalize_percent(
+            _resolve_metric(row["oee_weighted"], row["oee_weight"], row["oee_mean"])
         )
-        availability_pct = _resolve_metric(
-            row["availability_weighted"],
-            row["availability_weight"],
-            row["availability_mean"],
+        performance_pct = normalize_percent(
+            _resolve_metric(
+                row["performance_weighted"],
+                row["performance_weight"],
+                row["performance_mean"],
+            )
         )
-        quality_pct = _resolve_metric(
-            row["quality_weighted"],
-            row["quality_weight"],
-            row["quality_mean"],
+        availability_pct = normalize_percent(
+            _resolve_metric(
+                row["availability_weighted"],
+                row["availability_weight"],
+                row["availability_mean"],
+            )
+        )
+        quality_pct = normalize_percent(
+            _resolve_metric(
+                row["quality_weighted"],
+                row["quality_weight"],
+                row["quality_mean"],
+            )
         )
         rows.append(
             {
@@ -251,7 +274,7 @@ def _prepare_kpi_rows(
                 "source_file": source_file,
             }
         )
-    return rows, skipped, {}
+    return rows, skipped, {"scale_counts": scale_counts}
 
 
 def _render_import_tab(
@@ -335,6 +358,10 @@ def _render_import_tab(
                 "rows_skipped": int(skipped),
             }
         )
+        if label == "OEE / Performance CSV":
+            scale_counts = debug_payload.get("scale_counts")
+            if scale_counts:
+                st.write("Wykryta skala KPI (liczba wartości):", scale_counts)
 
 
 def render(con: sqlite3.Connection) -> None:
