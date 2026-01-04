@@ -33,7 +33,6 @@ from action_tracking.services.overlay_targets import (
 )
 from action_tracking.services.production_outcome import (
     apply_weekend_filter,
-    compute_baseline_after_metrics,
     format_metric_value,
     load_daily_frames,
     metric_delta_label,
@@ -252,29 +251,166 @@ def _resolve_work_center_default(
     return options[0] if options else ""
 
 
-def _collect_portfolio_work_centers(
-    projects: list[dict[str, Any]],
+def _resolve_after_days(total_days: int) -> int:
+    if total_days >= 28:
+        after_days = 14
+    elif total_days >= 14:
+        after_days = 7
+    elif total_days >= 8:
+        after_days = 4
+    else:
+        after_days = max(2, total_days // 2)
+    return min(total_days, after_days) if total_days > 0 else 0
+
+
+def _resolve_windows(
+    date_from: date,
+    date_to: date,
+    available_dates: list[date],
+) -> dict[str, Any]:
+    total_days = len(available_dates)
+    after_days = _resolve_after_days(total_days)
+    if total_days == 0 or after_days == 0:
+        return {
+            "baseline_from": date_from,
+            "baseline_to": date_from,
+            "after_from": date_to,
+            "after_to": date_to,
+            "after_days": 0,
+            "total_days": total_days,
+            "baseline_days": 0,
+        }
+    after_to = available_dates[-1]
+    after_from = available_dates[-after_days]
+    baseline_to = after_from - timedelta(days=1)
+    baseline_from = max(date_from, after_from - timedelta(days=90))
+    baseline_days = max(0, (after_from - baseline_from).days)
+    return {
+        "baseline_from": baseline_from,
+        "baseline_to": baseline_to,
+        "after_from": after_from,
+        "after_to": after_to,
+        "after_days": after_days,
+        "total_days": total_days,
+        "baseline_days": baseline_days,
+    }
+
+
+def _mean_or_none(series: pd.Series | None) -> float | None:
+    if series is None or series.empty:
+        return None
+    value = series.mean()
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def _compute_baseline_after_metrics(
+    merged_daily: pd.DataFrame,
+    date_from: date,
+    date_to: date,
+) -> dict[str, Any]:
+    if merged_daily.empty or "metric_date" not in merged_daily.columns:
+        return {"insufficient_data": True}
+
+    data = merged_daily.copy()
+    data["metric_date"] = pd.to_datetime(data["metric_date"], errors="coerce")
+    data = data.dropna(subset=["metric_date"])
+    if data.empty:
+        return {"insufficient_data": True}
+
+    available_dates = sorted({d.date() for d in data["metric_date"]})
+    windows = _resolve_windows(date_from, date_to, available_dates)
+    baseline_from = windows["baseline_from"]
+    baseline_to = windows["baseline_to"]
+    after_from = windows["after_from"]
+    after_to = windows["after_to"]
+
+    baseline_mask = (data["metric_date"].dt.date >= baseline_from) & (data["metric_date"].dt.date <= baseline_to)
+    after_mask = (data["metric_date"].dt.date >= after_from) & (data["metric_date"].dt.date <= after_to)
+
+    baseline_slice = data.loc[baseline_mask]
+    after_slice = data.loc[after_mask]
+
+    if baseline_slice.empty or after_slice.empty:
+        return {**windows, "insufficient_data": True}
+
+    return {
+        **windows,
+        "insufficient_data": False,
+        "baseline_scrap_qty": _mean_or_none(baseline_slice.get("scrap_qty_sum")),
+        "after_scrap_qty": _mean_or_none(after_slice.get("scrap_qty_sum")),
+        "baseline_scrap_pln": _mean_or_none(baseline_slice.get("scrap_pln_sum")),
+        "after_scrap_pln": _mean_or_none(after_slice.get("scrap_pln_sum")),
+        "baseline_oee": _mean_or_none(baseline_slice.get("oee_avg")),
+        "after_oee": _mean_or_none(after_slice.get("oee_avg")),
+        "baseline_perf": _mean_or_none(baseline_slice.get("performance_avg")),
+        "after_perf": _mean_or_none(after_slice.get("performance_avg")),
+    }
+
+
+def _project_work_centers(
+    project: dict[str, Any],
     include_related: bool,
-) -> tuple[list[str], list[dict[str, Any]]]:
-    work_centers: list[str] = []
-    missing_wc_projects: list[dict[str, Any]] = []
-    for project in projects:
-        primary_wc = project.get("work_center")
-        related_wc = project.get("related_work_center") if include_related else None
-        centers = parse_work_centers(primary_wc, related_wc)
-        if not centers:
-            missing_wc_projects.append(project)
-            continue
-        work_centers.extend(centers)
-    deduped = []
-    seen = set()
-    for center in work_centers:
-        normalized = normalize_key(center)
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        deduped.append(center)
-    return deduped, missing_wc_projects
+) -> list[str]:
+    primary_wc = project.get("work_center")
+    related_wc = project.get("related_work_center") if include_related else None
+    return parse_work_centers(primary_wc, related_wc)
+
+
+@st.cache_data(hash_funcs={sqlite3.Connection: id})
+def _load_project_outcome_data(
+    con: sqlite3.Connection,
+    work_centers: tuple[str, ...],
+    date_from: date,
+    date_to: date,
+    remove_saturdays: bool,
+    remove_sundays: bool,
+) -> dict[str, Any]:
+    production_repo = ProductionDataRepository(con)
+    scrap_daily, kpi_daily, merged_daily = load_daily_frames(
+        production_repo,
+        list(work_centers),
+        date_from,
+        date_to,
+        currency="PLN",
+    )
+
+    scrap_daily_f = apply_weekend_filter(scrap_daily, remove_saturdays, remove_sundays)
+    kpi_daily_f = apply_weekend_filter(kpi_daily, remove_saturdays, remove_sundays)
+    merged_daily_f = apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
+
+    kpi_rows = kpi_daily.attrs.get("kpi_rows", [])
+    kpi_rows_df = pd.DataFrame(kpi_rows)
+    worktime_sum = 0.0
+    kpi_days = 0
+    if not kpi_rows_df.empty and "metric_date" in kpi_rows_df.columns:
+        kpi_rows_df["metric_date"] = pd.to_datetime(kpi_rows_df["metric_date"], errors="coerce")
+        kpi_rows_df = apply_weekend_filter(kpi_rows_df, remove_saturdays, remove_sundays)
+        if "worktime_min" in kpi_rows_df.columns:
+            worktime_sum = float(kpi_rows_df["worktime_min"].fillna(0).sum())
+        kpi_days = kpi_rows_df["metric_date"].dt.date.nunique()
+
+    scrap_days = 0
+    if not scrap_daily_f.empty and "metric_date" in scrap_daily_f.columns:
+        scrap_days = scrap_daily_f["metric_date"].dt.date.nunique()
+
+    if worktime_sum > 0:
+        volume_proxy = worktime_sum
+    elif kpi_days > 0:
+        volume_proxy = float(kpi_days)
+    else:
+        volume_proxy = float(scrap_days)
+
+    return {
+        "scrap_daily": scrap_daily_f,
+        "kpi_daily": kpi_daily_f,
+        "merged_daily": merged_daily_f,
+        "oee_scale": kpi_daily.attrs.get("oee_scale", "unknown"),
+        "perf_scale": kpi_daily.attrs.get("perf_scale", "unknown"),
+        "non_pln_currencies": scrap_daily.attrs.get("non_pln_currencies", []),
+        "volume_proxy": volume_proxy,
+    }
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -348,49 +484,94 @@ def render(con: sqlite3.Connection) -> None:
             outcome_available = False
 
     selected_projects: list[dict[str, Any]] = []
-    work_centers: list[str] = []
+    project_data_by_id: dict[str, dict[str, Any]] = {}
     missing_wc_projects: list[dict[str, Any]] = []
+    include_closed_projects = False
+    selected_project_ids: list[str] = []
+    open_action_project_ids: list[str] = []
+    remove_saturdays = False
+    remove_sundays = False
+    show_markers = True
+
+    if outcome_available:
+        filter_cols = st.columns([1.1, 1.1, 1.2])
+        remove_saturdays = filter_cols[0].checkbox("Usuń soboty", value=False, key="remove_saturdays")
+        remove_sundays = filter_cols[1].checkbox("Usuń niedziele", value=False, key="remove_sundays")
+        show_markers = filter_cols[2].checkbox("Pokaż markery zamknięcia akcji", value=True)
 
     if outcome_available:
         if mode == "Projekt":
             selected_project = projects_by_id.get(selected_project_id, {})
             selected_projects = [selected_project] if selected_project else []
-            primary_wc = selected_project.get("work_center")
-            if not (primary_wc and str(primary_wc).strip()):
-                st.error("Projekt nie ma przypisanego Work Center.")
+            if not selected_projects:
+                st.info("Brak projektu do analizy.")
                 outcome_available = False
-            else:
-                related_wc = selected_project.get("related_work_center") if include_related else None
-                work_centers = parse_work_centers(primary_wc, related_wc)
-                if not work_centers:
-                    st.error("Nie znaleziono Work Center dla projektu.")
-                    outcome_available = False
         else:
             if not champion_ids:
                 st.info("Brak championów do analizy.")
                 outcome_available = False
             else:
-                selected_projects = [
-                    project for project in projects if project.get("owner_champion_id") == selected_champion_id
-                ]
+                use_assignments = champion_repo.has_champion_projects_table()
+                if use_assignments:
+                    assigned_ids = champion_repo.get_assigned_projects(selected_champion_id)
+                    selected_projects = [project for project in projects if project.get("id") in assigned_ids]
+                else:
+                    selected_projects = [
+                        project for project in projects if project.get("owner_champion_id") == selected_champion_id
+                    ]
                 if not selected_projects:
                     st.info("Wybrany champion nie ma przypisanych projektów.")
                     outcome_available = False
-                else:
-                    work_centers, missing_wc_projects = _collect_portfolio_work_centers(
-                        selected_projects,
-                        include_related,
-                    )
-                    if missing_wc_projects:
-                        missing_names = ", ".join(
-                            sorted({project.get("name") or project.get("id") for project in missing_wc_projects})
-                        )
-                        st.warning(f"Pomijam projekty bez Work Center: {missing_names}.")
-                    if not work_centers:
-                        st.info("Brak Work Center do agregacji dla portfela.")
-                        outcome_available = False
+
+    if outcome_available and mode == "Champion":
+        include_closed_projects = st.checkbox(
+            "Uwzględnij zamknięte / wstrzymane projekty",
+            value=False,
+        )
+        if not include_closed_projects:
+            selected_projects = [
+                project for project in selected_projects if (project.get("status") or "active") == "active"
+            ]
+        if not selected_projects:
+            st.info("Brak aktywnych projektów w portfelu.")
+            outcome_available = False
 
     if outcome_available:
+        if mode == "Champion":
+            open_action_project_ids = [project["id"] for project in selected_projects if project.get("id")]
+        else:
+            open_action_project_ids = [selected_project_id] if selected_project_id else []
+
+    if outcome_available:
+        for project in selected_projects:
+            work_centers = _project_work_centers(project, include_related)
+            if not work_centers:
+                missing_wc_projects.append(project)
+                continue
+            data = _load_project_outcome_data(
+                con,
+                tuple(work_centers),
+                selected_from,
+                selected_to,
+                remove_saturdays,
+                remove_sundays,
+            )
+            project_data_by_id[project["id"]] = {
+                "project": project,
+                "work_centers": work_centers,
+                "data": data,
+            }
+
+        if missing_wc_projects:
+            missing_names = ", ".join(
+                sorted({project.get("name") or project.get("id") for project in missing_wc_projects})
+            )
+            if mode == "Projekt":
+                st.error("Projekt nie ma przypisanego Work Center.")
+                outcome_available = False
+            else:
+                st.warning(f"Pomijam projekty bez Work Center: {missing_names}.")
+
         if mode == "Champion":
             summary_rows = [
                 {
@@ -404,247 +585,304 @@ def render(con: sqlite3.Connection) -> None:
             st.caption(f"Liczba projektów w portfelu: {len(selected_projects)}")
             st.dataframe(summary_rows, use_container_width=True)
 
-        scrap_daily, kpi_daily, merged_daily = load_daily_frames(
-            production_repo,
-            work_centers,
-            selected_from,
-            selected_to,
-            currency="PLN",
-        )
-
-        if scrap_daily.empty and kpi_daily.empty:
-            st.info("Brak danych produkcyjnych dla wybranego zakresu.")
-            outcome_available = False
-
     if outcome_available:
-        non_pln_currencies = scrap_daily.attrs.get("non_pln_currencies", [])
-        if non_pln_currencies:
-            st.info(
-                "Dostępne są dane scrap w innych walutach (pominięto): "
-                + ", ".join(sorted(non_pln_currencies))
-            )
-
-        oee_scale = kpi_daily.attrs.get("oee_scale", "unknown")
-        perf_scale = kpi_daily.attrs.get("perf_scale", "unknown")
+        volume_order = sorted(
+            ((pid, info["data"]["volume_proxy"]) for pid, info in project_data_by_id.items()),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        ordered_project_ids = [pid for pid, _ in volume_order]
 
         if mode == "Champion":
-            action_project_ids = sorted({project.get("id") for project in selected_projects if project.get("id")})
+            show_all_projects = st.checkbox("Pokaż wszystkie projekty", value=False, key="show_all_projects")
+            if len(ordered_project_ids) <= 10:
+                default_selection = ordered_project_ids
+            else:
+                default_selection = ordered_project_ids if show_all_projects else ordered_project_ids[:10]
+
+            selected_project_ids = st.multiselect(
+                "Filtruj projekty",
+                ordered_project_ids,
+                default=default_selection,
+                format_func=lambda pid: projects_by_id[pid].get("name", pid),
+            )
+            if show_all_projects and len(ordered_project_ids) > 30:
+                st.warning("Pokazujesz ponad 30 projektów — widok może być wolniejszy.")
+            if not selected_project_ids:
+                st.info("Brak wybranych projektów do wyświetlenia.")
         else:
-            action_project_ids = [selected_project_id]
+            selected_project_ids = [selected_project_id]
+
+    single_project_actions: list[dict[str, Any]] = []
+    single_effectiveness_map: dict[str, dict[str, Any]] = {}
+    single_merged_daily: pd.DataFrame | None = None
+
+    if outcome_available and selected_project_ids:
+        for project_id in ordered_project_ids:
+            if project_id not in selected_project_ids:
+                continue
+            project_info = project_data_by_id.get(project_id)
+            if not project_info:
+                continue
+            project = project_info["project"]
+            project_name = project.get("name") or project.get("id")
+            work_centers = project_info["work_centers"]
+            data = project_info["data"]
+
+            st.subheader(project_name)
+
+            non_pln_currencies = data.get("non_pln_currencies", [])
+            if non_pln_currencies and mode == "Projekt":
+                st.info(
+                    "Dostępne są dane scrap w innych walutach (pominięto): "
+                    + ", ".join(sorted(non_pln_currencies))
+                )
+
+            action_project_ids = [project_id]
             if include_related:
                 work_center_keys = {normalize_key(center) for center in work_centers if center}
                 action_project_ids = (
                     [p["id"] for p in projects if _project_matches_work_centers(p, work_center_keys)]
-                    or [selected_project_id]
+                    or [project_id]
                 )
 
-        actions_map: dict[str, dict[str, Any]] = {}
-        for project_id in action_project_ids:
-            project_actions = action_repo.list_actions_for_project_outcome(project_id, selected_from, selected_to)
-            for action in project_actions:
-                action_id = str(action.get("id") or "")
-                if action_id and action_id not in actions_map:
-                    actions_map[action_id] = action
-        actions = list(actions_map.values())
+            actions_map: dict[str, dict[str, Any]] = {}
+            for action_project_id in action_project_ids:
+                project_actions = action_repo.list_actions_for_project_outcome(
+                    action_project_id,
+                    selected_from,
+                    selected_to,
+                )
+                for action in project_actions:
+                    action_id = str(action.get("id") or "")
+                    if action_id and action_id not in actions_map:
+                        actions_map[action_id] = action
+            actions = list(actions_map.values())
+            action_ids = [str(row.get("id")) for row in actions]
+            effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(action_ids)
 
-        action_ids = [str(row.get("id")) for row in actions]
-        effectiveness_map = effectiveness_repo.get_effectiveness_for_actions(action_ids)
-
-        closed_markers: list[dict[str, Any]] = []
-        for action in actions:
-            if action.get("status") != "done":
-                continue
-            action_id = str(action.get("id") or "")
-            owner = action.get("owner_name") or champion_names.get(action.get("owner_champion_id"), "—")
-            effect_row = effectiveness_map.get(action_id)
-            title = action.get("title") or ""
-            short_id = _short_action_id(action_id)
-            action_label = f"{title} ({short_id})" if short_id else title
-            closed_date = parse_date(action.get("closed_at"))
-            if closed_date and selected_from <= closed_date <= selected_to:
-                overlay_targets = _resolve_overlay_targets(action, rules_repo)
-                for overlay_target in overlay_targets:
-                    closed_markers.append(
-                        {
-                            "closed_at": pd.to_datetime(closed_date),
-                            "action_label": action_label,
-                            "owner": owner or "—",
-                            "category": action.get("category") or "—",
-                            "overlay_target": overlay_target,
-                            "overlay_label": OVERLAY_TARGET_LABELS.get(overlay_target, overlay_target),
-                            "delta_scrap_qty": _format_delta(_effectiveness_delta(effect_row, "scrap_qty")),
-                            "delta_scrap_pln": _format_delta(
-                                _effectiveness_delta(effect_row, "scrap_cost")
-                                or _effectiveness_delta(effect_row, "scrap_pln")
-                            ),
-                        }
-                    )
-
-        markers_df = pd.DataFrame(closed_markers)
-
-        if "metric_date" not in merged_daily.columns:
-            st.info("Brak danych produkcyjnych dla wybranego zakresu.")
-            outcome_available = False
-
-    if outcome_available:
-        merged_daily["metric_date"] = pd.to_datetime(merged_daily["metric_date"], errors="coerce")
-        merged_daily = merged_daily.dropna(subset=["metric_date"]).sort_values("metric_date")
-        if merged_daily.empty:
-            st.info("Brak poprawnych danych produkcyjnych dla wybranego zakresu.")
-            outcome_available = False
-
-    if outcome_available:
-        marker_count = len(markers_df)
-        show_markers_default = marker_count > 0 and marker_count <= 20
-        filter_cols = st.columns([1.2, 1.1, 1.1])
-        show_markers = filter_cols[0].checkbox(
-            "Pokaż markery zamknięcia akcji",
-            value=show_markers_default,
-            disabled=marker_count == 0,
-        )
-        remove_saturdays = filter_cols[1].checkbox("Usuń soboty", value=False, key="remove_saturdays")
-        remove_sundays = filter_cols[2].checkbox("Usuń niedziele", value=False, key="remove_sundays")
-
-        scrap_daily_f = apply_weekend_filter(scrap_daily, remove_saturdays, remove_sundays)
-        kpi_daily_f = apply_weekend_filter(kpi_daily, remove_saturdays, remove_sundays)
-        merged_daily_f = apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
-
-        if merged_daily_f.empty:
-            st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
-            outcome_available = False
-
-    if outcome_available:
-        metrics = compute_baseline_after_metrics(merged_daily_f, selected_from, selected_to)
-        if metrics.get("used_halves"):
-            st.warning("Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after).")
-
-        baseline_scrap_qty = metrics.get("baseline_scrap_qty")
-        after_scrap_qty = metrics.get("after_scrap_qty")
-        baseline_scrap_pln = metrics.get("baseline_scrap_pln")
-        after_scrap_pln = metrics.get("after_scrap_pln")
-        baseline_oee = metrics.get("baseline_oee")
-        after_oee = metrics.get("after_oee")
-        baseline_perf = metrics.get("baseline_perf")
-        after_perf = metrics.get("after_perf")
-
-        kpi_cols = st.columns(4)
-        kpi_cols[0].metric("Śr. scrap qty/dzień", format_metric_value(after_scrap_qty, "{:.2f}"))
-        kpi_cols[0].markdown(
-            scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"),
-            unsafe_allow_html=True,
-        )
-        kpi_cols[0].caption(f"Baseline: {format_metric_value(baseline_scrap_qty, '{:.2f}')}")
-
-        kpi_cols[1].metric("Śr. scrap PLN/dzień", format_metric_value(after_scrap_pln, "{:.2f}"))
-        kpi_cols[1].markdown(
-            scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"),
-            unsafe_allow_html=True,
-        )
-        kpi_cols[1].caption(f"Baseline: {format_metric_value(baseline_scrap_pln, '{:.2f}')}")
-
-        kpi_cols[2].metric(
-            "Śr. OEE%",
-            format_metric_value(after_oee, "{:.1f}%"),
-            delta=metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
-        )
-        kpi_cols[2].caption(f"Baseline: {format_metric_value(baseline_oee, '{:.1f}%')}")
-
-        kpi_cols[3].metric(
-            "Śr. Performance%",
-            format_metric_value(after_perf, "{:.1f}%"),
-            delta=metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
-        )
-        kpi_cols[3].caption(f"Baseline: {format_metric_value(baseline_perf, '{:.1f}%')}")
-
-        st.caption("Dla scrap spadek = poprawa.")
-        if oee_scale != "unknown" or perf_scale != "unknown":
-            st.caption(f"Wykryta skala KPI: OEE={oee_scale}, Performance={perf_scale}.")
-
-        if marker_count == 0:
-            st.caption("Brak zamkniętych akcji w wybranym zakresie dat.")
-        if marker_count > 20:
-            st.warning(
-                "W zakresie jest dużo zamkniętych akcji — aby zachować czytelność, "
-                "markery są domyślnie ukryte."
-            )
-            if show_markers:
-                show_all_markers = st.checkbox("Pokaż wszystkie markery", value=False)
-                if not show_all_markers:
-                    markers_df = markers_df.sort_values("closed_at").tail(20)
-                    st.caption("Pokazano 20 ostatnich zamkniętych akcji.")
-
-        chart_cols = st.columns(2)
-        if not scrap_daily_f.empty:
-            chart_cols[0].altair_chart(
-                _line_chart_with_markers(
-                    scrap_daily_f,
-                    "scrap_qty_sum",
-                    "Scrap qty",
-                    "Scrap qty (suma)",
-                    markers_df,
-                    show_markers,
-                    "SCRAP_QTY",
-                ),
-                use_container_width=True,
-            )
-            chart_cols[1].altair_chart(
-                _line_chart_with_markers(
-                    scrap_daily_f,
-                    "scrap_pln_sum",
-                    "Scrap PLN",
-                    "Scrap PLN (suma)",
-                    markers_df,
-                    show_markers,
-                    "SCRAP_COST",
-                ),
-                use_container_width=True,
-            )
-        else:
-            st.info("Brak danych scrap (PLN) w wybranym zakresie.")
-
-        chart_cols = st.columns(2)
-        if not kpi_daily_f.empty:
-            chart_cols[0].altair_chart(
-                _line_chart_with_markers(
-                    kpi_daily_f,
-                    "oee_avg",
-                    "OEE (%)",
-                    "OEE (średnia, %)",
-                    markers_df,
-                    show_markers,
-                    "OEE",
-                ),
-                use_container_width=True,
-            )
-            chart_cols[1].altair_chart(
-                _line_chart_with_markers(
-                    kpi_daily_f,
-                    "performance_avg",
-                    "Performance (%)",
-                    "Performance (średnia, %)",
-                    markers_df,
-                    show_markers,
-                    "PERFORMANCE",
-                ),
-                use_container_width=True,
-            )
-        else:
-            st.info("Brak danych KPI w wybranym zakresie.")
-
-        st.caption(
-            "Markery pokazują daty zamknięcia akcji oraz docelowe wykresy "
-            "(ustawiane w Global Settings → reguły kategorii)."
-        )
-
-        st.subheader("Akcje w wybranym zakresie")
-        if not actions:
-            st.caption("Brak akcji w wybranym zakresie.")
-        else:
-            action_table: list[dict[str, Any]] = []
-            for action in sorted(actions, key=_actions_sort_key):
+            closed_markers: list[dict[str, Any]] = []
+            for action in actions:
+                if action.get("status") != "done":
+                    continue
                 action_id = str(action.get("id") or "")
                 owner = action.get("owner_name") or champion_names.get(action.get("owner_champion_id"), "—")
                 effect_row = effectiveness_map.get(action_id)
+                title = action.get("title") or ""
+                short_id = _short_action_id(action_id)
+                action_label = f"{title} ({short_id})" if short_id else title
+                closed_date = parse_date(action.get("closed_at"))
+                if closed_date and selected_from <= closed_date <= selected_to:
+                    overlay_targets = _resolve_overlay_targets(action, rules_repo)
+                    for overlay_target in overlay_targets:
+                        closed_markers.append(
+                            {
+                                "closed_at": pd.to_datetime(closed_date),
+                                "action_label": action_label,
+                                "owner": owner or "—",
+                                "category": action.get("category") or "—",
+                                "overlay_target": overlay_target,
+                                "overlay_label": OVERLAY_TARGET_LABELS.get(overlay_target, overlay_target),
+                                "delta_scrap_qty": _format_delta(_effectiveness_delta(effect_row, "scrap_qty")),
+                                "delta_scrap_pln": _format_delta(
+                                    _effectiveness_delta(effect_row, "scrap_cost")
+                                    or _effectiveness_delta(effect_row, "scrap_pln")
+                                ),
+                            }
+                        )
+
+            markers_df = pd.DataFrame(closed_markers)
+            marker_count = len(markers_df)
+
+            merged_daily_f = data["merged_daily"]
+            metrics = _compute_baseline_after_metrics(merged_daily_f, selected_from, selected_to)
+            insufficient_data = metrics.get("insufficient_data", True)
+
+            if insufficient_data:
+                st.warning("Brak danych do wyliczenia baseline/after dla wybranego zakresu.")
+
+            baseline_scrap_qty = metrics.get("baseline_scrap_qty")
+            after_scrap_qty = metrics.get("after_scrap_qty")
+            baseline_scrap_pln = metrics.get("baseline_scrap_pln")
+            after_scrap_pln = metrics.get("after_scrap_pln")
+            baseline_oee = metrics.get("baseline_oee")
+            after_oee = metrics.get("after_oee")
+            baseline_perf = metrics.get("baseline_perf")
+            after_perf = metrics.get("after_perf")
+
+            kpi_cols = st.columns(4)
+            kpi_cols[0].metric("Śr. scrap qty/dzień", format_metric_value(after_scrap_qty, "{:.2f}"))
+            kpi_cols[0].markdown(
+                scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"),
+                unsafe_allow_html=True,
+            )
+            kpi_cols[0].caption(f"Baseline: {format_metric_value(baseline_scrap_qty, '{:.2f}')}")
+
+            kpi_cols[1].metric("Śr. scrap PLN/dzień", format_metric_value(after_scrap_pln, "{:.2f}"))
+            kpi_cols[1].markdown(
+                scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"),
+                unsafe_allow_html=True,
+            )
+            kpi_cols[1].caption(f"Baseline: {format_metric_value(baseline_scrap_pln, '{:.2f}')}")
+
+            kpi_cols[2].metric(
+                "Śr. OEE%",
+                format_metric_value(after_oee, "{:.1f}%"),
+                delta=metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
+            )
+            kpi_cols[2].caption(f"Baseline: {format_metric_value(baseline_oee, '{:.1f}%')}")
+
+            kpi_cols[3].metric(
+                "Śr. Performance%",
+                format_metric_value(after_perf, "{:.1f}%"),
+                delta=metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
+            )
+            kpi_cols[3].caption(f"Baseline: {format_metric_value(baseline_perf, '{:.1f}%')}")
+
+            caption_line = "Baseline = max 90 dni przed oknem AFTER (14/7/4); AFTER = ostatnie okno."
+            after_days = metrics.get("after_days") or 0
+            total_days = metrics.get("total_days") or 0
+            if total_days and total_days < 28 and after_days:
+                caption_line += f" Zakres < 28 dni → okno AFTER = {after_days} dni."
+            st.caption(caption_line)
+            st.caption("Dla scrap spadek = poprawa.")
+
+            oee_scale = data.get("oee_scale", "unknown")
+            perf_scale = data.get("perf_scale", "unknown")
+            if oee_scale != "unknown" or perf_scale != "unknown":
+                st.caption(f"Wykryta skala KPI: OEE={oee_scale}, Performance={perf_scale}.")
+
+            if marker_count == 0:
+                st.caption("Brak zamkniętych akcji w wybranym zakresie dat.")
+            if marker_count > 20:
+                st.warning(
+                    "W zakresie jest dużo zamkniętych akcji — aby zachować czytelność, "
+                    "markery są domyślnie ukryte."
+                )
+                if show_markers:
+                    show_all_markers = st.checkbox(
+                        "Pokaż wszystkie markery",
+                        value=False,
+                        key=f"show_all_markers_{project_id}",
+                    )
+                    if not show_all_markers:
+                        markers_df = markers_df.sort_values("closed_at").tail(20)
+                        st.caption("Pokazano 20 ostatnich zamkniętych akcji.")
+
+            chart_cols = st.columns(2)
+            scrap_daily_f = data["scrap_daily"]
+            if not scrap_daily_f.empty:
+                chart_cols[0].altair_chart(
+                    _line_chart_with_markers(
+                        scrap_daily_f,
+                        "scrap_qty_sum",
+                        "Scrap qty",
+                        "Scrap qty (suma)",
+                        markers_df,
+                        show_markers,
+                        "SCRAP_QTY",
+                    ),
+                    use_container_width=True,
+                )
+                chart_cols[1].altair_chart(
+                    _line_chart_with_markers(
+                        scrap_daily_f,
+                        "scrap_pln_sum",
+                        "Scrap PLN",
+                        "Scrap PLN (suma)",
+                        markers_df,
+                        show_markers,
+                        "SCRAP_COST",
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.info("Brak danych scrap (PLN) w wybranym zakresie.")
+
+            chart_cols = st.columns(2)
+            kpi_daily_f = data["kpi_daily"]
+            if not kpi_daily_f.empty:
+                chart_cols[0].altair_chart(
+                    _line_chart_with_markers(
+                        kpi_daily_f,
+                        "oee_avg",
+                        "OEE (%)",
+                        "OEE (średnia, %)",
+                        markers_df,
+                        show_markers,
+                        "OEE",
+                    ),
+                    use_container_width=True,
+                )
+                chart_cols[1].altair_chart(
+                    _line_chart_with_markers(
+                        kpi_daily_f,
+                        "performance_avg",
+                        "Performance (%)",
+                        "Performance (średnia, %)",
+                        markers_df,
+                        show_markers,
+                        "PERFORMANCE",
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.info("Brak danych KPI w wybranym zakresie.")
+
+            st.caption(
+                "Markery pokazują daty zamknięcia akcji oraz docelowe wykresy "
+                "(ustawiane w Global Settings → reguły kategorii)."
+            )
+
+            if mode == "Projekt":
+                single_project_actions = actions
+                single_effectiveness_map = effectiveness_map
+                single_merged_daily = merged_daily_f
+
+    if outcome_available:
+        with st.expander("Akcje (otwarte)", expanded=False):
+            if not open_action_project_ids:
+                st.caption("Brak projektów do filtrowania otwartych akcji.")
+            else:
+                open_actions = action_repo.list_open_actions(open_action_project_ids)
+                if not open_actions:
+                    st.caption("Brak otwartych akcji.")
+                else:
+                    open_table = []
+                    today = date.today()
+                    for action in open_actions:
+                        due_date = parse_date(action.get("due_date"))
+                        created_date = parse_date(action.get("created_at"))
+                        overdue = bool(due_date and due_date < today)
+                        open_table.append(
+                            {
+                                "Utworzono": created_date.isoformat() if created_date else "—",
+                                "Termin": due_date.isoformat() if due_date else "—",
+                                "Status": action.get("status") or "—",
+                                "Priorytet": action.get("priority") or "—",
+                                "Projekt": action.get("project_name")
+                                or projects_by_id.get(action.get("project_id"), {}).get(
+                                    "name",
+                                    action.get("project_id") or "—",
+                                ),
+                                "Tytuł": action.get("title") or "—",
+                                "Owner": action.get("owner_name")
+                                or champion_names.get(action.get("owner_champion_id"), "—"),
+                                "Po terminie": "⚠️" if overdue else "—",
+                            }
+                        )
+                    st.dataframe(open_table, use_container_width=True)
+
+    if outcome_available and mode == "Projekt":
+        st.subheader("Akcje w wybranym zakresie")
+        if not single_project_actions:
+            st.caption("Brak akcji w wybranym zakresie.")
+        else:
+            action_table: list[dict[str, Any]] = []
+            for action in sorted(single_project_actions, key=_actions_sort_key):
+                action_id = str(action.get("id") or "")
+                owner = action.get("owner_name") or champion_names.get(action.get("owner_champion_id"), "—")
+                effect_row = single_effectiveness_map.get(action_id)
                 effect_label, _ = _effectiveness_style(effect_row)
                 title = action.get("title") or ""
                 short_id = _short_action_id(action_id)
@@ -669,10 +907,10 @@ def render(con: sqlite3.Connection) -> None:
             st.dataframe(action_table, use_container_width=True)
 
         st.subheader("Dzienny podgląd (audit)")
-        if merged_daily_f.empty:
+        if single_merged_daily is None or single_merged_daily.empty:
             st.caption("Brak danych do wyświetlenia w tabeli.")
         else:
-            merged_daily_f = merged_daily_f.sort_values("metric_date")
+            merged_daily_f = single_merged_daily.sort_values("metric_date")
             if len(merged_daily_f) > 180:
                 merged_daily_f = merged_daily_f.tail(180)
             audit_rows = merged_daily_f.rename(
