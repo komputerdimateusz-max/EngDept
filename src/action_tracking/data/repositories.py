@@ -1339,9 +1339,10 @@ class ActionRepository:
                 if not _table_exists(self.con, table):
                     continue
                 cols = _table_columns(self.con, table)
-                if "action_id" not in cols:
-                    continue
-                self.con.execute(f"DELETE FROM {table} WHERE action_id = ?", (action_id,))
+                for col in ("action_id", "added_action_id"):
+                    if col not in cols:
+                        continue
+                    self.con.execute(f"DELETE FROM {table} WHERE {col} = ?", (action_id,))
 
             self.con.execute("DELETE FROM actions WHERE id = ?", (action_id,))
             self.con.commit()
