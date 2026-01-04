@@ -1236,10 +1236,6 @@ class ActionRepository:
             return action_id
         return action_id
 
-    # ============================
-    # ✅ MISSING METHODS (FIX)
-    # ============================
-
     def update_action(self, action_id: str, data: dict[str, Any]) -> None:
         """
         Update action row in DB.
@@ -1273,9 +1269,11 @@ class ActionRepository:
         if "created_at" not in (data or {}) or not (data or {}).get("created_at"):
             merged["created_at"] = existing.get("created_at") or date.today().isoformat()
 
-        payload = self._normalize_action_payload(action_id, merged)
+        try:
+            payload = self._normalize_action_payload(action_id, merged)
+        except ValueError:
+            return
 
-        # Build UPDATE dynamically
         allowed_cols = [
             "project_id",
             "analysis_id",
@@ -1325,10 +1323,30 @@ class ActionRepository:
             return
         if not _table_exists(self.con, "actions"):
             return
+        _configure_sqlite_connection(self.con)
         try:
+            self.con.execute("BEGIN")
+
+            dependent_tables = [
+                "action_effectiveness",
+                "action_changelog",
+                "actions_changelog",
+                "email_notifications_log",
+                "analysis_actions",
+                "analysis_action_links",
+            ]
+            for table in dependent_tables:
+                if not _table_exists(self.con, table):
+                    continue
+                cols = _table_columns(self.con, table)
+                if "action_id" not in cols:
+                    continue
+                self.con.execute(f"DELETE FROM {table} WHERE action_id = ?", (action_id,))
+
             self.con.execute("DELETE FROM actions WHERE id = ?", (action_id,))
             self.con.commit()
         except sqlite3.Error:
+            _rollback_safely(self.con)
             return
 
     def list_action_changelog(
@@ -1341,6 +1359,21 @@ class ActionRepository:
         """
         _ = project_id  # reserved for future filtering
         return self.list_changelog(limit=limit, action_id=action_id)
+
+    def list_changelog(self, limit: int = 50, action_id: str | None = None) -> list[dict[str, Any]]:
+        return _list_changelog_generic(
+            self.con,
+            table_candidates=[
+                "action_changelog",
+                "actions_changelog",
+                "changelog_actions",
+                "changelog",
+                "change_log",
+                "audit_log",
+            ],
+            limit=limit,
+            entity_id=action_id,
+        )
 
     # ============================
     # Existing logic
