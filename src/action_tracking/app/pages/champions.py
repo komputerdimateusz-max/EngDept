@@ -44,6 +44,17 @@ def _format_changes(event_type: str, changes: dict[str, Any]) -> str:
     return "; ".join(parts) if parts else "Brak danych."
 
 
+def _format_assigned_projects(assigned_names: list[str], max_names: int = 4) -> str:
+    if not assigned_names:
+        return "—"
+    total = len(assigned_names)
+    shown = assigned_names[:max_names]
+    label = "; ".join(shown)
+    if total <= max_names:
+        return f"{total}: {label}"
+    return f"{total}: {label} +{total - max_names}"
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Champions")
 
@@ -58,7 +69,7 @@ def render(con: sqlite3.Connection) -> None:
 
     table_rows = []
     for champion in champions:
-        assigned_ids = repo.get_assigned_projects(champion["id"])
+        assigned_ids = repo.get_assigned_projects_with_fallback(champion["id"])
         assigned_names = [project_names.get(pid, pid) for pid in assigned_ids]
         table_rows.append(
             {
@@ -68,7 +79,7 @@ def render(con: sqlite3.Connection) -> None:
                 "Data zatrudnienia": champion["hire_date"],
                 "Stanowisko": champion["position"],
                 "Aktywny": "Tak" if int(champion["active"]) == 1 else "Nie",
-                "Przypisane projekty": ", ".join(assigned_names),
+                "Przypisane projekty": _format_assigned_projects(assigned_names),
             }
         )
 
@@ -90,7 +101,7 @@ def render(con: sqlite3.Connection) -> None:
     editing = selected_id != "(nowy)"
     selected = champions_by_id.get(selected_id) if editing else {}
 
-    assigned_default = repo.get_assigned_projects(selected_id) if editing else []
+    assigned_default = repo.get_assigned_projects_with_fallback(selected_id) if editing else []
     hire_date_value = None
     if selected.get("hire_date"):
         hire_date_value = date.fromisoformat(selected["hire_date"])
