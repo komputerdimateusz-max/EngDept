@@ -311,7 +311,7 @@ def render(con: sqlite3.Connection) -> None:
 
     st.caption("Dla scrap spadek = poprawa.")
     if oee_scale != "unknown" or perf_scale != "unknown":
-        st.caption(f"Wykryta skala KPI: OEE={oee_scale}, Performance={perf_scale}.")
+        st.caption("KPI zapisane w bazie jako procenty (0-100).")
 
     markers_df = pd.DataFrame()
     single_wc = len(selected_work_centers) == 1
