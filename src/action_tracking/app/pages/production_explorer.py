@@ -21,26 +21,14 @@ from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_LABELS,
     default_overlay_targets,
 )
-
-
-def _apply_weekend_filter(
-    df: pd.DataFrame,
-    remove_sat: bool,
-    remove_sun: bool,
-) -> pd.DataFrame:
-    if df.empty or "metric_date" not in df.columns:
-        return df
-    temp = df.copy()
-    if not pd.api.types.is_datetime64_any_dtype(temp["metric_date"]):
-        temp["metric_date"] = pd.to_datetime(temp["metric_date"], errors="coerce")
-    temp = temp.dropna(subset=["metric_date"])
-    weekday = temp["metric_date"].dt.weekday
-    mask = pd.Series(True, index=temp.index)
-    if remove_sat:
-        mask &= weekday != 5
-    if remove_sun:
-        mask &= weekday != 6
-    return temp.loc[mask]
+from action_tracking.services.production_outcome import (
+    apply_weekend_filter,
+    compute_baseline_after_metrics,
+    format_metric_value,
+    load_daily_frames,
+    metric_delta_label,
+    scrap_delta_badge,
+)
 
 
 def _weighted_or_mean(values: pd.Series, weights: pd.Series | None) -> float | None:
@@ -56,41 +44,6 @@ def _weighted_or_mean(values: pd.Series, weights: pd.Series | None) -> float | N
         return float(weighted_values.sum() / valid_weights.sum())
     mean_value = values.mean()
     return None if pd.isna(mean_value) else float(mean_value)
-
-
-def _daily_scrap_aggregation(scrap_df: pd.DataFrame) -> pd.DataFrame:
-    if scrap_df.empty:
-        return pd.DataFrame(columns=["metric_date", "scrap_qty_sum", "scrap_pln_sum"])
-    return (
-        scrap_df.groupby("metric_date", as_index=False)
-        .agg(
-            scrap_qty_sum=("scrap_qty", "sum"),
-            scrap_pln_sum=("scrap_cost_amount", "sum"),
-        )
-        .sort_values("metric_date")
-    )
-
-
-def _daily_kpi_aggregation(kpi_df: pd.DataFrame) -> pd.DataFrame:
-    if kpi_df.empty:
-        return pd.DataFrame(columns=["metric_date", "oee_avg", "performance_avg"])
-    return (
-        kpi_df.groupby("metric_date")
-        .apply(
-            lambda group: pd.Series(
-                {
-                    "oee_avg": _weighted_or_mean(
-                        group["oee_pct"], group.get("worktime_min")
-                    ),
-                    "performance_avg": _weighted_or_mean(
-                        group["performance_pct"], group.get("worktime_min")
-                    ),
-                }
-            )
-        )
-        .reset_index()
-        .sort_values("metric_date")
-    )
 
 
 def _weekly_bucket(df: pd.DataFrame, date_col: str = "metric_date") -> pd.Series:
@@ -257,37 +210,26 @@ def render(con: sqlite3.Connection) -> None:
         return
 
     work_center_filter = selected_work_centers
-    scrap_rows_all = production_repo.list_scrap_daily(
+    currency_filter = "PLN" if currency == "PLN" else None
+    scrap_daily, kpi_daily, merged_daily = load_daily_frames(
+        production_repo,
         work_center_filter,
         selected_from,
         selected_to,
-        currency=None,
-    )
-    if currency == "PLN":
-        scrap_rows = [
-            row
-            for row in scrap_rows_all
-            if row.get("scrap_cost_currency") == "PLN"
-        ]
-    else:
-        scrap_rows = scrap_rows_all
-    kpi_rows = production_repo.list_kpi_daily(
-        work_center_filter,
-        selected_from,
-        selected_to,
+        currency=currency_filter,
     )
 
-    if not scrap_rows and not kpi_rows:
+    scrap_rows = scrap_daily.attrs.get("scrap_rows_filtered", [])
+    kpi_rows = kpi_daily.attrs.get("kpi_rows", [])
+    oee_scale = kpi_daily.attrs.get("oee_scale", "unknown")
+    perf_scale = kpi_daily.attrs.get("perf_scale", "unknown")
+
+    if scrap_daily.empty and kpi_daily.empty:
         st.info("Brak danych produkcyjnych dla wybranych filtrów.")
         return
 
     if currency == "PLN":
-        non_pln = {
-            row.get("scrap_cost_currency")
-            for row in scrap_rows_all
-            if row.get("scrap_cost_currency")
-            and row.get("scrap_cost_currency") != "PLN"
-        }
+        non_pln = scrap_daily.attrs.get("non_pln_currencies", [])
         if non_pln:
             st.info(
                 "Dostępne są dane scrap w innych walutach (pominięto): "
@@ -309,10 +251,9 @@ def render(con: sqlite3.Connection) -> None:
         st.caption("Filtry weekendów dotyczą tylko widoku dziennego.")
 
     if daily_view:
-        scrap_daily = _daily_scrap_aggregation(scrap_df)
-        kpi_daily = _daily_kpi_aggregation(kpi_df)
-        scrap_daily = _apply_weekend_filter(scrap_daily, remove_saturdays, remove_sundays)
-        kpi_daily = _apply_weekend_filter(kpi_daily, remove_saturdays, remove_sundays)
+        scrap_daily = apply_weekend_filter(scrap_daily, remove_saturdays, remove_sundays)
+        kpi_daily = apply_weekend_filter(kpi_daily, remove_saturdays, remove_sundays)
+        merged_daily = apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
     else:
         scrap_daily = _weekly_scrap_aggregation(scrap_df)
         kpi_daily = _weekly_kpi_aggregation(kpi_df)
@@ -320,6 +261,57 @@ def render(con: sqlite3.Connection) -> None:
     if daily_view and (scrap_daily.empty and kpi_daily.empty):
         st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
         return
+
+    baseline_daily = apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
+    if baseline_daily.empty:
+        st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
+        return
+
+    metrics = compute_baseline_after_metrics(baseline_daily, selected_from, selected_to)
+    if metrics.get("used_halves"):
+        st.warning("Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after).")
+
+    baseline_scrap_qty = metrics.get("baseline_scrap_qty")
+    after_scrap_qty = metrics.get("after_scrap_qty")
+    baseline_scrap_pln = metrics.get("baseline_scrap_pln")
+    after_scrap_pln = metrics.get("after_scrap_pln")
+    baseline_oee = metrics.get("baseline_oee")
+    after_oee = metrics.get("after_oee")
+    baseline_perf = metrics.get("baseline_perf")
+    after_perf = metrics.get("after_perf")
+
+    kpi_cols = st.columns(4)
+    kpi_cols[0].metric("Śr. scrap qty/dzień", format_metric_value(after_scrap_qty, "{:.2f}"))
+    kpi_cols[0].markdown(
+        scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"),
+        unsafe_allow_html=True,
+    )
+    kpi_cols[0].caption(f"Baseline: {format_metric_value(baseline_scrap_qty, '{:.2f}')}")
+
+    kpi_cols[1].metric("Śr. scrap PLN/dzień", format_metric_value(after_scrap_pln, "{:.2f}"))
+    kpi_cols[1].markdown(
+        scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"),
+        unsafe_allow_html=True,
+    )
+    kpi_cols[1].caption(f"Baseline: {format_metric_value(baseline_scrap_pln, '{:.2f}')}")
+
+    kpi_cols[2].metric(
+        "Śr. OEE%",
+        format_metric_value(after_oee, "{:.1f}%"),
+        delta=metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
+    )
+    kpi_cols[2].caption(f"Baseline: {format_metric_value(baseline_oee, '{:.1f}%')}")
+
+    kpi_cols[3].metric(
+        "Śr. Performance%",
+        format_metric_value(after_perf, "{:.1f}%"),
+        delta=metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
+    )
+    kpi_cols[3].caption(f"Baseline: {format_metric_value(baseline_perf, '{:.1f}%')}")
+
+    st.caption("Dla scrap spadek = poprawa.")
+    if oee_scale != "unknown" or perf_scale != "unknown":
+        st.caption(f"Wykryta skala KPI: OEE={oee_scale}, Performance={perf_scale}.")
 
     markers_df = pd.DataFrame()
     single_wc = len(selected_work_centers) == 1
