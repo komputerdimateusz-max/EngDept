@@ -5,6 +5,8 @@ from datetime import date, datetime, timedelta, timezone
 import re
 from typing import Any
 
+from action_tracking.services.kpi_delta import compute_kpi_pp_delta, compute_scrap_delta
+
 
 def normalize_wc(value: str | None) -> str:
     if not value:
@@ -127,11 +129,10 @@ def compute_scrap_effectiveness(
     baseline_days, baseline_avg = _window_stats(baseline_from, baseline_to)
     after_days, after_avg = _window_stats(after_from, after_to)
 
-    delta = None
-    if baseline_avg is not None and after_avg is not None:
-        delta = after_avg - baseline_avg
+    delta = compute_scrap_delta(after_avg, baseline_avg)
+    delta_abs = delta.get("delta_abs")
+    pct_change = delta.get("delta_pct")
 
-    pct_change = None
     classification = "insufficient_data"
     if baseline_days >= 5 and after_days >= 5:
         if baseline_avg == 0:
@@ -139,17 +140,13 @@ def compute_scrap_effectiveness(
                 classification = "no_scrap"
             else:
                 classification = "worse"
-        else:
-            pct_change = (after_avg - baseline_avg) / baseline_avg
-            if pct_change <= -0.10:
+        elif isinstance(pct_change, (int, float)):
+            if pct_change <= -10:
                 classification = "effective"
-            elif pct_change < 0.10:
+            elif pct_change < 10:
                 classification = "no_change"
             else:
                 classification = "worse"
-
-    if pct_change is None and baseline_avg not in (None, 0) and after_avg is not None:
-        pct_change = (after_avg - baseline_avg) / baseline_avg
 
     return {
         **base_payload,
@@ -157,7 +154,7 @@ def compute_scrap_effectiveness(
         "after_days": after_days,
         "baseline_avg": baseline_avg,
         "after_avg": after_avg,
-        "delta": delta,
+        "delta": delta_abs,
         "pct_change": pct_change,
         "classification": classification,
     }
@@ -168,7 +165,7 @@ def compute_kpi_effectiveness(
     work_centers: list[str],
     kpi_rows: list[dict[str, Any]],
     metric_key: str,
-    threshold: float = 0.05,
+    threshold: float = 5.0,
 ) -> dict[str, Any] | None:
     closed_date = parse_date(action.get("closed_at"))
     if closed_date is None:
@@ -222,10 +219,8 @@ def compute_kpi_effectiveness(
     baseline_days, baseline_avg = _window_stats(baseline_from, baseline_to)
     after_days, after_avg = _window_stats(after_from, after_to)
 
-    delta = None
-    if baseline_avg is not None and after_avg is not None:
-        delta = after_avg - baseline_avg
-
+    delta = compute_kpi_pp_delta(after_avg, baseline_avg)
+    delta_pp = delta.get("delta_pp")
     pct_change = None
     classification = "insufficient_data"
     if baseline_days >= 5 and after_days >= 5:
@@ -234,17 +229,13 @@ def compute_kpi_effectiveness(
                 classification = "no_change"
             else:
                 classification = "effective"
-        else:
-            pct_change = (after_avg - baseline_avg) / baseline_avg
-            if pct_change >= threshold:
+        elif isinstance(delta_pp, (int, float)):
+            if delta_pp >= threshold:
                 classification = "effective"
-            elif pct_change <= -threshold:
+            elif delta_pp <= -threshold:
                 classification = "worse"
             else:
                 classification = "no_change"
-
-    if pct_change is None and baseline_avg not in (None, 0) and after_avg is not None:
-        pct_change = (after_avg - baseline_avg) / baseline_avg
 
     return {
         **base_payload,
@@ -252,7 +243,7 @@ def compute_kpi_effectiveness(
         "after_days": after_days,
         "baseline_avg": baseline_avg,
         "after_avg": after_avg,
-        "delta": delta,
+        "delta": delta_pp,
         "pct_change": pct_change,
         "classification": classification,
     }

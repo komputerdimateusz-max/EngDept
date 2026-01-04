@@ -5,6 +5,8 @@ from typing import Any
 
 import pandas as pd
 
+from action_tracking.services.kpi_delta import compute_kpi_pp_delta, compute_scrap_delta
+
 
 def window_bounds(
     date_from: date,
@@ -179,12 +181,11 @@ def metric_delta_label(
 ) -> str:
     if baseline is None or after is None:
         return "—"
-    delta = after - baseline
-    if baseline == 0:
-        pct_label = "n/a"
-    else:
-        pct_label = f"{delta / baseline:+.1%}"
-    return f"{fmt.format(delta)} ({pct_label})"
+    delta = compute_kpi_pp_delta(after, baseline)
+    delta_pp = delta.get("delta_pp")
+    if delta_pp is None:
+        return "—"
+    return fmt.format(delta_pp)
 
 
 def scrap_delta_badge(
@@ -196,12 +197,17 @@ def scrap_delta_badge(
         text = "—"
         color = "#616161"
         return _scrap_delta_badge_html(text, color)
-    delta = after - baseline
-    if delta == 0:
+    delta = compute_scrap_delta(after, baseline)
+    delta_abs = delta.get("delta_abs")
+    if delta_abs is None:
+        text = "—"
+        color = "#616161"
+        return _scrap_delta_badge_html(text, color)
+    if delta_abs == 0:
         text = "→ 0"
         color = "#616161"
         return _scrap_delta_badge_html(text, color)
-    if delta < 0:
+    if delta_abs < 0:
         arrow = "↓"
         sign = "-"
         color = "#2e7d32"
@@ -209,11 +215,12 @@ def scrap_delta_badge(
         arrow = "↑"
         sign = "+"
         color = "#c62828"
-    if baseline == 0:
+    delta_pct = delta.get("delta_pct")
+    if delta_pct is None:
         pct_label = "n/a"
     else:
-        pct_label = f"{delta / baseline:+.1%}"
-    value_label = f"{sign}{unit_fmt.format(abs(delta))}"
+        pct_label = f"{delta_pct:+.1f}%"
+    value_label = f"{sign}{unit_fmt.format(abs(delta_abs))}"
     text = f"{arrow} {value_label} ({pct_label})"
     return _scrap_delta_badge_html(text, color)
 

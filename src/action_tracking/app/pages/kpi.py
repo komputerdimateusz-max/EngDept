@@ -291,7 +291,7 @@ def render(con: sqlite3.Connection) -> None:
             {
                 "Action": row.get("title") or "—",
                 "Project": project_names.get(row.get("project_id"), row.get("project_id") or "—"),
-                "Pct change": "—" if not isinstance(pct_change, (int, float)) else f"{pct_change:.0%}",
+                "Pct change": "—" if not isinstance(pct_change, (int, float)) else f"{pct_change:.0f}%",
                 "Baseline avg": effect.get("baseline_avg"),
                 "After avg": effect.get("after_avg"),
                 "_pct_change_value": pct_change if isinstance(pct_change, (int, float)) else None,
