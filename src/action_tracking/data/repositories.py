@@ -2156,6 +2156,30 @@ class ChampionRepository:
         )
         return [row["project_id"] for row in cur.fetchall()]
 
+    def get_assigned_projects_with_fallback(self, champion_id: str) -> list[str]:
+        assigned = self.get_assigned_projects(champion_id)
+        if assigned:
+            return assigned
+
+        # Fallback for legacy data: use projects.owner_champion_id when no explicit assignments exist.
+        if not _table_exists(self.con, "projects"):
+            return []
+        project_cols = _table_columns(self.con, "projects")
+        if "owner_champion_id" not in project_cols or "id" not in project_cols:
+            return []
+
+        order_by = "name" if "name" in project_cols else "id"
+        cur = self.con.execute(
+            f"""
+            SELECT id
+            FROM projects
+            WHERE owner_champion_id = ?
+            ORDER BY {order_by}
+            """,
+            (champion_id,),
+        )
+        return [row["id"] for row in cur.fetchall()]
+
     def set_assigned_projects(self, champion_id: str, project_ids: list[str]) -> None:
         if not _table_exists(self.con, "champion_projects"):
             return
