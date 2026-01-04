@@ -1121,6 +1121,71 @@ class ActionRepository:
             row.setdefault("owner_name", None)
         return rows
 
+    def list_open_actions(self, project_ids: list[str] | None = None) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "actions"):
+            return []
+
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols or "status" not in action_cols:
+            return []
+
+        select_cols = [f"a.{c}" for c in action_cols]
+        if "id" not in action_cols:
+            select_cols.append("a.rowid AS id")
+
+        joins: list[str] = []
+        project_name_select = "NULL AS project_name"
+        if _table_exists(self.con, "projects") and "project_id" in action_cols:
+            project_cols = _table_columns(self.con, "projects")
+            if "id" in project_cols and "name" in project_cols:
+                joins.append("LEFT JOIN projects p ON p.id = a.project_id")
+                project_name_select = "p.name AS project_name"
+
+        owner_name_select = "NULL AS owner_name"
+        if _table_exists(self.con, "champions") and "owner_champion_id" in action_cols:
+            champion_cols = _table_columns(self.con, "champions")
+            if "id" in champion_cols:
+                joins.append("LEFT JOIN champions ch ON ch.id = a.owner_champion_id")
+                owner_name_select = (
+                    "TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS owner_name"
+                )
+
+        select_sql = ", ".join(select_cols + [project_name_select, owner_name_select])
+        base_query = f"""
+            SELECT {select_sql}
+            FROM actions a
+            {' '.join(joins)}
+        """
+        filters: list[str] = ["a.status NOT IN ('done','cancelled')"]
+        params: list[Any] = []
+
+        if "is_draft" in action_cols:
+            filters.append("a.is_draft = 0")
+
+        if project_ids and "project_id" in action_cols:
+            placeholders = ", ".join(["?"] * len(project_ids))
+            filters.append(f"a.project_id IN ({placeholders})")
+            params.extend(project_ids)
+
+        if filters:
+            base_query += " WHERE " + " AND ".join(filters)
+
+        if "created_at" in action_cols:
+            base_query += " ORDER BY a.created_at ASC"
+        else:
+            base_query += " ORDER BY a.rowid ASC"
+
+        try:
+            cur = self.con.execute(base_query, params)
+            rows = [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
+        for row in rows:
+            row.setdefault("project_name", None)
+            row.setdefault("owner_name", None)
+        return rows
+
     def create_action(self, data: dict[str, Any]) -> str:
         action_id = data.get("id") or str(uuid4())
         if not _table_exists(self.con, "actions"):
@@ -2070,6 +2135,9 @@ class ChampionRepository:
             r.setdefault("position", None)
             r.setdefault("team", None)
         return rows
+
+    def has_champion_projects_table(self) -> bool:
+        return _table_exists(self.con, "champion_projects")
 
     def get_assigned_projects(self, champion_id: str) -> list[str]:
         if not _table_exists(self.con, "champion_projects"):
