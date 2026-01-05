@@ -92,16 +92,21 @@ params = st.query_params if hasattr(st, "query_params") else st.experimental_get
 page_param = params.get("page")
 if isinstance(page_param, list):
     page_param = page_param[0] if page_param else None
-if page_param in PAGES:
-    st.session_state["sidebar_page"] = page_param
+
+nav_target = st.session_state.pop("nav_to_page", None)
+if nav_target:
+    st.session_state["sidebar_page_default"] = nav_target
+elif page_param in PAGES:
+    st.session_state["sidebar_page_default"] = page_param
 
 page_labels = list(PAGES.keys())
 default_index = 0
-current_page = st.session_state.get("sidebar_page")
+current_page = st.session_state.get("sidebar_page_default")
 if current_page in page_labels:
     default_index = page_labels.index(current_page)
 
 selected = st.sidebar.radio("Strony", page_labels, index=default_index, key="sidebar_page")
+st.session_state.pop("sidebar_page_default", None)
 
 # --- Render selected page ---
 PAGES[selected]()

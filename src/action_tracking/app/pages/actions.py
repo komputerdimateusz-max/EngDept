@@ -136,6 +136,30 @@ def _get_query_param(key: str) -> str | None:
 
 
 def render(con: sqlite3.Connection) -> None:
+    prefill = st.session_state.pop("nav_action_prefill", None)
+    prefill_project_id = _get_query_param("prefill_action_project_id")
+    prefill_owner_id = _get_query_param("prefill_action_owner_champion_id")
+    if (prefill_project_id or prefill_owner_id) and not prefill:
+        prefill = {
+            "project_id": prefill_project_id,
+            "owner_champion_id": prefill_owner_id,
+        }
+    if prefill:
+        prefill_nonce = prefill.get("nonce")
+        if not prefill_nonce:
+            prefill_nonce = (
+                f"query:{prefill.get('project_id')}:{prefill.get('owner_champion_id')}"
+            )
+        st.session_state["actions_prefill_nonce"] = prefill_nonce
+        if st.session_state.get("actions_prefill_last_applied_nonce") != prefill_nonce:
+            st.session_state["actions_prefill_project_id"] = prefill.get("project_id")
+            st.session_state["actions_prefill_owner_champion_id"] = prefill.get(
+                "owner_champion_id"
+            )
+            st.session_state["actions_prefill_work_centers"] = prefill.get("work_centers")
+            st.session_state["actions_prefill_last_applied_nonce"] = prefill_nonce
+            st.session_state["actions_prefill_should_apply"] = True
+
     st.header("Akcje")
 
     repo = ActionRepository(con)
@@ -145,15 +169,6 @@ def render(con: sqlite3.Connection) -> None:
     champion_repo = ChampionRepository(con)
     settings_repo = SettingsRepository(con)
     rules_repo = GlobalSettingsRepository(con)
-
-    prefill_project_id = _get_query_param("prefill_action_project_id")
-    prefill_owner_id = _get_query_param("prefill_action_owner_champion_id")
-    if prefill_project_id:
-        st.session_state["prefill_action_project_id"] = prefill_project_id
-    if prefill_owner_id:
-        st.session_state["prefill_action_owner_champion_id"] = prefill_owner_id
-    if prefill_project_id or prefill_owner_id:
-        st.session_state["prefill_action_applied"] = False
 
     projects = project_repo.list_projects(include_counts=True)
     project_names = {
@@ -400,11 +415,9 @@ def render(con: sqlite3.Connection) -> None:
         return
 
     action_options = ["(nowa)"] + [a["id"] for a in all_actions]
-    if st.session_state.get("prefill_action_project_id") and not st.session_state.get(
-        "prefill_action_applied"
-    ):
+    if st.session_state.get("actions_prefill_should_apply"):
         st.session_state["action_edit_select"] = "(nowa)"
-        st.session_state["prefill_action_applied"] = True
+        st.session_state["actions_prefill_should_apply"] = False
     selected_action = st.selectbox(
         "Wybierz akcję do edycji",
         action_options,
@@ -479,7 +492,7 @@ def render(con: sqlite3.Connection) -> None:
 
             project_ids = [p["id"] for p in projects]
             prefill_project = (
-                st.session_state.get("prefill_action_project_id")
+                st.session_state.get("actions_prefill_project_id")
                 if not editing
                 else None
             )
@@ -496,7 +509,7 @@ def render(con: sqlite3.Connection) -> None:
 
             owner_options = ["(brak)"] + [c["id"] for c in champions]
             prefill_owner = (
-                st.session_state.get("prefill_action_owner_champion_id")
+                st.session_state.get("actions_prefill_owner_champion_id")
                 if not editing
                 else None
             )
@@ -688,18 +701,32 @@ def render(con: sqlite3.Connection) -> None:
             )
 
             project_ids = [p["id"] for p in projects]
+            prefill_project = (
+                st.session_state.get("actions_prefill_project_id")
+                if not editing
+                else None
+            )
             project_id = st.selectbox(
                 "Projekt",
                 project_ids,
-                index=project_ids.index(selected.get("project_id"))
+                index=project_ids.index(prefill_project)
+                if prefill_project in project_ids
+                else project_ids.index(selected.get("project_id"))
                 if selected.get("project_id") in project_ids
                 else 0,
                 format_func=lambda pid: project_names.get(pid, pid),
             )
 
             owner_options = ["(brak)"] + [c["id"] for c in champions]
+            prefill_owner = (
+                st.session_state.get("actions_prefill_owner_champion_id")
+                if not editing
+                else None
+            )
             owner_default = (
-                owner_options.index(selected.get("owner_champion_id"))
+                owner_options.index(prefill_owner)
+                if prefill_owner in owner_options
+                else owner_options.index(selected.get("owner_champion_id"))
                 if selected.get("owner_champion_id") in owner_options
                 else 0
             )
