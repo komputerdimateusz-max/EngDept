@@ -101,12 +101,14 @@ def render(con: sqlite3.Connection) -> None:
             project_centers,
             default=project_centers,
         )
+        full_project_filter = selected_project
     else:
         selected_work_centers = col2.multiselect(
             "Work Center",
             all_work_centers,
             default=all_work_centers,
         )
+        full_project_filter = None
 
     selected_from = col3.date_input("Data od", value=default_start)
     selected_to = col4.date_input("Data do", value=default_end)
@@ -138,8 +140,19 @@ def render(con: sqlite3.Connection) -> None:
             None if set(selected_work_centers) == set(all_work_centers) else selected_work_centers
         )
 
-    scrap_rows = repo.list_scrap_daily(work_center_filter, selected_from, selected_to, currency=None)
-    kpi_rows = repo.list_kpi_daily(work_center_filter, selected_from, selected_to)
+    scrap_rows = repo.list_scrap_daily(
+        work_center_filter,
+        selected_from,
+        selected_to,
+        currency=None,
+        full_project=full_project_filter,
+    )
+    kpi_rows = repo.list_kpi_daily(
+        work_center_filter,
+        selected_from,
+        selected_to,
+        full_project=full_project_filter,
+    )
 
     if not scrap_rows and not kpi_rows:
         st.info("Brak danych dla wybranych filtrów.")

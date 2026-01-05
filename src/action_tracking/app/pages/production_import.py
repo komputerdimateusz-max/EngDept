@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from io import BytesIO
+import re
 import sqlite3
 from typing import Any
 
@@ -11,26 +12,42 @@ import streamlit as st
 from action_tracking.data.repositories import ProductionDataRepository
 from action_tracking.services.metrics_scale import detect_percent_scale, normalize_kpi_percent
 
-SCRAP_REQUIRED_COLUMNS = [
-    "DATE",
-    "FULL PROJECT",
-    "QTY [pcs]",
-    "OK S. QTY [pcs]",
-    "SCRAP VALUE [pln]",
-]
+SCRAP_COLUMN_CANDIDATES = {
+    "date": ["DATE", "DATA"],
+    "full_project": ["FULL PROJECT", "FULLPROJECT"],
+    "workcenter": ["WORKCENTER", "WORK CENTER"],
+    "scrap_qty": ["SCRAP QTY [PCS]", "SCRAPQTY", "OK S. QTY [PCS]", "OKSQTYPCS"],
+    "scrap_value": ["SCRAP VALUE [PLN]", "SCRAP VALUE", "SCRAP VAL", "SCRAPVALPLN"],
+    "scrap_currency": ["SCRAP CURRENCY", "SCRAP CURR", "CURRENCY"],
+}
 
-KPI_REQUIRED_COLUMNS = [
-    "DATE",
-    "FULL PROJECT",
-    "WORKTIME  [min]",
-    "OEE [%]",
-    "PERFORMANCE [%]",
-]
+KPI_COLUMN_CANDIDATES = {
+    "date": ["DATE", "DATA"],
+    "full_project": ["FULL PROJECT", "FULLPROJECT"],
+    "workcenter": ["WORKCENTER", "WORK CENTER"],
+    "worktime": ["WORKTIME  [MIN]", "WORKTIME [MIN]", "WORKTIME PROC[S]", "WORKTIME"],
+    "oee": ["OEE [%]", "OEE"],
+    "performance": ["PERFORMANCE [%]", "PERFORMANCE"],
+    "availability": ["AVAILABILITY [%]", "AVAILABILITY"],
+    "quality": ["QUALITY [%]", "QUALITY"],
+}
 
-KPI_OPTIONAL_COLUMNS = [
-    "AVAILABILITY [%]",
-    "QUALITY [%]",
-]
+SCRAP_REQUIRED_KEYS = ["date", "full_project", "workcenter", "scrap_qty", "scrap_value"]
+KPI_REQUIRED_KEYS = ["date", "full_project", "workcenter", "worktime", "oee", "performance"]
+
+COLUMN_LABELS = {
+    "date": "DATE",
+    "full_project": "FULL PROJECT",
+    "workcenter": "WORKCENTER",
+    "scrap_qty": "SCRAP QTY [pcs]",
+    "scrap_value": "SCRAP VALUE [pln]",
+    "scrap_currency": "SCRAP CURRENCY",
+    "worktime": "WORKTIME [min]/[s]",
+    "oee": "OEE [%]",
+    "performance": "PERFORMANCE [%]",
+    "availability": "AVAILABILITY [%]",
+    "quality": "QUALITY [%]",
+}
 
 
 DATE_FORMATS = ["%Y%m%d", "%Y-%m-%d", "%d.%m.%Y"]
@@ -41,14 +58,32 @@ def _normalize_column_name(value: str) -> str:
     return " ".join(normalized.strip().split())
 
 
-def _col(df: pd.DataFrame, expected_name: str) -> str | None:
-    if expected_name in df.columns:
-        return expected_name
-    expected_normalized = _normalize_column_name(expected_name)
-    for column in df.columns:
-        if _normalize_column_name(column) == expected_normalized:
-            return column
+def _normalize_column_token(value: str) -> str:
+    normalized = _normalize_column_name(value).upper()
+    return re.sub(r"[^A-Z0-9]+", "", normalized)
+
+
+def _find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    normalized_map = {_normalize_column_token(column): column for column in df.columns}
+    for candidate in candidates:
+        token = _normalize_column_token(candidate)
+        if token in normalized_map:
+            return normalized_map[token]
+    for candidate in candidates:
+        token = _normalize_column_token(candidate)
+        if len(token) < 4:
+            continue
+        for column_token, column_name in normalized_map.items():
+            if token and token in column_token:
+                return column_name
     return None
+
+
+def _build_column_map(
+    df: pd.DataFrame,
+    candidates: dict[str, list[str]],
+) -> dict[str, str | None]:
+    return {key: _find_column(df, options) for key, options in candidates.items()}
 
 
 def _parse_date_value(value: Any) -> str | None:
@@ -72,18 +107,23 @@ def _normalize_work_center(value: Any) -> str:
     return " ".join(text.strip().split())
 
 
+def _normalize_text(value: Any) -> str:
+    text = str(value or "").replace("\u00a0", " ")
+    return " ".join(text.strip().split())
+
+
 def _read_production_csv(file_data: bytes) -> pd.DataFrame:
     return pd.read_csv(
         BytesIO(file_data),
-        sep=";",
+        sep=None,
+        engine="python",
         decimal=",",
         encoding="utf-8-sig",
     )
 
 
-def _validate_columns(df: pd.DataFrame, required: list[str]) -> list[str]:
-    missing = [col for col in required if _col(df, col) is None]
-    return missing
+def _validate_columns(column_map: dict[str, str | None], required: list[str]) -> list[str]:
+    return [key for key in required if not column_map.get(key)]
 
 
 def _prepare_scrap_rows(
@@ -91,33 +131,55 @@ def _prepare_scrap_rows(
     column_map: dict[str, str],
 ) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
     df = df.copy()
-    date_col = column_map["DATE"]
-    project_col = column_map["FULL PROJECT"]
-    ok_s_qty_col = column_map["OK S. QTY [pcs]"]
-    scrap_value_col = column_map["SCRAP VALUE [pln]"]
+    date_col = column_map["date"]
+    project_col = column_map["full_project"]
+    workcenter_col = column_map["workcenter"]
+    scrap_qty_col = column_map["scrap_qty"]
+    scrap_value_col = column_map["scrap_value"]
+    currency_col = column_map.get("scrap_currency")
     df["metric_date"] = df[date_col].apply(_parse_date_value)
-    df["work_center"] = df[project_col].apply(_normalize_work_center)
-    valid_mask = df["metric_date"].notna() & (df["work_center"] != "")
+    df["full_project"] = df[project_col].apply(_normalize_text)
+    df["work_center"] = df[workcenter_col].apply(_normalize_work_center)
+    valid_mask = (
+        df["metric_date"].notna()
+        & (df["full_project"] != "")
+        & (df["work_center"] != "")
+    )
     skipped = int((~valid_mask).sum())
     df = df.loc[valid_mask].copy()
 
-    df["ok_s_qty"] = pd.to_numeric(df[ok_s_qty_col], errors="coerce").fillna(0)
+    df["scrap_qty"] = pd.to_numeric(df[scrap_qty_col], errors="coerce").fillna(0)
     df["scrap_value"] = pd.to_numeric(df[scrap_value_col], errors="coerce").fillna(0)
+    if currency_col:
+        df["scrap_cost_currency"] = df[currency_col].apply(_normalize_text)
+    else:
+        df["scrap_cost_currency"] = "PLN"
+    df.loc[df["scrap_cost_currency"] == "", "scrap_cost_currency"] = "PLN"
 
     grouped = (
-        df.groupby(["metric_date", "work_center"], dropna=False)
+        df.groupby(
+            ["metric_date", "full_project", "work_center", "scrap_cost_currency"],
+            dropna=False,
+        )
         .agg(
-            total_ok_s_qty=("ok_s_qty", "sum"),
+            total_scrap_qty=("scrap_qty", "sum"),
             total_scrap_value=("scrap_value", "sum"),
         )
         .reset_index()
     )
 
-    grouped["scrap_qty"] = grouped["total_ok_s_qty"].round().astype(int)
+    grouped["scrap_qty"] = grouped["total_scrap_qty"].round().astype(int)
     aggregated_df = grouped.rename(
         columns={"total_scrap_value": "scrap_cost_amount"}
     )[
-        ["metric_date", "work_center", "scrap_qty", "scrap_cost_amount"]
+        [
+            "metric_date",
+            "full_project",
+            "work_center",
+            "scrap_cost_currency",
+            "scrap_qty",
+            "scrap_cost_amount",
+        ]
     ]
 
     rows: list[dict[str, Any]] = []
@@ -127,30 +189,34 @@ def _prepare_scrap_rows(
             {
                 "metric_date": row["metric_date"],
                 "work_center": row["work_center"],
+                "full_project": row["full_project"],
                 "scrap_qty": scrap_qty,
                 "scrap_cost_amount": float(row["scrap_cost_amount"]),
-                "scrap_cost_currency": "PLN",
+                "scrap_cost_currency": row["scrap_cost_currency"] or "PLN",
             }
         )
     raw_sum = (
-        df.groupby(["metric_date", "work_center"], dropna=False)["ok_s_qty"]
+        df.groupby(
+            ["metric_date", "full_project", "work_center", "scrap_cost_currency"],
+            dropna=False,
+        )["scrap_qty"]
         .sum()
         .reset_index()
-        .rename(columns={"ok_s_qty": "raw_ok_s_qty"})
+        .rename(columns={"scrap_qty": "raw_scrap_qty"})
     )
-    raw_sum["raw_ok_s_qty"] = raw_sum["raw_ok_s_qty"].round().astype(int)
+    raw_sum["raw_scrap_qty"] = raw_sum["raw_scrap_qty"].round().astype(int)
     comparison = raw_sum.merge(
         aggregated_df,
-        on=["metric_date", "work_center"],
+        on=["metric_date", "full_project", "work_center", "scrap_cost_currency"],
         how="left",
     )
     mismatch = comparison[
-        comparison["raw_ok_s_qty"] != comparison["scrap_qty"]
+        comparison["raw_scrap_qty"] != comparison["scrap_qty"]
     ].copy()
     debug_payload = {
         "aggregated_df": aggregated_df,
         "mismatch_df": mismatch,
-        "ok_s_qty_col": ok_s_qty_col,
+        "scrap_qty_col": scrap_qty_col,
     }
     return rows, skipped, debug_payload
 
@@ -161,24 +227,32 @@ def _prepare_kpi_rows(
     source_file: str | None = None,
 ) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
     df = df.copy()
-    df["metric_date"] = df[column_map["DATE"]].apply(_parse_date_value)
-    df["work_center"] = df[column_map["FULL PROJECT"]].apply(_normalize_work_center)
-    valid_mask = df["metric_date"].notna() & (df["work_center"] != "")
+    df["metric_date"] = df[column_map["date"]].apply(_parse_date_value)
+    df["full_project"] = df[column_map["full_project"]].apply(_normalize_text)
+    df["work_center"] = df[column_map["workcenter"]].apply(_normalize_work_center)
+    valid_mask = (
+        df["metric_date"].notna()
+        & (df["full_project"] != "")
+        & (df["work_center"] != "")
+    )
     skipped = int((~valid_mask).sum())
     df = df.loc[valid_mask].copy()
 
-    df["worktime_min"] = pd.to_numeric(
-        df[column_map["WORKTIME  [min]"]], errors="coerce"
-    ).fillna(0)
-    df["oee_pct"] = pd.to_numeric(
-        df[column_map["OEE [%]"]], errors="coerce"
-    )
-    df["performance_pct"] = pd.to_numeric(
-        df[column_map["PERFORMANCE [%]"]], errors="coerce"
-    )
+    worktime_col = column_map["worktime"]
+    worktime_series = pd.to_numeric(df[worktime_col], errors="coerce").fillna(0)
+    worktime_token = _normalize_column_token(worktime_col)
+    if "MIN" in worktime_token:
+        df["worktime_min"] = worktime_series
+    elif worktime_token.endswith("S") or "SEC" in worktime_token:
+        df["worktime_min"] = worktime_series / 60.0
+    else:
+        df["worktime_min"] = worktime_series
 
-    availability_col = column_map.get("AVAILABILITY [%]")
-    quality_col = column_map.get("QUALITY [%]")
+    df["oee_pct"] = pd.to_numeric(df[column_map["oee"]], errors="coerce")
+    df["performance_pct"] = pd.to_numeric(df[column_map["performance"]], errors="coerce")
+
+    availability_col = column_map.get("availability")
+    quality_col = column_map.get("quality")
     if availability_col:
         df["availability_pct"] = pd.to_numeric(df[availability_col], errors="coerce")
     else:
@@ -210,7 +284,7 @@ def _prepare_kpi_rows(
         _weighted_columns(metric)
 
     grouped = (
-        df.groupby(["metric_date", "work_center"], dropna=False)
+        df.groupby(["metric_date", "full_project", "work_center"], dropna=False)
         .agg(
             total_worktime=("worktime_min", "sum"),
             oee_weighted=("oee_pct_weighted", "sum"),
@@ -266,6 +340,7 @@ def _prepare_kpi_rows(
             {
                 "metric_date": row["metric_date"],
                 "work_center": row["work_center"],
+                "full_project": row["full_project"],
                 "worktime_min": float(row["total_worktime"]),
                 "oee_pct": oee_pct,
                 "performance_pct": performance_pct,
@@ -280,8 +355,8 @@ def _prepare_kpi_rows(
 def _render_import_tab(
     *,
     label: str,
-    required_columns: list[str],
-    optional_columns: list[str] | None,
+    column_candidates: dict[str, list[str]],
+    required_keys: list[str],
     prepare_rows: callable,
     on_import: callable,
 ) -> None:
@@ -290,32 +365,32 @@ def _render_import_tab(
         return
 
     df = _read_production_csv(uploaded_file.getvalue())
-    optional_columns = optional_columns or []
-    column_map = {col: _col(df, col) for col in required_columns + optional_columns}
+    column_map = _build_column_map(df, column_candidates)
     if label == "Scrap CSV":
         st.write("Detected columns:", list(df.columns))
         preview_columns = [
-            column_map.get("DATE"),
-            column_map.get("FULL PROJECT"),
-            column_map.get("OK S. QTY [pcs]"),
-            column_map.get("SCRAP VALUE [pln]"),
+            column_map.get("date"),
+            column_map.get("full_project"),
+            column_map.get("workcenter"),
+            column_map.get("scrap_qty"),
+            column_map.get("scrap_value"),
         ]
         missing_preview = [col for col in preview_columns if col is None]
         if missing_preview:
             st.warning(
                 "Brakuje kolumn do podglądu: "
-                + ", ".join(required_columns)
+                + ", ".join(COLUMN_LABELS.get(key, key) for key in required_keys)
             )
         else:
             st.dataframe(df[preview_columns].head(20))
     st.caption("Podgląd pierwszych 50 wierszy")
     st.dataframe(df.head(50))
 
-    missing_columns = _validate_columns(df, required_columns)
+    missing_columns = _validate_columns(column_map, required_keys)
     if missing_columns:
         st.error(
             "Brakuje wymaganych kolumn: "
-            + ", ".join(missing_columns)
+            + ", ".join(COLUMN_LABELS.get(key, key) for key in missing_columns)
             + ". Dostępne kolumny: "
             + ", ".join(df.columns)
         )
@@ -341,7 +416,7 @@ def _render_import_tab(
             mismatch_df = debug_payload.get("mismatch_df")
             if mismatch_df is not None and not mismatch_df.empty:
                 st.error(
-                    "Niezgodność scrap_qty z OK S. QTY [pcs] dla kluczy: "
+                    "Niezgodność scrap_qty z danymi źródłowymi dla kluczy: "
                     + ", ".join(
                         [
                             f"{row['metric_date']} / {row['work_center']}"
@@ -367,8 +442,8 @@ def _render_import_tab(
 def render(con: sqlite3.Connection) -> None:
     st.header("Import danych produkcyjnych")
     st.write(
-        "Wczytaj eksport CSV (separator ;, liczby z przecinkiem). Dane są agregowane dziennie "
-        "per projekt (work center)."
+        "Wczytaj eksport CSV (separator ; lub ,; liczby z przecinkiem). Dane są agregowane "
+        "dziennie per FULL PROJECT i WORKCENTER."
     )
 
     repo = ProductionDataRepository(con)
@@ -382,8 +457,8 @@ def render(con: sqlite3.Connection) -> None:
         )
         _render_import_tab(
             label="Scrap CSV",
-            required_columns=SCRAP_REQUIRED_COLUMNS,
-            optional_columns=None,
+            column_candidates=SCRAP_COLUMN_CANDIDATES,
+            required_keys=SCRAP_REQUIRED_KEYS,
             prepare_rows=_prepare_scrap_rows,
             on_import=repo.upsert_scrap_daily,
         )
@@ -391,8 +466,8 @@ def render(con: sqlite3.Connection) -> None:
     with kpi_tab:
         _render_import_tab(
             label="OEE / Performance CSV",
-            required_columns=KPI_REQUIRED_COLUMNS,
-            optional_columns=KPI_OPTIONAL_COLUMNS,
+            column_candidates=KPI_COLUMN_CANDIDATES,
+            required_keys=KPI_REQUIRED_KEYS,
             prepare_rows=_prepare_kpi_rows,
             on_import=repo.upsert_production_kpi_daily,
         )

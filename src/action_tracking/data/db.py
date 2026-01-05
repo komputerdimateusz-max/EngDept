@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS actions (
   impact_value REAL,
   impact_aspects TEXT,
   category TEXT,
+  area TEXT,
   manual_savings_amount REAL,
   manual_savings_currency TEXT,
   manual_savings_note TEXT,
@@ -112,6 +113,7 @@ CREATE TABLE IF NOT EXISTS scrap_daily (
   id TEXT PRIMARY KEY,
   metric_date TEXT NOT NULL,
   work_center TEXT NOT NULL,
+  full_project TEXT,
   scrap_qty INTEGER NOT NULL,
   scrap_cost_amount REAL,
   scrap_cost_currency TEXT NOT NULL DEFAULT 'PLN',
@@ -123,6 +125,7 @@ CREATE TABLE IF NOT EXISTS production_kpi_daily (
   id TEXT PRIMARY KEY,
   metric_date TEXT NOT NULL,
   work_center TEXT NOT NULL,
+  full_project TEXT,
   worktime_min REAL,
   performance_pct REAL,
   oee_pct REAL,
@@ -198,6 +201,7 @@ CREATE TABLE IF NOT EXISTS analyses (
   status TEXT NOT NULL DEFAULT 'open',
   created_at TEXT NOT NULL,
   closed_at TEXT,
+  area TEXT,
   template_json TEXT NOT NULL,
   FOREIGN KEY(project_id) REFERENCES projects(id),
   FOREIGN KEY(champion_id) REFERENCES champions(id)
@@ -696,6 +700,30 @@ def _migrate_to_v16(con: sqlite3.Connection) -> None:
     _set_user_version(con, 16)
 
 
+def _migrate_to_v17(con: sqlite3.Connection) -> None:
+    if _table_exists(con, "scrap_daily") and not _column_exists(con, "scrap_daily", "full_project"):
+        con.execute("ALTER TABLE scrap_daily ADD COLUMN full_project TEXT;")
+    if _table_exists(con, "production_kpi_daily") and not _column_exists(con, "production_kpi_daily", "full_project"):
+        con.execute("ALTER TABLE production_kpi_daily ADD COLUMN full_project TEXT;")
+    if _table_exists(con, "actions") and not _column_exists(con, "actions", "area"):
+        con.execute("ALTER TABLE actions ADD COLUMN area TEXT;")
+    if _table_exists(con, "analyses") and not _column_exists(con, "analyses", "area"):
+        con.execute("ALTER TABLE analyses ADD COLUMN area TEXT;")
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_scrap_daily_full_project_date
+          ON scrap_daily (full_project, metric_date);
+        """
+    )
+    con.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_kpi_daily_full_project_date
+          ON production_kpi_daily (full_project, metric_date);
+        """
+    )
+    _set_user_version(con, 17)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "action_categories"):
         return
@@ -831,6 +859,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v15(con)
     if current_version < 16:
         _migrate_to_v16(con)
+    if current_version < 17:
+        _migrate_to_v17(con)
     _seed_action_categories(con)
     _seed_category_rules(con)
     con.commit()

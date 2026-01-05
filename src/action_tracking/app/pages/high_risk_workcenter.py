@@ -13,10 +13,13 @@ from action_tracking.data.repositories import (
     ProductionDataRepository,
     ProjectRepository,
 )
-from action_tracking.services.effectiveness import parse_work_centers
 from action_tracking.services.kpi_windows import compute_project_kpi_windows
-from action_tracking.services.normalize import normalize_key
 from action_tracking.services.production_outcome import format_metric_value
+from action_tracking.services.workcenter_classifier import (
+    KPI_COMPONENTS,
+    SCRAP_COMPONENTS,
+    extract_injection_machines,
+)
 
 IMPORTANCE_ORDER = {
     "High Runner": 0,
@@ -26,37 +29,6 @@ IMPORTANCE_ORDER = {
 }
 
 
-def _build_work_center_map(work_centers: list[str]) -> dict[str, list[str]]:
-    mapping: dict[str, list[str]] = {}
-    for work_center in work_centers:
-        normalized = normalize_key(work_center)
-        if not normalized:
-            continue
-        mapping.setdefault(normalized, [])
-        if work_center not in mapping[normalized]:
-            mapping[normalized].append(work_center)
-    return mapping
-
-
-def _resolve_project_work_centers(
-    project: dict[str, Any],
-    work_center_map: dict[str, list[str]],
-    include_related: bool,
-) -> list[str]:
-    centers = parse_work_centers(
-        project.get("work_center"),
-        project.get("related_work_center") if include_related else None,
-    )
-    resolved: list[str] = []
-    for center in centers:
-        normalized = normalize_key(center)
-        if not normalized:
-            continue
-        if normalized in work_center_map:
-            for candidate in work_center_map[normalized]:
-                if candidate not in resolved:
-                    resolved.append(candidate)
-    return resolved
 
 
 def _format_scrap_cell(metric: dict[str, Any]) -> tuple[str, float | None]:
@@ -107,22 +79,17 @@ def render(con: sqlite3.Connection) -> None:
     champions = champion_repo.list_champions()
     champion_names = {c["id"]: c["display_name"] for c in champions}
 
-    wc_lists = production_repo.list_distinct_work_centers()
-    all_work_centers = sorted(
-        set(wc_lists.get("scrap_work_centers", []) + wc_lists.get("kpi_work_centers", []))
-    )
-    work_center_map = _build_work_center_map(all_work_centers)
-
     today = date.today()
     default_from = today - timedelta(days=90)
     searchback_calendar_days = 180
 
-    filter_col1, filter_col2, filter_col3 = st.columns([1.2, 1.2, 1.6])
+    filter_col1, filter_col2, filter_col3 = st.columns([1.2, 1.2, 1.8])
     selected_from = filter_col1.date_input("Data od", value=default_from)
     selected_to = filter_col2.date_input("Data do", value=today)
-    include_related = filter_col3.checkbox(
-        "Uwzględnij powiązane Work Center",
-        value=True,
+    scrap_component = filter_col3.selectbox(
+        "Scrap – komponent",
+        list(SCRAP_COMPONENTS.keys()),
+        index=0,
     )
 
     weekend_col1, weekend_col2 = st.columns(2)
@@ -146,6 +113,31 @@ def render(con: sqlite3.Connection) -> None:
     ]
     sort_mode = filter_col5.selectbox("Tryb / sortowanie", sort_modes, index=0)
 
+    kpi_area_col, machine_col = st.columns([1.6, 1.4])
+    kpi_component = kpi_area_col.selectbox(
+        "OEE/Performance – obszar",
+        list(KPI_COMPONENTS.keys()),
+        index=0,
+    )
+    kpi_machine_filter: list[str] | None = None
+    if kpi_component == "Wtrysk (Mxx)":
+        injection_rows = production_repo.list_kpi_daily(
+            None,
+            selected_from,
+            selected_to,
+            workcenter_areas=KPI_COMPONENTS.get("Wtrysk (Mxx)"),
+        )
+        machine_options = ["Wszystkie"] + extract_injection_machines(injection_rows)
+        selected_machine = machine_col.selectbox(
+            "Wtrysk – maszyna",
+            machine_options,
+            index=0,
+        )
+        if selected_machine and selected_machine != "Wszystkie":
+            kpi_machine_filter = [selected_machine]
+    else:
+        machine_col.caption(" ")
+
     threshold_col1, threshold_col2, threshold_col3 = st.columns(3)
     oee_threshold = threshold_col1.slider("OEE spadek (pp)", min_value=1, max_value=10, value=3)
     perf_threshold = threshold_col2.slider("Performance spadek (pp)", min_value=1, max_value=10, value=3)
@@ -155,12 +147,13 @@ def render(con: sqlite3.Connection) -> None:
         st.error("Zakres dat jest nieprawidłowy (Data od > Data do).")
         return
 
-    if not all_work_centers:
-        st.info("Brak danych produkcyjnych do analizy.")
+    if not projects:
+        st.info("Brak projektów do analizy.")
         return
 
     rows: list[dict[str, Any]] = []
-    no_wc_count = 0
+    scrap_area_filter = SCRAP_COMPONENTS.get(scrap_component)
+    kpi_area_filter = KPI_COMPONENTS.get(kpi_component)
     searchback_from = selected_to - timedelta(days=searchback_calendar_days)
 
     for project in projects:
@@ -168,18 +161,21 @@ def render(con: sqlite3.Connection) -> None:
         if selected_importance and importance not in selected_importance:
             continue
 
-        work_centers = _resolve_project_work_centers(project, work_center_map, include_related)
-        if not work_centers:
-            no_wc_count += 1
-            continue
-
         scrap_rows = production_repo.list_scrap_daily(
-            work_centers,
+            None,
             searchback_from,
             selected_to,
             currency="PLN",
+            full_project=project.get("id"),
+            workcenter_areas=scrap_area_filter,
         )
-        kpi_rows = production_repo.list_kpi_daily(work_centers, searchback_from, selected_to)
+        kpi_rows = production_repo.list_kpi_daily(
+            kpi_machine_filter,
+            searchback_from,
+            selected_to,
+            full_project=project.get("id"),
+            workcenter_areas=kpi_area_filter,
+        )
         kpi_window = compute_project_kpi_windows(
             scrap_rows,
             kpi_rows,
@@ -240,12 +236,9 @@ def render(con: sqlite3.Connection) -> None:
                 "current_scrap_pln": scrap_pln_metrics.get("current"),
                 "current_oee": oee_metrics.get("current"),
                 "current_perf": perf_metrics.get("current"),
-                "work_centers": work_centers,
+                "work_centers": [],
             }
         )
-
-    if no_wc_count:
-        st.caption(f"Pominięto projekty bez Work Center: {no_wc_count}.")
 
     if not rows:
         if sort_mode == "Bad trend":

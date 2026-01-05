@@ -43,16 +43,22 @@ def apply_weekend_filter(
 
 def load_daily_frames(
     production_repo: Any,
-    work_centers: list[str],
+    scrap_work_centers: list[str] | None,
+    kpi_work_centers: list[str] | None,
     date_from: date,
     date_to: date,
     currency: str | None = "PLN",
+    full_project: str | None = None,
+    scrap_areas: set[str] | None = None,
+    kpi_areas: set[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     scrap_rows_all = production_repo.list_scrap_daily(
-        work_centers,
+        scrap_work_centers,
         date_from,
         date_to,
         currency=None,
+        full_project=full_project,
+        workcenter_areas=scrap_areas,
     )
     non_pln_currencies = {
         row.get("scrap_cost_currency")
@@ -77,7 +83,13 @@ def load_daily_frames(
     else:
         scrap_daily = pd.DataFrame(columns=["metric_date", "scrap_qty_sum", "scrap_pln_sum"])
 
-    kpi_rows = production_repo.list_kpi_daily(work_centers, date_from, date_to)
+    kpi_rows = production_repo.list_kpi_daily(
+        kpi_work_centers,
+        date_from,
+        date_to,
+        full_project=full_project,
+        workcenter_areas=kpi_areas,
+    )
     kpi_df = pd.DataFrame(kpi_rows)
     if not kpi_df.empty:
         kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"], errors="coerce")
