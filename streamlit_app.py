@@ -61,7 +61,7 @@ st.sidebar.markdown(
 
 PAGES = {
     "Production Explorer": lambda: production_explorer.render(con),
-    "High risk WorkCenter": lambda: high_risk_workcenter.render(con),
+    "High Risk project": lambda: high_risk_workcenter.render(con),
     "KPI": lambda: kpi.render(con),
     "Akcje": lambda: actions.render(con),
     "Champions ranking": lambda: champions_ranking.render(con),
@@ -71,6 +71,22 @@ PAGES = {
     "Ustawienia Globalne": lambda: settings.render(con),
     "Import danych produkcyjnych": lambda: production_import.render(con),
 }
+
+nav_target = st.session_state.pop("nav_to_page", None)
+nav_prefill = st.session_state.pop("nav_action_prefill", None)
+if nav_prefill:
+    project_id = nav_prefill.get("project_id")
+    if project_id:
+        st.session_state["prefill_action_project_id"] = str(project_id)
+    owner_id = nav_prefill.get("owner_champion_id")
+    if owner_id:
+        st.session_state["prefill_action_owner_champion_id"] = str(owner_id)
+    work_center = nav_prefill.get("work_center")
+    if work_center:
+        st.session_state["prefill_action_work_center"] = str(work_center)
+    st.session_state["prefill_action_applied"] = False
+if nav_target in PAGES:
+    st.session_state["sidebar_page"] = nav_target
 
 params = st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
 page_param = params.get("page")
