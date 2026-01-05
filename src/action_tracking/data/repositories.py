@@ -2213,10 +2213,14 @@ class ProjectRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
 
+    def ensure_projects_full_project_column(self) -> None:
+        _ensure_column(self.con, "projects", "full_project", "TEXT")
+
     def create_project(self, data: dict[str, Any]) -> str:
         if not _table_exists(self.con, "projects"):
             return ""
 
+        self.ensure_projects_full_project_column()
         project_id = data.get("id") or str(uuid4())
         cols = _table_columns(self.con, "projects")
         if not cols:
@@ -2235,6 +2239,10 @@ class ProjectRepository:
                 payload["name"] = (data.get("name") or "").strip() or None
             if "work_center" in cols:
                 payload["work_center"] = (data.get("work_center") or "").strip() or None
+            if "project_code" in cols:
+                payload["project_code"] = (data.get("project_code") or "").strip() or None
+            if "full_project" in cols:
+                payload["full_project"] = (data.get("full_project") or "").strip() or None
             if "status" in cols:
                 payload["status"] = (data.get("status") or "active").strip() or "active"
             if "created_at" in cols:
@@ -2265,6 +2273,7 @@ class ProjectRepository:
         if not _table_exists(self.con, "projects"):
             return
 
+        self.ensure_projects_full_project_column()
         cols = _table_columns(self.con, "projects")
         if not cols:
             return
@@ -2285,6 +2294,8 @@ class ProjectRepository:
             payload["work_center"] = work_center
         if "project_code" in data_keys and "project_code" in cols:
             payload["project_code"] = (data.get("project_code") or "").strip() or None
+        if "full_project" in data_keys and "full_project" in cols:
+            payload["full_project"] = (data.get("full_project") or "").strip() or None
         if "project_sop" in data_keys and "project_sop" in cols:
             project_sop = data.get("project_sop") or None
             if project_sop:
@@ -2410,6 +2421,7 @@ class ProjectRepository:
                 "closed_at",
                 "work_center",
                 "project_code",
+                "full_project",
                 "project_sop",
                 "project_eop",
                 "related_work_center",
@@ -2534,6 +2546,7 @@ class ProjectRepository:
             "closed_at": closed_at,
             "work_center": work_center,
             "project_code": (data.get("project_code") or "").strip() or None,
+            "full_project": (data.get("full_project") or "").strip() or None,
             "project_sop": project_sop,
             "project_eop": project_eop,
             "related_work_center": (data.get("related_work_center") or "").strip() or None,

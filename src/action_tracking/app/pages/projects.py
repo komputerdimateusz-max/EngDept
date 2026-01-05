@@ -20,6 +20,7 @@ FIELD_LABELS = {
     "name": "Nazwa projektu",
     "work_center": "Work center",
     "project_code": "Project Code",
+    "full_project": "FULL PROJECT (production key)",
     "project_sop": "Project SOP",
     "project_eop": "Project EOP",
     "related_work_center": "Powiązane Work Center",
@@ -182,6 +183,14 @@ def render(con: sqlite3.Connection) -> None:
                 work_center = st.text_input("Work center", value=selected.get("work_center", "") or "")
 
             project_code = st.text_input("Project Code", value=selected.get("project_code", "") or "")
+            full_project = st.text_input(
+                "FULL PROJECT (production key)",
+                value=selected.get("full_project", "") or "",
+                help=(
+                    "Musi odpowiadać dokładnie wartości FULL PROJECT w danych produkcyjnych "
+                    "(np. 'REAR LAMP BMW U10')."
+                ),
+            )
 
             no_sop = st.checkbox("Brak daty SOP", value=sop_value is None)
             project_sop = st.date_input("Project SOP", value=sop_value or date.today(), disabled=no_sop)
@@ -273,6 +282,7 @@ def render(con: sqlite3.Connection) -> None:
                     "name": name.strip(),
                     "work_center": work_center.strip(),
                     "project_code": project_code.strip() or None,
+                    "full_project": full_project.strip() or None,
                     "project_sop": None if no_sop else project_sop.isoformat(),
                     "project_eop": None if no_eop else project_eop.isoformat(),
                     "related_work_center": related_work_center.strip() or None,
@@ -345,6 +355,15 @@ def render(con: sqlite3.Connection) -> None:
                     with st.form(f"wc_inbox_create_{wc_key}"):
                         project_name = st.text_input("Nazwa projektu", value=wc_raw, key=f"wc_inbox_name_{wc_key}")
                         st.text_input("Work center", value=wc_raw, disabled=True, key=f"wc_inbox_wc_{wc_key}")
+                        full_project = st.text_input(
+                            "FULL PROJECT (production key)",
+                            value=project_name,
+                            help=(
+                                "Musi odpowiadać dokładnie wartości FULL PROJECT w danych produkcyjnych "
+                                "(np. 'REAR LAMP BMW U10')."
+                            ),
+                            key=f"wc_inbox_full_project_{wc_key}",
+                        )
                         project_type = st.selectbox(
                             "Typ", PROJECT_TYPES, index=PROJECT_TYPES.index("Others"), key=f"wc_inbox_type_{wc_key}"
                         )
@@ -373,6 +392,7 @@ def render(con: sqlite3.Connection) -> None:
                             payload = {
                                 "name": project_name.strip(),
                                 "work_center": wc_raw.strip(),
+                                "full_project": full_project.strip() or None,
                                 "type": project_type,
                                 "importance": importance,
                                 "owner_champion_id": None if owner_champion_id == "(brak)" else owner_champion_id,

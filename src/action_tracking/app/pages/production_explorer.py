@@ -243,14 +243,14 @@ def render(con: sqlite3.Connection) -> None:
         selected_project_id = None
         selected_project_name = None
         selected_project_code = None
-        project_scope_key = ""
+        production_key = ""
         project_work_centers: list[str] = []
     else:
         st.session_state["production_explorer_selected_project_id"] = selected_project
         project = projects_by_id.get(selected_project)
         selected_project_name = project.get("name") if project else None
         selected_project_code = project.get("project_code") if project else None
-        project_scope_key = (selected_project_code or "").strip() or (selected_project_name or "").strip()
+        production_key = (project.get("full_project") or "").strip() if project else ""
         project_work_centers = (
             parse_work_centers(project.get("work_center"), project.get("related_work_center"))
             if project
@@ -264,8 +264,14 @@ def render(con: sqlite3.Connection) -> None:
     active_work_centers = None
     active_full_project: str | None = None
     if selected_project != "Wszystkie":
-        if has_full_project_column and project_scope_key:
-            active_full_project = project_scope_key
+        if has_full_project_column:
+            if production_key:
+                active_full_project = production_key
+            else:
+                st.warning(
+                    "Brak FULL PROJECT w projekcie — uzupełnij w Projekty → FULL PROJECT (production key)."
+                )
+                return
         else:
             active_work_centers = project_work_centers or None
 
@@ -371,11 +377,11 @@ def render(con: sqlite3.Connection) -> None:
     if selected_project != "Wszystkie":
         count_full_project_matches_scrap = production_repo.count_full_project_matches(
             "scrap_daily",
-            project_scope_key,
+            production_key,
         )
         count_full_project_matches_kpi = production_repo.count_full_project_matches(
             "production_kpi_daily",
-            project_scope_key,
+            production_key,
         )
         distinct_full_project_scrap = production_repo.list_distinct_full_project(
             "scrap_daily",
@@ -389,7 +395,7 @@ def render(con: sqlite3.Connection) -> None:
             st.write("selected_project_id:", selected_project_id)
             st.write("selected_project_name:", selected_project_name)
             st.write("selected_project_code:", selected_project_code)
-            st.write("project_scope_key:", project_scope_key)
+            st.write("production_key:", production_key)
             if count_full_project_matches_scrap is None:
                 st.write("scrap_daily:", "No FULL PROJECT column in DB (old schema)")
             else:
