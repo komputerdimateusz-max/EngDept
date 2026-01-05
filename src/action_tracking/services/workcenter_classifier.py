@@ -20,7 +20,7 @@ AREA_LABELS = {
     AREA_ASSEMBLY_LINE: "Montaż (PLxx)",
     AREA_SUBGROUP: "Podgrupa (PLxxA)",
     AREA_INJECTION: "Wtrysk (Mxx)",
-    AREA_METALIZATION: "Metalizacja (MTZ)",
+    AREA_METALIZATION: "Metalizacja (MZT/MTZ)",
     AREA_OTHER: "Inne",
 }
 
@@ -40,20 +40,20 @@ SCRAP_COMPONENTS = {
     },
     "Podgrupy (PLxx[A-Z])": {AREA_SUBGROUP},
     "Wtrysk (Mxx)": {AREA_INJECTION},
-    "Metalizacja (MTZ)": {AREA_METALIZATION},
+    "Metalizacja (MZT/MTZ)": {AREA_METALIZATION},
 }
 
 KPI_COMPONENTS = {
     "Montaż (PLxx/P)": {AREA_ASSEMBLY_MAIN},
     "Wtrysk (Mxx)": {AREA_INJECTION},
-    "Metalizacja (MTZ)": {AREA_METALIZATION},
+    "Metalizacja (MZT/MTZ)": {AREA_METALIZATION},
 }
 
 _INJECTION_RE = re.compile(r"M\d{2}", re.IGNORECASE)
 _ASSEMBLY_MAIN_RE = re.compile(r"PL\d{2}/P", re.IGNORECASE)
 _ASSEMBLY_LINE_RE = re.compile(r"PL\d{2}", re.IGNORECASE)
 _SUBGROUP_RE = re.compile(r"PL\d{2}[A-Z]", re.IGNORECASE)
-_METALIZATION_RE = re.compile(r"MTZ", re.IGNORECASE)
+_METALIZATION_RE = re.compile(r"M(?:TZ|ZT)", re.IGNORECASE)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -150,16 +150,17 @@ def extract_injection_machines(rows: list[dict[str, Any]]) -> list[str]:
 
 
 def classification_sanity_check() -> list[str]:
-    samples = {
-        "PL01/P": AREA_ASSEMBLY_MAIN,
-        "PL01": AREA_ASSEMBLY_LINE,
-        "PL01A": AREA_SUBGROUP,
-        "M12": AREA_INJECTION,
-        "MTZ": AREA_METALIZATION,
-        "": AREA_OTHER,
-    }
+    samples = [
+        ("PL01/P", AREA_ASSEMBLY_MAIN),
+        ("PL01", AREA_ASSEMBLY_LINE),
+        ("PL01A", AREA_SUBGROUP),
+        ("M12", AREA_INJECTION),
+        ("MZT", AREA_METALIZATION),
+        ("MTZ", AREA_METALIZATION),
+        ("", AREA_OTHER),
+    ]
     mismatches = []
-    for sample, expected in samples.items():
+    for sample, expected in samples:
         actual = classify_wc_area(sample)
         if actual != expected:
             mismatches.append(f"{sample} -> {actual} (expected {expected})")
