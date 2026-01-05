@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from action_tracking.services.metrics_scale import normalize_kpi_percent
+from action_tracking.services.workcenter_classifier import filter_rows_by_areas
 
 # =====================================================
 # OPTIONAL IMPORTS (never crash if modules moved / missing)
@@ -139,6 +140,30 @@ def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
         return {r[1] for r in cur.fetchall()}
     except sqlite3.Error:
         return set()
+
+
+def _ensure_column(
+    con: sqlite3.Connection,
+    table: str,
+    column: str,
+    column_type: str,
+) -> None:
+    if not _table_exists(con, table):
+        return
+    columns = _table_columns(con, table)
+    if column in columns:
+        return
+    try:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type};")
+    except sqlite3.Error:
+        return
+
+
+def _ensure_index(con: sqlite3.Connection, ddl: str) -> None:
+    try:
+        con.execute(ddl)
+    except sqlite3.Error:
+        return
 
 
 def _normalize_impact_aspects_payload(value: Any) -> str | None:
@@ -460,6 +485,22 @@ def _list_changelog_generic(
 class SettingsRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
+        _configure_sqlite_connection(self.con)
+        self._ensure_production_schema()
+
+    def _ensure_production_schema(self) -> None:
+        _ensure_column(self.con, "scrap_daily", "full_project", "TEXT")
+        _ensure_column(self.con, "production_kpi_daily", "full_project", "TEXT")
+        _ensure_index(
+            self.con,
+            "CREATE INDEX IF NOT EXISTS idx_scrap_daily_full_project_date "
+            "ON scrap_daily (full_project, metric_date);",
+        )
+        _ensure_index(
+            self.con,
+            "CREATE INDEX IF NOT EXISTS idx_kpi_daily_full_project_date "
+            "ON production_kpi_daily (full_project, metric_date);",
+        )
 
     def list_action_categories(self, active_only: bool = True) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "action_categories"):
@@ -1014,6 +1055,8 @@ class NotificationRepository:
 class ActionRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
+        _configure_sqlite_connection(self.con)
+        _ensure_column(self.con, "actions", "area", "TEXT")
 
     def list_actions(
         self,
@@ -1206,6 +1249,7 @@ class ActionRepository:
             "impact_value",
             "impact_aspects",
             "category",
+            "area",
             "manual_savings_amount",
             "manual_savings_currency",
             "manual_savings_note",
@@ -1284,6 +1328,7 @@ class ActionRepository:
             "impact_value",
             "impact_aspects",
             "category",
+            "area",
             "manual_savings_amount",
             "manual_savings_currency",
             "manual_savings_note",
@@ -1408,6 +1453,7 @@ class ActionRepository:
             "impact_value": data.get("impact_value"),
             "impact_aspects": _normalize_impact_aspects_payload(data.get("impact_aspects")),
             "category": data.get("category"),
+            "area": (data.get("area") or "").strip() or None,
             "manual_savings_amount": data.get("manual_savings_amount"),
             "manual_savings_currency": data.get("manual_savings_currency"),
             "manual_savings_note": data.get("manual_savings_note"),
@@ -1683,6 +1729,8 @@ class ActionRepository:
 class AnalysisRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
+        _configure_sqlite_connection(self.con)
+        _ensure_column(self.con, "analyses", "area", "TEXT")
 
     def list_analyses(self) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "analyses"):
@@ -1764,6 +1812,7 @@ class AnalysisRepository:
             "status",
             "created_at",
             "closed_at",
+            "area",
             "template_json",
         ]
         insert_cols = [c for c in cols if c in analysis_cols]
@@ -1814,6 +1863,7 @@ class AnalysisRepository:
             "status",
             "created_at",
             "closed_at",
+            "area",
             "template_json",
         ]
         updates = {k: payload.get(k) for k in allowed_cols if k in analysis_cols}
@@ -2016,6 +2066,7 @@ class AnalysisRepository:
             "status": status,
             "created_at": created_date.isoformat(),
             "closed_at": closed_at,
+            "area": (data.get("area") or "").strip() or None,
             "template_json": template_json,
         }
 
@@ -2880,6 +2931,7 @@ class ProductionDataRepository:
                     "id": r.get("id") or str(uuid4()),
                     "metric_date": str(r["metric_date"]),
                     "work_center": str(r["work_center"]),
+                    "full_project": r.get("full_project"),
                     "scrap_qty": _normalize_int(r.get("scrap_qty"), default=0),
                     "scrap_cost_amount": _normalize_float(r.get("scrap_cost_amount")),
                     "scrap_cost_currency": (r.get("scrap_cost_currency") or "PLN"),
@@ -2893,6 +2945,7 @@ class ProductionDataRepository:
                 "id",
                 "metric_date",
                 "work_center",
+                "full_project",
                 "scrap_qty",
                 "scrap_cost_amount",
                 "scrap_cost_currency",
@@ -2904,7 +2957,16 @@ class ProductionDataRepository:
             return
         values = [[row.get(col) for col in insert_cols] for row in payload]
         placeholders = ", ".join(["?"] * len(insert_cols))
-        update_cols = [c for c in ("scrap_qty", "scrap_cost_amount", "scrap_cost_currency") if c in cols]
+        update_cols = [
+            c
+            for c in (
+                "full_project",
+                "scrap_qty",
+                "scrap_cost_amount",
+                "scrap_cost_currency",
+            )
+            if c in cols
+        ]
         update_clause = ", ".join([f"{col} = excluded.{col}" for col in update_cols])
         _configure_sqlite_connection(self.con)
         self.con.executemany(
@@ -2934,6 +2996,7 @@ class ProductionDataRepository:
                     "id": r.get("id") or str(uuid4()),
                     "metric_date": str(r["metric_date"]),
                     "work_center": str(r["work_center"]),
+                    "full_project": r.get("full_project"),
                     "worktime_min": _normalize_float(r.get("worktime_min")),
                     "performance_pct": _normalize_percent(r.get("performance_pct")),
                     "oee_pct": _normalize_percent(r.get("oee_pct")),
@@ -2951,6 +3014,7 @@ class ProductionDataRepository:
                 "id",
                 "metric_date",
                 "work_center",
+                "full_project",
                 "worktime_min",
                 "performance_pct",
                 "oee_pct",
@@ -2969,6 +3033,7 @@ class ProductionDataRepository:
         update_cols = [
             c
             for c in (
+                "full_project",
                 "worktime_min",
                 "performance_pct",
                 "oee_pct",
@@ -2999,6 +3064,8 @@ class ProductionDataRepository:
         date_from: date | str | None,
         date_to: date | str | None,
         currency: str | None = "PLN",
+        full_project: str | list[str] | None = None,
+        workcenter_areas: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "scrap_daily"):
             return []
@@ -3017,6 +3084,22 @@ class ProductionDataRepository:
         """
         filters: list[str] = []
         params: list[Any] = []
+
+        if full_project is not None:
+            if "full_project" in cols:
+                if isinstance(full_project, str):
+                    project_value = full_project.strip()
+                    if project_value:
+                        filters.append("full_project = ?")
+                        params.append(project_value)
+                else:
+                    if not full_project:
+                        return []
+                    placeholders = ", ".join(["?"] * len(full_project))
+                    filters.append(f"full_project IN ({placeholders})")
+                    params.extend([str(project) for project in full_project])
+            elif work_centers is None:
+                work_centers = full_project
 
         if work_centers is not None:
             if isinstance(work_centers, str):
@@ -3051,6 +3134,8 @@ class ProductionDataRepository:
             rows = [dict(r) for r in cur.fetchall()]
         except sqlite3.Error:
             return []
+        if workcenter_areas:
+            rows = filter_rows_by_areas(rows, workcenter_areas)
         for row in rows:
             row["scrap_qty"] = _normalize_int(row.get("scrap_qty"), default=0)
             row["scrap_cost_amount"] = _normalize_float(row.get("scrap_cost_amount"))
@@ -3063,6 +3148,8 @@ class ProductionDataRepository:
         work_centers: str | list[str] | None,
         date_from: date | str | None,
         date_to: date | str | None,
+        full_project: str | list[str] | None = None,
+        workcenter_areas: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         if not _table_exists(self.con, "production_kpi_daily"):
             return []
@@ -3089,6 +3176,22 @@ class ProductionDataRepository:
         """
         filters: list[str] = []
         params: list[Any] = []
+
+        if full_project is not None:
+            if "full_project" in cols:
+                if isinstance(full_project, str):
+                    project_value = full_project.strip()
+                    if project_value:
+                        filters.append("full_project = ?")
+                        params.append(project_value)
+                else:
+                    if not full_project:
+                        return []
+                    placeholders = ", ".join(["?"] * len(full_project))
+                    filters.append(f"full_project IN ({placeholders})")
+                    params.extend([str(project) for project in full_project])
+            elif work_centers is None:
+                work_centers = full_project
 
         if work_centers is not None:
             if isinstance(work_centers, str):
@@ -3119,6 +3222,8 @@ class ProductionDataRepository:
             rows = [dict(r) for r in cur.fetchall()]
         except sqlite3.Error:
             return []
+        if workcenter_areas:
+            rows = filter_rows_by_areas(rows, workcenter_areas)
         for row in rows:
             row["worktime_min"] = _normalize_float(row.get("worktime_min"))
             row["performance_pct"] = _normalize_percent(row.get("performance_pct"))

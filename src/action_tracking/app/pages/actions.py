@@ -46,11 +46,14 @@ FIELD_LABELS: dict[str, str] = {
     "impact_value": "Wartość wpływu",
     "impact_aspects": "Aspekty Work Center",
     "category": "Kategoria",
+    "area": "Obszar",
     "manual_savings_amount": "Oszczędności ręczne (kwota)",
     "manual_savings_currency": "Oszczędności ręczne (waluta)",
     "manual_savings_note": "Oszczędności ręczne (opis)",
     "is_draft": "Szkic",
 }
+
+AREA_OPTIONS = ["(brak)", "Montaż", "Wtrysk", "Metalizacja", "Podgrupa", "Inne"]
 
 
 def _format_value(value: Any) -> str:
@@ -393,6 +396,7 @@ def render(con: sqlite3.Connection) -> None:
                 "Szkic": "tak" if row.get("is_draft") else "nie",
                 "Kategoria": row.get("category"),
                 "Projekt": project_names.get(row.get("project_id"), row.get("project_name")),
+                "Obszar": row.get("area") or "—",
                 "Owner": owner or "—",
                 "Status": row.get("status"),
                 "Priorytet": row.get("priority"),
@@ -488,6 +492,22 @@ def render(con: sqlite3.Connection) -> None:
                 "Opis",
                 value=selected.get("description", "") or "",
                 max_chars=500,
+            )
+            area = st.selectbox(
+                "Obszar",
+                AREA_OPTIONS,
+                index=AREA_OPTIONS.index(selected.get("area"))
+                if selected.get("area") in AREA_OPTIONS
+                else 0,
+                key="action_area_select",
+            )
+            area = st.selectbox(
+                "Obszar",
+                AREA_OPTIONS,
+                index=AREA_OPTIONS.index(selected.get("area"))
+                if selected.get("area") in AREA_OPTIONS
+                else 0,
+                key="draft_action_area_select",
             )
 
             project_ids = [p["id"] for p in projects]
@@ -627,6 +647,7 @@ def render(con: sqlite3.Connection) -> None:
                 "title": title,
                 "description": description,
                 "category": category,
+                "area": None if area == "(brak)" else area,
                 "project_id": project_id,
                 "owner_champion_id": None if owner_champion == "(brak)" else owner_champion,
                 "priority": priority,
@@ -841,6 +862,7 @@ def render(con: sqlite3.Connection) -> None:
                 "title": title,
                 "description": description,
                 "category": category,
+                "area": None if area == "(brak)" else area,
                 "project_id": project_id,
                 "owner_champion_id": None if owner_champion == "(brak)" else owner_champion,
                 "priority": priority,

@@ -14,8 +14,7 @@ from action_tracking.data.repositories import (
     ProductionDataRepository,
     ProjectRepository,
 )
-from action_tracking.services.effectiveness import parse_date, parse_work_centers
-from action_tracking.services.normalize import normalize_key
+from action_tracking.services.effectiveness import parse_date
 from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_COLORS,
     OVERLAY_TARGET_LABELS,
@@ -28,6 +27,13 @@ from action_tracking.services.production_outcome import (
     load_daily_frames,
     metric_delta_label,
     scrap_delta_badge,
+)
+from action_tracking.services.workcenter_classifier import (
+    KPI_COMPONENTS,
+    SCRAP_COMPONENTS,
+    classify_workcenter,
+    extract_injection_machines,
+    filter_rows_by_areas,
 )
 
 
@@ -152,52 +158,12 @@ def _resolve_overlay_targets(
     return default_overlay_targets(effect_model)
 
 
-def _project_matches_work_center(project: dict[str, Any], target_key: str) -> bool:
-    centers = parse_work_centers(
-        project.get("work_center"),
-        project.get("related_work_center"),
-    )
-    return any(normalize_key(center) == target_key for center in centers)
-
-
 def _get_query_param(key: str) -> str | None:
     params = st.query_params if hasattr(st, "query_params") else st.experimental_get_query_params()
     value = params.get(key)
     if isinstance(value, list):
         return value[0] if value else None
     return value
-
-
-def _build_work_center_map(work_centers: list[str]) -> dict[str, list[str]]:
-    mapping: dict[str, list[str]] = {}
-    for work_center in work_centers:
-        normalized = normalize_key(work_center)
-        if not normalized:
-            continue
-        mapping.setdefault(normalized, [])
-        if work_center not in mapping[normalized]:
-            mapping[normalized].append(work_center)
-    return mapping
-
-
-def _resolve_project_work_centers(
-    project: dict[str, Any],
-    work_center_map: dict[str, list[str]],
-) -> list[str]:
-    centers = parse_work_centers(
-        project.get("work_center"),
-        project.get("related_work_center"),
-    )
-    resolved: list[str] = []
-    for center in centers:
-        normalized = normalize_key(center)
-        if not normalized:
-            continue
-        if normalized in work_center_map:
-            for candidate in work_center_map[normalized]:
-                if candidate not in resolved:
-                    resolved.append(candidate)
-    return resolved
 
 
 def _format_window_label(window: dict[str, Any]) -> str:
@@ -224,14 +190,7 @@ def render(con: sqlite3.Connection) -> None:
     rules_repo = GlobalSettingsRepository(con)
 
     projects = project_repo.list_projects(include_counts=True)
-    projects_by_id = {p["id"]: p for p in projects}
     project_names = {p["id"]: p.get("name") or p.get("id") for p in projects}
-
-    wc_lists = production_repo.list_distinct_work_centers()
-    all_work_centers = sorted(
-        set(wc_lists.get("scrap_work_centers", []) + wc_lists.get("kpi_work_centers", []))
-    )
-    work_center_map = _build_work_center_map(all_work_centers)
 
     today = date.today()
     default_from = today - timedelta(days=90)
@@ -242,8 +201,8 @@ def render(con: sqlite3.Connection) -> None:
         st.session_state["production_explorer_selected_project_id"] = preselected_project_id
     selected_project_state = st.session_state.get("production_explorer_selected_project_id")
 
-    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5, filter_col6 = st.columns(
-        [1.4, 2.2, 1.4, 1.4, 1.2, 1.2]
+    filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns(
+        [1.4, 2.4, 2.0, 1.4, 1.4]
     )
     project_options = ["Wszystkie"] + [p["id"] for p in projects]
     project_index = 0
@@ -255,36 +214,58 @@ def render(con: sqlite3.Connection) -> None:
         index=project_index,
         format_func=lambda pid: "Wszystkie" if pid == "Wszystkie" else project_names.get(pid, pid),
     )
-
     if selected_project == "Wszystkie":
         st.session_state.pop("production_explorer_selected_project_id", None)
-        selected_project_row = None
+        full_project_filter = None
     else:
         st.session_state["production_explorer_selected_project_id"] = selected_project
-        selected_project_row = projects_by_id.get(selected_project)
+        full_project_filter = selected_project
 
-    project_work_centers: list[str] = []
-    if selected_project_row:
-        project_work_centers = _resolve_project_work_centers(selected_project_row, work_center_map)
-
-    selected_work_centers = filter_col2.multiselect(
-        "Work Center",
-        all_work_centers,
-        default=project_work_centers or all_work_centers,
+    scrap_component = filter_col2.selectbox(
+        "Scrap – komponent",
+        list(SCRAP_COMPONENTS.keys()),
+        index=0,
     )
-    selected_from = filter_col3.date_input("Data od", value=default_from)
-    selected_to = filter_col4.date_input("Data do", value=today)
-    granularity = filter_col5.radio(
+    kpi_component = filter_col3.selectbox(
+        "OEE/Performance – obszar",
+        list(KPI_COMPONENTS.keys()),
+        index=0,
+    )
+    granularity = filter_col4.radio(
         "Granularność",
         ["Dziennie", "Tygodniowo"],
         index=0,
         horizontal=True,
     )
-    currency = filter_col6.selectbox(
+    currency = filter_col5.selectbox(
         "Waluta",
         ["PLN", "All currencies"],
         index=0,
     )
+
+    date_col1, date_col2, machine_col = st.columns([1.4, 1.4, 1.4])
+    selected_from = date_col1.date_input("Data od", value=default_from)
+    selected_to = date_col2.date_input("Data do", value=today)
+    selected_machine = None
+    kpi_machine_filter: list[str] | None = None
+    if kpi_component == "Wtrysk (Mxx)":
+        injection_rows = production_repo.list_kpi_daily(
+            None,
+            selected_from,
+            selected_to,
+            full_project=full_project_filter,
+            workcenter_areas=KPI_COMPONENTS.get("Wtrysk (Mxx)"),
+        )
+        machine_options = ["Wszystkie"] + extract_injection_machines(injection_rows)
+        selected_machine = machine_col.selectbox(
+            "Wtrysk – maszyna",
+            machine_options,
+            index=0,
+        )
+        if selected_machine and selected_machine != "Wszystkie":
+            kpi_machine_filter = [selected_machine]
+    else:
+        machine_col.caption(" ")
 
     weekend_col1, weekend_col2 = st.columns(2)
     remove_saturdays = weekend_col1.checkbox("Usuń soboty", value=False)
@@ -294,30 +275,35 @@ def render(con: sqlite3.Connection) -> None:
         st.error("Zakres dat jest nieprawidłowy (Data od > Data do).")
         return
 
-    if selected_project_row and not project_work_centers:
-        st.warning("Wybrany projekt nie ma Work Center dostępnego w danych produkcyjnych.")
-    if not selected_work_centers:
-        st.info("Wybierz Work Center, aby zobaczyć dane.")
-        return
-
-    work_center_filter = selected_work_centers
+    scrap_area_filter = SCRAP_COMPONENTS.get(scrap_component)
+    kpi_area_filter = KPI_COMPONENTS.get(kpi_component)
     currency_filter = "PLN" if currency == "PLN" else None
     scrap_daily, kpi_daily, _ = load_daily_frames(
         production_repo,
-        work_center_filter,
+        None,
+        kpi_machine_filter,
         selected_from,
         selected_to,
         currency=currency_filter,
+        full_project=full_project_filter,
+        scrap_areas=scrap_area_filter,
+        kpi_areas=kpi_area_filter,
     )
     searchback_from = selected_to - timedelta(days=searchback_calendar_days)
     kpi_scrap_rows = production_repo.list_scrap_daily(
-        work_center_filter,
+        None,
         searchback_from,
         selected_to,
         currency="PLN",
+        full_project=full_project_filter,
+        workcenter_areas=scrap_area_filter,
     )
     kpi_window_rows = production_repo.list_kpi_daily(
-        work_center_filter, searchback_from, selected_to
+        kpi_machine_filter,
+        searchback_from,
+        selected_to,
+        full_project=full_project_filter,
+        workcenter_areas=kpi_area_filter,
     )
     kpi_window = compute_project_kpi_windows(
         kpi_scrap_rows,
@@ -353,6 +339,34 @@ def render(con: sqlite3.Connection) -> None:
     if not kpi_df.empty:
         kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"], errors="coerce")
         kpi_df = kpi_df.dropna(subset=["metric_date"])
+
+    if full_project_filter:
+        totals_rows = production_repo.list_scrap_daily(
+            None,
+            selected_from,
+            selected_to,
+            currency="PLN",
+            full_project=full_project_filter,
+        )
+        totals_rows = filter_rows_by_areas(totals_rows, SCRAP_COMPONENTS.get("TOTAL (all)"))
+        totals_by_area: dict[str, dict[str, float]] = {}
+        for row in totals_rows:
+            area = classify_workcenter(row.get("work_center") or "").get("area") or "other"
+            payload = totals_by_area.setdefault(area, {"scrap_qty": 0.0, "scrap_pln": 0.0})
+            payload["scrap_qty"] += float(row.get("scrap_qty") or 0)
+            payload["scrap_pln"] += float(row.get("scrap_cost_amount") or 0)
+
+        if totals_by_area:
+            totals_summary = [
+                {
+                    "Obszar": area,
+                    "Scrap qty": metrics["scrap_qty"],
+                    "Scrap PLN": metrics["scrap_pln"],
+                }
+                for area, metrics in sorted(totals_by_area.items())
+            ]
+            with st.expander("Debug: Scrap per area (PLN)", expanded=False):
+                st.dataframe(totals_summary, use_container_width=True)
 
     daily_view = granularity == "Dziennie"
     if not daily_view:
@@ -423,55 +437,45 @@ def render(con: sqlite3.Connection) -> None:
         st.caption("KPI zapisane w bazie jako procenty (0-100).")
 
     markers_df = pd.DataFrame()
-    single_wc = len(selected_work_centers) == 1
-    if single_wc:
-        target_wc = selected_work_centers[0]
-        target_key = normalize_key(target_wc)
-        project_ids = [
-            project["id"]
-            for project in project_repo.list_projects(include_counts=True)
-            if _project_matches_work_center(project, target_key)
-        ]
+    if full_project_filter:
         markers: list[dict[str, Any]] = []
-        for project_id in project_ids:
-            actions = action_repo.list_actions(
-                status="done",
-                project_id=project_id,
-                is_draft=False,
-            )
-            for action in actions:
-                closed_date = parse_date(action.get("closed_at"))
-                if not closed_date:
-                    continue
-                if not (selected_from <= closed_date <= selected_to):
-                    continue
-                overlay_targets = _resolve_overlay_targets(action, rules_repo)
-                for overlay_target in overlay_targets:
-                    markers.append(
-                        {
-                            "closed_at": pd.to_datetime(closed_date),
-                            "action_title": action.get("title") or "—",
-                            "category": action.get("category") or "—",
-                            "overlay_target": overlay_target,
-                            "overlay_label": OVERLAY_TARGET_LABELS.get(
-                                overlay_target, overlay_target
-                            ),
-                        }
-                    )
+        actions = action_repo.list_actions(
+            status="done",
+            project_id=full_project_filter,
+            is_draft=False,
+        )
+        for action in actions:
+            closed_date = parse_date(action.get("closed_at"))
+            if not closed_date:
+                continue
+            if not (selected_from <= closed_date <= selected_to):
+                continue
+            overlay_targets = _resolve_overlay_targets(action, rules_repo)
+            for overlay_target in overlay_targets:
+                markers.append(
+                    {
+                        "closed_at": pd.to_datetime(closed_date),
+                        "action_title": action.get("title") or "—",
+                        "category": action.get("category") or "—",
+                        "overlay_target": overlay_target,
+                        "overlay_label": OVERLAY_TARGET_LABELS.get(
+                            overlay_target, overlay_target
+                        ),
+                    }
+                )
         markers_df = pd.DataFrame(markers)
+        if markers_df.empty:
+            st.caption("Brak zamkniętych akcji w zakresie.")
+    else:
+        st.caption("Markery akcji są dostępne po wyborze projektu.")
 
-    if not single_wc:
-        st.caption("Markery akcji są dostępne tylko dla pojedynczego Work Center.")
-
-    if single_wc and markers_df.empty:
-        st.caption("Brak zamkniętych akcji w zakresie.")
-
+    markers_available = not markers_df.empty
     chart_cols = st.columns(2)
     if not scrap_daily.empty:
         show_scrap_qty_markers = chart_cols[0].checkbox(
             "Pokaż markery akcji",
-            value=single_wc and not markers_df.empty,
-            disabled=not single_wc or markers_df.empty,
+            value=markers_available,
+            disabled=not markers_available,
             key="prod_explorer_markers_scrap_qty",
         )
         chart_cols[0].altair_chart(
@@ -491,8 +495,8 @@ def render(con: sqlite3.Connection) -> None:
         else:
             show_scrap_cost_markers = chart_cols[1].checkbox(
                 "Pokaż markery akcji",
-                value=single_wc and not markers_df.empty,
-                disabled=not single_wc or markers_df.empty,
+                value=markers_available,
+                disabled=not markers_available,
                 key="prod_explorer_markers_scrap_cost",
             )
             chart_cols[1].altair_chart(
@@ -514,8 +518,8 @@ def render(con: sqlite3.Connection) -> None:
     if not kpi_daily.empty:
         show_oee_markers = chart_cols[0].checkbox(
             "Pokaż markery akcji",
-            value=single_wc and not markers_df.empty,
-            disabled=not single_wc or markers_df.empty,
+            value=markers_available,
+            disabled=not markers_available,
             key="prod_explorer_markers_oee",
         )
         chart_cols[0].altair_chart(
@@ -532,8 +536,8 @@ def render(con: sqlite3.Connection) -> None:
         )
         show_perf_markers = chart_cols[1].checkbox(
             "Pokaż markery akcji",
-            value=single_wc and not markers_df.empty,
-            disabled=not single_wc or markers_df.empty,
+            value=markers_available,
+            disabled=not markers_available,
             key="prod_explorer_markers_perf",
         )
         chart_cols[1].altair_chart(
@@ -565,6 +569,6 @@ def render(con: sqlite3.Connection) -> None:
             st.dataframe(scrap_currency_view, use_container_width=True)
 
     st.caption(
-        "Markery akcji są ustawiane na dacie zamknięcia i widoczne wyłącznie "
-        "dla pojedynczego Work Center (mapowanie wykresów definiuje Global Settings)."
+        "Markery akcji są ustawiane na dacie zamknięcia i widoczne po wyborze projektu "
+        "(mapowanie wykresów definiuje Global Settings)."
     )

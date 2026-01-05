@@ -16,6 +16,7 @@ from action_tracking.data.repositories import (
 
 
 TOOL_TYPES = ["5WHY", "Diagram Ishikawy", "Raport A3", "Raport 8D"]
+AREA_OPTIONS = ["(brak)", "Montaż", "Wtrysk", "Metalizacja", "Podgrupa", "Inne"]
 
 
 def _default_template(tool_type: str) -> dict[str, Any]:
@@ -151,6 +152,7 @@ def _render_analysis_actions(
     analysis_id: str,
     analysis_project_id: str | None,
     analysis_champion_id: str | None,
+    analysis_area: str | None,
     champions: list[dict[str, Any]],
 ) -> None:
     actions = analysis_repo.list_analysis_actions(analysis_id)
@@ -228,6 +230,7 @@ def _render_analysis_actions(
                         or analysis_champion_id,
                         "due_date": analysis_action.get("due_date"),
                         "source": "analysis",
+                        "area": analysis_area,
                     }
                 )
                 analysis_repo.mark_analysis_action_added(analysis_action["id"], action_id)
@@ -266,6 +269,7 @@ def render(con: sqlite3.Connection) -> None:
                 "Champion": analysis.get("champion_name")
                 or champion_names.get(analysis.get("champion_id"), "—"),
                 "Typ narzędzia": analysis.get("tool_type") or "—",
+                "Obszar": analysis.get("area") or "—",
                 "Data utworzenia": analysis.get("created_at") or "—",
                 "Data zamknięcia": analysis.get("closed_at") or "—",
                 "Status": analysis.get("status") or "—",
@@ -301,6 +305,7 @@ def render(con: sqlite3.Connection) -> None:
                 else champion_names.get(cid, cid),
             )
             tool_type = st.selectbox("Typ narzędzia", TOOL_TYPES)
+            area = st.selectbox("Obszar", AREA_OPTIONS)
             submitted = st.form_submit_button("Utwórz analizę")
 
         if submitted:
@@ -309,6 +314,7 @@ def render(con: sqlite3.Connection) -> None:
                     "project_id": None if selected_project == "(brak)" else selected_project,
                     "champion_id": None if selected_champion == "(brak)" else selected_champion,
                     "tool_type": tool_type,
+                    "area": None if area == "(brak)" else area,
                     "template_json": _default_template(tool_type),
                 }
             )
@@ -348,6 +354,7 @@ def render(con: sqlite3.Connection) -> None:
     st.markdown(
         f"**Champion:** {selected_analysis.get('champion_name') or champion_names.get(selected_analysis.get('champion_id'), '—')}"
     )
+    st.markdown(f"**Obszar:** {selected_analysis.get('area') or '—'}")
 
     st.subheader("Szablon analizy")
     with st.form(f"analysis_template_form_{selected_analysis_id}"):
@@ -369,6 +376,7 @@ def render(con: sqlite3.Connection) -> None:
         selected_analysis_id,
         selected_analysis.get("project_id"),
         selected_analysis.get("champion_id"),
+        selected_analysis.get("area"),
         champions,
     )
 
@@ -377,10 +385,16 @@ def render(con: sqlite3.Connection) -> None:
     status = st.selectbox(
         "Status", ["open", "closed"], index=0 if current_status != "closed" else 1
     )
+    current_area = selected_analysis.get("area") or "(brak)"
+    area = st.selectbox(
+        "Obszar",
+        AREA_OPTIONS,
+        index=AREA_OPTIONS.index(current_area) if current_area in AREA_OPTIONS else 0,
+    )
     if st.button("Zapisz status"):
         analysis_repo.update_analysis(
             selected_analysis_id,
-            {"status": status},
+            {"status": status, "area": None if area == "(brak)" else area},
         )
         st.success("Status zaktualizowany.")
         st.rerun()
