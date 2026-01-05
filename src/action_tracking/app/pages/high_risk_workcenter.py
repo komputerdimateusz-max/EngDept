@@ -20,6 +20,7 @@ from action_tracking.services.workcenter_classifier import (
     SCRAP_COMPONENTS,
     extract_injection_machines,
 )
+from action_tracking.services.effectiveness import parse_work_centers
 
 IMPORTANCE_ORDER = {
     "High Runner": 0,
@@ -155,25 +156,45 @@ def render(con: sqlite3.Connection) -> None:
     scrap_area_filter = SCRAP_COMPONENTS.get(scrap_component)
     kpi_area_filter = KPI_COMPONENTS.get(kpi_component)
     searchback_from = selected_to - timedelta(days=searchback_calendar_days)
+    has_full_project_column = (
+        production_repo.has_full_project_column("scrap_daily")
+        and production_repo.has_full_project_column("production_kpi_daily")
+    )
+    missing_full_project = 0
 
     for project in projects:
         importance = project.get("importance") or "Mid Runner"
         if selected_importance and importance not in selected_importance:
             continue
+        production_key = (project.get("full_project") or "").strip() if has_full_project_column else ""
+        project_work_centers = parse_work_centers(
+            project.get("work_center"),
+            project.get("related_work_center"),
+        )
+        active_full_project = None
+        active_work_centers = None
+        if has_full_project_column:
+            if production_key:
+                active_full_project = production_key
+            else:
+                missing_full_project += 1
+                continue
+        else:
+            active_work_centers = project_work_centers or None
 
         scrap_rows = production_repo.list_scrap_daily(
-            None,
+            active_work_centers,
             searchback_from,
             selected_to,
             currency="PLN",
-            full_project=project.get("id"),
+            full_project=active_full_project,
             workcenter_areas=scrap_area_filter,
         )
         kpi_rows = production_repo.list_kpi_daily(
-            kpi_machine_filter,
+            kpi_machine_filter or active_work_centers,
             searchback_from,
             selected_to,
-            full_project=project.get("id"),
+            full_project=active_full_project,
             workcenter_areas=kpi_area_filter,
         )
         kpi_window = compute_project_kpi_windows(
@@ -240,6 +261,10 @@ def render(con: sqlite3.Connection) -> None:
             }
         )
 
+    if has_full_project_column and missing_full_project:
+        st.warning(
+            "Pominięto projekty bez FULL PROJECT — uzupełnij w Projekty → FULL PROJECT (production key)."
+        )
     if not rows:
         if sort_mode == "Bad trend":
             st.info("Brak projektów spełniających kryteria ryzyka.")
