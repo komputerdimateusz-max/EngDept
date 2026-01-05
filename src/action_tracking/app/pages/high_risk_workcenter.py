@@ -86,7 +86,7 @@ def _format_kpi_cell(current: float | None, baseline: float | None) -> tuple[str
 
 
 def render(con: sqlite3.Connection) -> None:
-    st.header("High risk WorkCenter")
+    st.header("High Risk project")
 
     production_repo = ProductionDataRepository(con)
     project_repo = ProjectRepository(con)
@@ -117,19 +117,27 @@ def render(con: sqlite3.Connection) -> None:
     remove_saturdays = weekend_col1.checkbox("Usuń soboty", value=False)
     remove_sundays = weekend_col2.checkbox("Usuń niedziele", value=False)
 
+    importance_options = ["High Runner", "Mid Runner", "Low Runner", "Spare parts"]
+    default_importance = [option for option in importance_options if option != "Spare parts"]
+    filter_col4, filter_col5 = st.columns([1.2, 1.6])
+    selected_importance = filter_col4.multiselect(
+        "Importance",
+        importance_options,
+        default=default_importance,
+    )
+
+    sort_modes = [
+        "Bad trend",
+        "Highest scrap PLN",
+        "Lowest OEE",
+        "Lowest Performance",
+    ]
+    sort_mode = filter_col5.selectbox("Tryb / sortowanie", sort_modes, index=0)
+
     threshold_col1, threshold_col2, threshold_col3 = st.columns(3)
     oee_threshold = threshold_col1.slider("OEE spadek (pp)", min_value=1, max_value=10, value=3)
     perf_threshold = threshold_col2.slider("Performance spadek (pp)", min_value=1, max_value=10, value=3)
     scrap_threshold = threshold_col3.slider("Scrap wzrost (%)", min_value=1, max_value=50, value=10)
-
-    sort_options = [
-        "Priorytet (importance)",
-        "Liczba ryzyk",
-        "Scrap Δ%",
-        "OEE Δ pp",
-        "Performance Δ pp",
-    ]
-    sort_choice = st.selectbox("Sortuj wg", sort_options, index=0)
 
     if selected_from > selected_to:
         st.error("Zakres dat jest nieprawidłowy (Data od > Data do).")
@@ -143,6 +151,10 @@ def render(con: sqlite3.Connection) -> None:
     no_wc_count = 0
 
     for project in projects:
+        importance = project.get("importance") or "Mid Runner"
+        if selected_importance and importance not in selected_importance:
+            continue
+
         work_centers = _resolve_project_work_centers(project, work_center_map, include_related)
         if not work_centers:
             no_wc_count += 1
@@ -187,10 +199,9 @@ def render(con: sqlite3.Connection) -> None:
         if scrap_risk:
             risk_flags.append("Scrap↑")
 
-        if not risk_flags:
+        if sort_mode == "Bad trend" and not risk_flags:
             continue
 
-        importance = project.get("importance") or "Mid Runner"
         owner_id = project.get("owner_champion_id")
         owner_name = champion_names.get(owner_id) if owner_id else "—"
 
@@ -211,6 +222,9 @@ def render(con: sqlite3.Connection) -> None:
                 "scrap_delta_pct": scrap_delta_pct,
                 "oee_delta_pp": oee_delta_pp,
                 "perf_delta_pp": perf_delta_pp,
+                "current_scrap_pln": current_scrap_pln,
+                "current_oee": current_oee,
+                "current_perf": current_perf,
                 "work_centers": work_centers,
             }
         )
@@ -219,35 +233,45 @@ def render(con: sqlite3.Connection) -> None:
         st.caption(f"Pominięto projekty bez Work Center: {no_wc_count}.")
 
     if not rows:
-        st.info("Brak projektów spełniających kryteria ryzyka.")
+        if sort_mode == "Bad trend":
+            st.info("Brak projektów spełniających kryteria ryzyka.")
+        else:
+            st.info("Brak projektów spełniających kryteria filtrowania.")
         return
 
-    if sort_choice == "Liczba ryzyk":
-        rows = sorted(rows, key=lambda r: (r["risk_count"], -r["importance_order"]), reverse=True)
-    elif sort_choice == "Scrap Δ%":
+    if sort_mode == "Highest scrap PLN":
         rows = sorted(
             rows,
             key=lambda r: (
-                r["scrap_delta_pct"] if r["scrap_delta_pct"] is not None else -9999
-            ),
-            reverse=True,
-        )
-    elif sort_choice == "OEE Δ pp":
-        rows = sorted(
-            rows,
-            key=lambda r: (
-                r["oee_delta_pp"] if r["oee_delta_pp"] is not None else 9999
+                r["current_scrap_pln"] is None,
+                -(r["current_scrap_pln"] or 0),
             ),
         )
-    elif sort_choice == "Performance Δ pp":
+    elif sort_mode == "Lowest OEE":
         rows = sorted(
             rows,
             key=lambda r: (
-                r["perf_delta_pp"] if r["perf_delta_pp"] is not None else 9999
+                r["current_oee"] is None,
+                r["current_oee"] if r["current_oee"] is not None else float("inf"),
+            ),
+        )
+    elif sort_mode == "Lowest Performance":
+        rows = sorted(
+            rows,
+            key=lambda r: (
+                r["current_perf"] is None,
+                r["current_perf"] if r["current_perf"] is not None else float("inf"),
             ),
         )
     else:
-        rows = sorted(rows, key=lambda r: (r["importance_order"], r["project_name"] or ""))
+        rows = sorted(
+            rows,
+            key=lambda r: (
+                -r["risk_count"],
+                r["importance_order"],
+                r["project_name"] or "",
+            ),
+        )
 
     sample_metrics = compute_baseline_current_metrics(
         pd.DataFrame(columns=["metric_date"]),

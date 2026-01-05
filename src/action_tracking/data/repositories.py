@@ -2384,8 +2384,10 @@ class ProjectRepository:
             cur = self.con.execute(query)
             return [dict(r) for r in cur.fetchall()]
 
-        select_cols = ", ".join(project_cols)
-        query = f"SELECT {select_cols} FROM projects"
+        select_fields = list(project_cols)
+        if "importance" not in project_cols:
+            select_fields.append("NULL AS importance")
+        query = f"SELECT {', '.join(select_fields)} FROM projects"
         if "name" in project_cols:
             query += " ORDER BY name"
         cur = self.con.execute(query)
