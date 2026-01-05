@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 # What changed:
-# - Added project filter fallback to work centers for Production Explorer data loads.
 # - Added empty-filter debug info and classification sanity checks.
 
 from datetime import date, timedelta
+import re
 import sqlite3
 from typing import Any
 
@@ -18,7 +18,7 @@ from action_tracking.data.repositories import (
     ProductionDataRepository,
     ProjectRepository,
 )
-from action_tracking.services.effectiveness import parse_date, parse_work_centers
+from action_tracking.services.effectiveness import parse_date
 from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_COLORS,
     OVERLAY_TARGET_LABELS,
@@ -187,49 +187,29 @@ def _format_window_label(window: dict[str, Any]) -> str:
     )
 
 
-def _resolve_project_filters(project: dict[str, Any] | None) -> tuple[list[str], list[str]]:
+def _resolve_project_filters(project: dict[str, Any] | None) -> list[str]:
     if not project:
-        return [], []
-    full_project_candidates = [
-        str(project.get("id") or "").strip(),
-        str(project.get("name") or "").strip(),
-        str(project.get("project_code") or "").strip(),
-    ]
-    full_project_values = [
-        value for value in full_project_candidates if value and value.lower() != "none"
-    ]
-    work_centers = parse_work_centers(
-        project.get("work_center"),
-        project.get("related_work_center"),
-    )
-    return list(dict.fromkeys(full_project_values)), work_centers
+        return []
+    full_project = str(project.get("id") or "").strip()
+    if not full_project or full_project.lower() == "none":
+        return []
+    return [full_project]
 
 
-def _load_kpi_rows_with_fallback(
+def _load_kpi_rows(
     production_repo: ProductionDataRepository,
     date_from: date,
     date_to: date,
     full_project: str | list[str] | None,
-    work_centers: list[str] | None,
     workcenter_areas: set[str] | None,
-) -> tuple[list[dict[str, Any]], bool]:
-    rows = production_repo.list_kpi_daily(
+) -> list[dict[str, Any]]:
+    return production_repo.list_kpi_daily(
         None,
         date_from,
         date_to,
         full_project=full_project,
         workcenter_areas=workcenter_areas,
     )
-    if rows or not work_centers:
-        return rows, False
-    fallback_rows = production_repo.list_kpi_daily(
-        work_centers,
-        date_from,
-        date_to,
-        full_project=None,
-        workcenter_areas=workcenter_areas,
-    )
-    return fallback_rows, True
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -270,12 +250,11 @@ def render(con: sqlite3.Connection) -> None:
     if selected_project == "Wszystkie":
         st.session_state.pop("production_explorer_selected_project_id", None)
         full_project_filter = None
-        project_work_centers: list[str] | None = None
         selected_project_id = None
     else:
         st.session_state["production_explorer_selected_project_id"] = selected_project
         project = projects_by_id.get(selected_project)
-        project_full_projects, project_work_centers = _resolve_project_filters(project)
+        project_full_projects = _resolve_project_filters(project)
         full_project_filter = project_full_projects or [selected_project]
         selected_project_id = selected_project
 
@@ -307,12 +286,11 @@ def render(con: sqlite3.Connection) -> None:
     selected_machine = None
     kpi_machine_filter: list[str] | None = None
     if kpi_component == "Wtrysk (Mxx)":
-        injection_rows, used_wc_fallback = _load_kpi_rows_with_fallback(
+        injection_rows = _load_kpi_rows(
             production_repo,
             selected_from,
             selected_to,
             full_project_filter,
-            project_work_centers,
             KPI_COMPONENTS.get("Wtrysk (Mxx)"),
         )
         machine_options = ["Wszystkie"] + extract_injection_machines(injection_rows)
@@ -348,28 +326,9 @@ def render(con: sqlite3.Connection) -> None:
         scrap_areas=scrap_area_filter,
         kpi_areas=kpi_area_filter,
     )
-    used_wc_fallback = False
-    if (
-        selected_project != "Wszystkie"
-        and scrap_daily.empty
-        and kpi_daily.empty
-        and project_work_centers
-    ):
-        scrap_daily, kpi_daily, _ = load_daily_frames(
-            production_repo,
-            project_work_centers,
-            kpi_machine_filter or project_work_centers,
-            selected_from,
-            selected_to,
-            currency=currency_filter,
-            full_project=None,
-            scrap_areas=scrap_area_filter,
-            kpi_areas=kpi_area_filter,
-        )
-        used_wc_fallback = True
     searchback_from = selected_to - timedelta(days=searchback_calendar_days)
-    active_full_project = None if used_wc_fallback else full_project_filter
-    active_work_centers = project_work_centers if used_wc_fallback else None
+    active_full_project = full_project_filter
+    active_work_centers = None
     kpi_scrap_rows = production_repo.list_scrap_daily(
         active_work_centers,
         searchback_from,
@@ -398,6 +357,66 @@ def render(con: sqlite3.Connection) -> None:
     oee_scale = kpi_daily.attrs.get("oee_scale", "unknown")
     perf_scale = kpi_daily.attrs.get("perf_scale", "unknown")
 
+    if selected_project != "Wszystkie" and active_full_project:
+        debug_scrap_rows = production_repo.list_scrap_daily(
+            None,
+            selected_from,
+            selected_to,
+            currency=None,
+            full_project=active_full_project,
+            workcenter_areas=None,
+        )
+        debug_kpi_rows = production_repo.list_kpi_daily(
+            None,
+            selected_from,
+            selected_to,
+            full_project=active_full_project,
+            workcenter_areas=None,
+        )
+        debug_workcenters = [
+            " ".join(str(row.get("work_center") or "").replace("\u00a0", " ").split()).upper()
+            for row in (debug_scrap_rows + debug_kpi_rows)
+            if str(row.get("work_center") or "").strip()
+        ]
+        debug_workcenters = [wc for wc in debug_workcenters if wc]
+        distinct_workcenters = sorted(set(debug_workcenters))[:20]
+        counts_by_area: dict[str, int] = {}
+        for row in debug_scrap_rows + debug_kpi_rows:
+            area = classify_workcenter(row.get("work_center") or "").get("area") or "other"
+            counts_by_area[area] = counts_by_area.get(area, 0) + 1
+        metalization_token_re = re.compile(r"M(?:TZ|ZT)", re.IGNORECASE)
+        has_metalization_token = any(
+            metalization_token_re.search(str(row.get("work_center") or ""))
+            for row in (debug_scrap_rows + debug_kpi_rows)
+        )
+        metalization_count = counts_by_area.get("metalization", 0)
+        with st.expander("Debug: matching keys", expanded=False):
+            st.caption(f"Selected project id: {selected_project_id}")
+            st.caption(f"Selected project name: {project_names.get(selected_project_id, '—')}")
+            st.caption(
+                "Rows matched by FULL PROJECT: "
+                f"{len(debug_scrap_rows)} scrap / {len(debug_kpi_rows)} KPI"
+            )
+            if distinct_workcenters:
+                st.caption(
+                    "Distinct WORKCENTER tokens (top 20): "
+                    + ", ".join(distinct_workcenters)
+                )
+            else:
+                st.caption("Distinct WORKCENTER tokens (top 20): —")
+            if counts_by_area:
+                area_rows = [
+                    {"Area": area, "Rows": count}
+                    for area, count in sorted(counts_by_area.items())
+                ]
+                st.dataframe(area_rows, use_container_width=True)
+            else:
+                st.caption("Counts by area: —")
+            if has_metalization_token and metalization_count == 0:
+                st.caption(
+                    "Debug: wykryto token MZT/MTZ w WORKCENTER, ale 0 w Metalizacji."
+                )
+
     if scrap_daily.empty and kpi_daily.empty:
         pre_scrap_rows = production_repo.list_scrap_daily(
             active_work_centers,
@@ -419,8 +438,6 @@ def render(con: sqlite3.Connection) -> None:
             f"Scrap rows: {len(scrap_rows)} / {len(pre_scrap_rows)} | "
             f"KPI rows: {len(kpi_rows)} / {len(pre_kpi_rows)}."
         )
-        if used_wc_fallback:
-            st.caption("Użyto fallbacku na work center (pełny projekt bez dopasowania).")
         return
 
     if currency == "PLN":
@@ -441,7 +458,7 @@ def render(con: sqlite3.Connection) -> None:
         kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"], errors="coerce")
         kpi_df = kpi_df.dropna(subset=["metric_date"])
 
-    if active_full_project or active_work_centers:
+    if active_full_project:
         totals_rows = production_repo.list_scrap_daily(
             active_work_centers,
             selected_from,
