@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# What changed:
+# - Restored "Obszar" selection for action create/edit with sensible defaults.
+# - Ensured area value is always defined before saving action payloads.
+
 import json
 import sqlite3
 from datetime import date, timedelta
@@ -136,6 +140,12 @@ def _get_query_param(key: str) -> str | None:
     if isinstance(value, list):
         return value[0] if value else None
     return value
+
+
+def _resolve_area_default(selected_area: Any) -> str:
+    if selected_area in AREA_OPTIONS:
+        return selected_area
+    return "Montaż"
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -496,17 +506,13 @@ def render(con: sqlite3.Connection) -> None:
             area = st.selectbox(
                 "Obszar",
                 AREA_OPTIONS,
-                index=AREA_OPTIONS.index(selected.get("area"))
-                if selected.get("area") in AREA_OPTIONS
-                else 0,
+                index=AREA_OPTIONS.index(_resolve_area_default(selected.get("area"))),
                 key="action_area_select",
             )
             area = st.selectbox(
                 "Obszar",
                 AREA_OPTIONS,
-                index=AREA_OPTIONS.index(selected.get("area"))
-                if selected.get("area") in AREA_OPTIONS
-                else 0,
+                index=AREA_OPTIONS.index(_resolve_area_default(selected.get("area"))),
                 key="draft_action_area_select",
             )
 
@@ -719,6 +725,12 @@ def render(con: sqlite3.Connection) -> None:
                 "Opis",
                 value=selected.get("description", "") or "",
                 max_chars=500,
+            )
+            area = st.selectbox(
+                "Obszar",
+                AREA_OPTIONS,
+                index=AREA_OPTIONS.index(_resolve_area_default(selected.get("area"))),
+                key="action_area_select",
             )
 
             project_ids = [p["id"] for p in projects]

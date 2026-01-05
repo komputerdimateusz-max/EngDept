@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# What changed:
+# - Added project filter fallback to work centers for Production Explorer data loads.
+# - Added empty-filter debug info and classification sanity checks.
+
 from datetime import date, timedelta
 import sqlite3
 from typing import Any
@@ -14,7 +18,7 @@ from action_tracking.data.repositories import (
     ProductionDataRepository,
     ProjectRepository,
 )
-from action_tracking.services.effectiveness import parse_date
+from action_tracking.services.effectiveness import parse_date, parse_work_centers
 from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_COLORS,
     OVERLAY_TARGET_LABELS,
@@ -31,6 +35,7 @@ from action_tracking.services.production_outcome import (
 from action_tracking.services.workcenter_classifier import (
     KPI_COMPONENTS,
     SCRAP_COMPONENTS,
+    classification_sanity_check,
     classify_workcenter,
     extract_injection_machines,
     filter_rows_by_areas,
@@ -182,6 +187,51 @@ def _format_window_label(window: dict[str, Any]) -> str:
     )
 
 
+def _resolve_project_filters(project: dict[str, Any] | None) -> tuple[list[str], list[str]]:
+    if not project:
+        return [], []
+    full_project_candidates = [
+        str(project.get("id") or "").strip(),
+        str(project.get("name") or "").strip(),
+        str(project.get("project_code") or "").strip(),
+    ]
+    full_project_values = [
+        value for value in full_project_candidates if value and value.lower() != "none"
+    ]
+    work_centers = parse_work_centers(
+        project.get("work_center"),
+        project.get("related_work_center"),
+    )
+    return list(dict.fromkeys(full_project_values)), work_centers
+
+
+def _load_kpi_rows_with_fallback(
+    production_repo: ProductionDataRepository,
+    date_from: date,
+    date_to: date,
+    full_project: str | list[str] | None,
+    work_centers: list[str] | None,
+    workcenter_areas: set[str] | None,
+) -> tuple[list[dict[str, Any]], bool]:
+    rows = production_repo.list_kpi_daily(
+        None,
+        date_from,
+        date_to,
+        full_project=full_project,
+        workcenter_areas=workcenter_areas,
+    )
+    if rows or not work_centers:
+        return rows, False
+    fallback_rows = production_repo.list_kpi_daily(
+        work_centers,
+        date_from,
+        date_to,
+        full_project=None,
+        workcenter_areas=workcenter_areas,
+    )
+    return fallback_rows, True
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Production Explorer")
     production_repo = ProductionDataRepository(con)
@@ -191,6 +241,9 @@ def render(con: sqlite3.Connection) -> None:
 
     projects = project_repo.list_projects(include_counts=True)
     project_names = {p["id"]: p.get("name") or p.get("id") for p in projects}
+    projects_by_id = {p["id"]: p for p in projects}
+
+    classification_sanity_check()
 
     today = date.today()
     default_from = today - timedelta(days=90)
@@ -217,9 +270,14 @@ def render(con: sqlite3.Connection) -> None:
     if selected_project == "Wszystkie":
         st.session_state.pop("production_explorer_selected_project_id", None)
         full_project_filter = None
+        project_work_centers: list[str] | None = None
+        selected_project_id = None
     else:
         st.session_state["production_explorer_selected_project_id"] = selected_project
-        full_project_filter = selected_project
+        project = projects_by_id.get(selected_project)
+        project_full_projects, project_work_centers = _resolve_project_filters(project)
+        full_project_filter = project_full_projects or [selected_project]
+        selected_project_id = selected_project
 
     scrap_component = filter_col2.selectbox(
         "Scrap – komponent",
@@ -249,12 +307,13 @@ def render(con: sqlite3.Connection) -> None:
     selected_machine = None
     kpi_machine_filter: list[str] | None = None
     if kpi_component == "Wtrysk (Mxx)":
-        injection_rows = production_repo.list_kpi_daily(
-            None,
+        injection_rows, used_wc_fallback = _load_kpi_rows_with_fallback(
+            production_repo,
             selected_from,
             selected_to,
-            full_project=full_project_filter,
-            workcenter_areas=KPI_COMPONENTS.get("Wtrysk (Mxx)"),
+            full_project_filter,
+            project_work_centers,
+            KPI_COMPONENTS.get("Wtrysk (Mxx)"),
         )
         machine_options = ["Wszystkie"] + extract_injection_machines(injection_rows)
         selected_machine = machine_col.selectbox(
@@ -289,20 +348,41 @@ def render(con: sqlite3.Connection) -> None:
         scrap_areas=scrap_area_filter,
         kpi_areas=kpi_area_filter,
     )
+    used_wc_fallback = False
+    if (
+        selected_project != "Wszystkie"
+        and scrap_daily.empty
+        and kpi_daily.empty
+        and project_work_centers
+    ):
+        scrap_daily, kpi_daily, _ = load_daily_frames(
+            production_repo,
+            project_work_centers,
+            kpi_machine_filter or project_work_centers,
+            selected_from,
+            selected_to,
+            currency=currency_filter,
+            full_project=None,
+            scrap_areas=scrap_area_filter,
+            kpi_areas=kpi_area_filter,
+        )
+        used_wc_fallback = True
     searchback_from = selected_to - timedelta(days=searchback_calendar_days)
+    active_full_project = None if used_wc_fallback else full_project_filter
+    active_work_centers = project_work_centers if used_wc_fallback else None
     kpi_scrap_rows = production_repo.list_scrap_daily(
-        None,
+        active_work_centers,
         searchback_from,
         selected_to,
         currency="PLN",
-        full_project=full_project_filter,
+        full_project=active_full_project,
         workcenter_areas=scrap_area_filter,
     )
     kpi_window_rows = production_repo.list_kpi_daily(
-        kpi_machine_filter,
+        kpi_machine_filter or active_work_centers,
         searchback_from,
         selected_to,
-        full_project=full_project_filter,
+        full_project=active_full_project,
         workcenter_areas=kpi_area_filter,
     )
     kpi_window = compute_project_kpi_windows(
@@ -319,7 +399,28 @@ def render(con: sqlite3.Connection) -> None:
     perf_scale = kpi_daily.attrs.get("perf_scale", "unknown")
 
     if scrap_daily.empty and kpi_daily.empty:
-        st.info("Brak danych produkcyjnych dla wybranych filtrów.")
+        pre_scrap_rows = production_repo.list_scrap_daily(
+            active_work_centers,
+            selected_from,
+            selected_to,
+            currency=currency_filter,
+            full_project=active_full_project,
+            workcenter_areas=None,
+        )
+        pre_kpi_rows = production_repo.list_kpi_daily(
+            kpi_machine_filter or active_work_centers,
+            selected_from,
+            selected_to,
+            full_project=active_full_project,
+            workcenter_areas=None,
+        )
+        st.info(
+            "Brak danych produkcyjnych po filtrach. "
+            f"Scrap rows: {len(scrap_rows)} / {len(pre_scrap_rows)} | "
+            f"KPI rows: {len(kpi_rows)} / {len(pre_kpi_rows)}."
+        )
+        if used_wc_fallback:
+            st.caption("Użyto fallbacku na work center (pełny projekt bez dopasowania).")
         return
 
     if currency == "PLN":
@@ -340,13 +441,13 @@ def render(con: sqlite3.Connection) -> None:
         kpi_df["metric_date"] = pd.to_datetime(kpi_df["metric_date"], errors="coerce")
         kpi_df = kpi_df.dropna(subset=["metric_date"])
 
-    if full_project_filter:
+    if active_full_project or active_work_centers:
         totals_rows = production_repo.list_scrap_daily(
-            None,
+            active_work_centers,
             selected_from,
             selected_to,
             currency="PLN",
-            full_project=full_project_filter,
+            full_project=active_full_project,
         )
         totals_rows = filter_rows_by_areas(totals_rows, SCRAP_COMPONENTS.get("TOTAL (all)"))
         totals_by_area: dict[str, dict[str, float]] = {}
@@ -437,11 +538,11 @@ def render(con: sqlite3.Connection) -> None:
         st.caption("KPI zapisane w bazie jako procenty (0-100).")
 
     markers_df = pd.DataFrame()
-    if full_project_filter:
+    if selected_project_id:
         markers: list[dict[str, Any]] = []
         actions = action_repo.list_actions(
             status="done",
-            project_id=full_project_filter,
+            project_id=selected_project_id,
             is_draft=False,
         )
         for action in actions:
