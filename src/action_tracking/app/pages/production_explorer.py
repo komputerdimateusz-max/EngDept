@@ -21,9 +21,9 @@ from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_LABELS,
     default_overlay_targets,
 )
+from action_tracking.services.kpi_windows import compute_project_kpi_windows
 from action_tracking.services.production_outcome import (
     apply_weekend_filter,
-    compute_baseline_after_metrics,
     format_metric_value,
     load_daily_frames,
     metric_delta_label,
@@ -200,6 +200,22 @@ def _resolve_project_work_centers(
     return resolved
 
 
+def _format_window_label(window: dict[str, Any]) -> str:
+    current_days = window.get("current_days") or 0
+    baseline_days = window.get("baseline_days") or 0
+    current_from = window.get("current_from")
+    current_to = window.get("current_to")
+    baseline_from = window.get("baseline_from")
+    baseline_to = window.get("baseline_to")
+    if not current_days or not baseline_days or not current_from or not baseline_from:
+        return "Okno KPI: —"
+    return (
+        "Okno KPI: "
+        f"Current {current_days} prod dni ({current_from}..{current_to}), "
+        f"Baseline {baseline_days} prod dni ({baseline_from}..{baseline_to})"
+    )
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Production Explorer")
     production_repo = ProductionDataRepository(con)
@@ -219,6 +235,7 @@ def render(con: sqlite3.Connection) -> None:
 
     today = date.today()
     default_from = today - timedelta(days=90)
+    searchback_calendar_days = 180
 
     preselected_project_id = _get_query_param("project_id")
     if preselected_project_id:
@@ -285,12 +302,29 @@ def render(con: sqlite3.Connection) -> None:
 
     work_center_filter = selected_work_centers
     currency_filter = "PLN" if currency == "PLN" else None
-    scrap_daily, kpi_daily, merged_daily = load_daily_frames(
+    scrap_daily, kpi_daily, _ = load_daily_frames(
         production_repo,
         work_center_filter,
         selected_from,
         selected_to,
         currency=currency_filter,
+    )
+    searchback_from = selected_to - timedelta(days=searchback_calendar_days)
+    kpi_scrap_rows = production_repo.list_scrap_daily(
+        work_center_filter,
+        searchback_from,
+        selected_to,
+        currency="PLN",
+    )
+    kpi_window_rows = production_repo.list_kpi_daily(
+        work_center_filter, searchback_from, selected_to
+    )
+    kpi_window = compute_project_kpi_windows(
+        kpi_scrap_rows,
+        kpi_window_rows,
+        remove_saturdays,
+        remove_sundays,
+        searchback_calendar_days=searchback_calendar_days,
     )
 
     scrap_rows = scrap_daily.attrs.get("scrap_rows_filtered", [])
@@ -327,7 +361,6 @@ def render(con: sqlite3.Connection) -> None:
     if daily_view:
         scrap_daily = apply_weekend_filter(scrap_daily, remove_saturdays, remove_sundays)
         kpi_daily = apply_weekend_filter(kpi_daily, remove_saturdays, remove_sundays)
-        merged_daily = apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
     else:
         scrap_daily = _weekly_scrap_aggregation(scrap_df)
         kpi_daily = _weekly_kpi_aggregation(kpi_df)
@@ -336,54 +369,56 @@ def render(con: sqlite3.Connection) -> None:
         st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
         return
 
-    baseline_daily = apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
-    if baseline_daily.empty:
-        st.info("Po odfiltrowaniu weekendów brak danych w zakresie.")
-        return
+    if kpi_window.get("status") == "insufficient_data":
+        st.warning("Za mało dni produkcyjnych (<8), aby policzyć okna KPI.")
 
-    metrics = compute_baseline_after_metrics(baseline_daily, selected_from, selected_to)
-    if metrics.get("used_halves"):
-        st.warning("Zakres < 28 dni: KPI obliczane jako połowy zakresu (baseline vs after).")
+    window = kpi_window.get("window", {})
+    metrics = kpi_window.get("metrics", {})
+    scrap_metrics = metrics.get("scrap_qty", {})
+    scrap_pln_metrics = metrics.get("scrap_pln", {})
+    oee_metrics = metrics.get("oee", {})
+    perf_metrics = metrics.get("performance", {})
 
-    baseline_scrap_qty = metrics.get("baseline_scrap_qty")
-    after_scrap_qty = metrics.get("after_scrap_qty")
-    baseline_scrap_pln = metrics.get("baseline_scrap_pln")
-    after_scrap_pln = metrics.get("after_scrap_pln")
-    baseline_oee = metrics.get("baseline_oee")
-    after_oee = metrics.get("after_oee")
-    baseline_perf = metrics.get("baseline_perf")
-    after_perf = metrics.get("after_perf")
+    baseline_scrap_qty = scrap_metrics.get("baseline")
+    current_scrap_qty = scrap_metrics.get("current")
+    baseline_scrap_pln = scrap_pln_metrics.get("baseline")
+    current_scrap_pln = scrap_pln_metrics.get("current")
+    baseline_oee = oee_metrics.get("baseline")
+    current_oee = oee_metrics.get("current")
+    baseline_perf = perf_metrics.get("baseline")
+    current_perf = perf_metrics.get("current")
 
     kpi_cols = st.columns(4)
-    kpi_cols[0].metric("Śr. scrap qty/dzień", format_metric_value(after_scrap_qty, "{:.2f}"))
+    kpi_cols[0].metric("Śr. scrap qty/dzień", format_metric_value(current_scrap_qty, "{:.2f}"))
     kpi_cols[0].markdown(
-        scrap_delta_badge(baseline_scrap_qty, after_scrap_qty, "{:.2f}"),
+        scrap_delta_badge(baseline_scrap_qty, current_scrap_qty, "{:.2f}"),
         unsafe_allow_html=True,
     )
     kpi_cols[0].caption(f"Baseline: {format_metric_value(baseline_scrap_qty, '{:.2f}')}")
 
-    kpi_cols[1].metric("Śr. scrap PLN/dzień", format_metric_value(after_scrap_pln, "{:.2f}"))
+    kpi_cols[1].metric("Śr. scrap PLN/dzień", format_metric_value(current_scrap_pln, "{:.2f}"))
     kpi_cols[1].markdown(
-        scrap_delta_badge(baseline_scrap_pln, after_scrap_pln, "{:.2f}"),
+        scrap_delta_badge(baseline_scrap_pln, current_scrap_pln, "{:.2f}"),
         unsafe_allow_html=True,
     )
     kpi_cols[1].caption(f"Baseline: {format_metric_value(baseline_scrap_pln, '{:.2f}')}")
 
     kpi_cols[2].metric(
         "Śr. OEE%",
-        format_metric_value(after_oee, "{:.1f}%"),
-        delta=metric_delta_label(baseline_oee, after_oee, "{:+.1f} pp"),
+        format_metric_value(current_oee, "{:.1f}%"),
+        delta=metric_delta_label(baseline_oee, current_oee, "{:+.1f} pp"),
     )
     kpi_cols[2].caption(f"Baseline: {format_metric_value(baseline_oee, '{:.1f}%')}")
 
     kpi_cols[3].metric(
         "Śr. Performance%",
-        format_metric_value(after_perf, "{:.1f}%"),
-        delta=metric_delta_label(baseline_perf, after_perf, "{:+.1f} pp"),
+        format_metric_value(current_perf, "{:.1f}%"),
+        delta=metric_delta_label(baseline_perf, current_perf, "{:+.1f} pp"),
     )
     kpi_cols[3].caption(f"Baseline: {format_metric_value(baseline_perf, '{:.1f}%')}")
 
     st.caption("Dla scrap spadek = poprawa.")
+    st.caption(_format_window_label(window))
     if oee_scale != "unknown" or perf_scale != "unknown":
         st.caption("KPI zapisane w bazie jako procenty (0-100).")
 

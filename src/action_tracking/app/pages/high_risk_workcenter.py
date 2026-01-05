@@ -6,7 +6,6 @@ from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
 
-import pandas as pd
 import streamlit as st
 
 from action_tracking.data.repositories import (
@@ -15,14 +14,9 @@ from action_tracking.data.repositories import (
     ProjectRepository,
 )
 from action_tracking.services.effectiveness import parse_work_centers
-from action_tracking.services.kpi_delta import compute_kpi_pp_delta, compute_scrap_delta
+from action_tracking.services.kpi_windows import compute_project_kpi_windows
 from action_tracking.services.normalize import normalize_key
-from action_tracking.services.production_outcome import (
-    apply_weekend_filter,
-    compute_baseline_current_metrics,
-    format_metric_value,
-    load_daily_frames,
-)
+from action_tracking.services.production_outcome import format_metric_value
 
 IMPORTANCE_ORDER = {
     "High Runner": 0,
@@ -65,24 +59,41 @@ def _resolve_project_work_centers(
     return resolved
 
 
-def _format_scrap_cell(current: float | None, baseline: float | None) -> tuple[str, float | None]:
+def _format_scrap_cell(metric: dict[str, Any]) -> tuple[str, float | None]:
+    current = metric.get("current")
     current_label = format_metric_value(current, "{:.2f}")
-    delta = compute_scrap_delta(current, baseline)
-    delta_abs = delta.get("delta_abs")
-    delta_pct = delta.get("delta_pct")
+    delta_abs = metric.get("delta_abs")
+    delta_pct = metric.get("delta_rel_pct")
     if delta_abs is None:
         return current_label, None
     pct_label = "n/a" if delta_pct is None else f"{delta_pct:+.1f}%"
     return f"{current_label} ({delta_abs:+.2f}, {pct_label})", delta_pct
 
 
-def _format_kpi_cell(current: float | None, baseline: float | None) -> tuple[str, float | None]:
+def _format_kpi_cell(metric: dict[str, Any]) -> tuple[str, float | None]:
+    current = metric.get("current")
     current_label = format_metric_value(current, "{:.1f}%")
-    delta = compute_kpi_pp_delta(current, baseline)
-    delta_pp = delta.get("delta_pp")
+    delta_pp = metric.get("delta_pp")
     if delta_pp is None:
         return current_label, None
     return f"{current_label} ({delta_pp:+.1f} pp)", delta_pp
+
+
+def _format_window_label(window: dict[str, Any], status: str) -> str:
+    if status != "ok":
+        return "Okno KPI: — (insufficient data)"
+    current_days = window.get("current_days") or 0
+    baseline_days = window.get("baseline_days") or 0
+    current_from = window.get("current_from")
+    current_to = window.get("current_to")
+    baseline_from = window.get("baseline_from")
+    baseline_to = window.get("baseline_to")
+    if not current_days or not baseline_days or not current_from or not baseline_from:
+        return "Okno KPI: —"
+    return (
+        f"Okno KPI: Current {current_days} dni ({current_from}..{current_to}), "
+        f"Baseline {baseline_days} dni ({baseline_from}..{baseline_to})"
+    )
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -104,6 +115,7 @@ def render(con: sqlite3.Connection) -> None:
 
     today = date.today()
     default_from = today - timedelta(days=90)
+    searchback_calendar_days = 180
 
     filter_col1, filter_col2, filter_col3 = st.columns([1.2, 1.2, 1.6])
     selected_from = filter_col1.date_input("Data od", value=default_from)
@@ -149,6 +161,7 @@ def render(con: sqlite3.Connection) -> None:
 
     rows: list[dict[str, Any]] = []
     no_wc_count = 0
+    searchback_from = selected_to - timedelta(days=searchback_calendar_days)
 
     for project in projects:
         importance = project.get("importance") or "Mid Runner"
@@ -160,31 +173,32 @@ def render(con: sqlite3.Connection) -> None:
             no_wc_count += 1
             continue
 
-        _scrap_daily, _kpi_daily, merged_daily = load_daily_frames(
-            production_repo,
+        scrap_rows = production_repo.list_scrap_daily(
             work_centers,
-            selected_from,
+            searchback_from,
             selected_to,
             currency="PLN",
         )
-        filtered_daily = apply_weekend_filter(merged_daily, remove_saturdays, remove_sundays)
-        metrics = compute_baseline_current_metrics(filtered_daily, selected_from, selected_to)
-
-        baseline_scrap_qty = metrics.get("baseline_scrap_qty")
-        current_scrap_qty = metrics.get("current_scrap_qty")
-        baseline_scrap_pln = metrics.get("baseline_scrap_pln")
-        current_scrap_pln = metrics.get("current_scrap_pln")
-        baseline_oee = metrics.get("baseline_oee")
-        current_oee = metrics.get("current_oee")
-        baseline_perf = metrics.get("baseline_perf")
-        current_perf = metrics.get("current_perf")
-
-        scrap_label, scrap_delta_pct = _format_scrap_cell(current_scrap_qty, baseline_scrap_qty)
-        scrap_pln_label, scrap_pln_delta_pct = _format_scrap_cell(
-            current_scrap_pln, baseline_scrap_pln
+        kpi_rows = production_repo.list_kpi_daily(work_centers, searchback_from, selected_to)
+        kpi_window = compute_project_kpi_windows(
+            scrap_rows,
+            kpi_rows,
+            remove_saturdays,
+            remove_sundays,
+            searchback_calendar_days=searchback_calendar_days,
         )
-        oee_label, oee_delta_pp = _format_kpi_cell(current_oee, baseline_oee)
-        perf_label, perf_delta_pp = _format_kpi_cell(current_perf, baseline_perf)
+        status = kpi_window.get("status", "insufficient_data")
+        window = kpi_window.get("window", {})
+        metrics = kpi_window.get("metrics", {})
+        scrap_metrics = metrics.get("scrap_qty", {})
+        scrap_pln_metrics = metrics.get("scrap_pln", {})
+        oee_metrics = metrics.get("oee", {})
+        perf_metrics = metrics.get("performance", {})
+
+        scrap_label, scrap_delta_pct = _format_scrap_cell(scrap_metrics)
+        scrap_pln_label, scrap_pln_delta_pct = _format_scrap_cell(scrap_pln_metrics)
+        oee_label, oee_delta_pp = _format_kpi_cell(oee_metrics)
+        perf_label, perf_delta_pp = _format_kpi_cell(perf_metrics)
 
         risk_flags: list[str] = []
         if oee_delta_pp is not None and oee_delta_pp < -float(oee_threshold):
@@ -217,14 +231,15 @@ def render(con: sqlite3.Connection) -> None:
                 "scrap_pln_label": scrap_pln_label,
                 "oee_label": oee_label,
                 "perf_label": perf_label,
+                "window_label": _format_window_label(window, status),
                 "risk_flags": ", ".join(risk_flags),
                 "risk_count": len(risk_flags),
                 "scrap_delta_pct": scrap_delta_pct,
                 "oee_delta_pp": oee_delta_pp,
                 "perf_delta_pp": perf_delta_pp,
-                "current_scrap_pln": current_scrap_pln,
-                "current_oee": current_oee,
-                "current_perf": current_perf,
+                "current_scrap_pln": scrap_pln_metrics.get("current"),
+                "current_oee": oee_metrics.get("current"),
+                "current_perf": perf_metrics.get("current"),
                 "work_centers": work_centers,
             }
         )
@@ -273,15 +288,10 @@ def render(con: sqlite3.Connection) -> None:
             ),
         )
 
-    sample_metrics = compute_baseline_current_metrics(
-        pd.DataFrame(columns=["metric_date"]),
-        selected_from,
-        selected_to,
-    )
-    current_days = sample_metrics.get("current_days") or 0
     st.caption(
-        "Definicja trendu: baseline = średnia z historii (maks. 90 dni) bez ostatnich "
-        f"{current_days} dni; current = średnia z ostatnich {current_days} dni."
+        "Definicja trendu: current = ostatnie dostępne dni produkcyjne (14/7/4), "
+        "baseline = dni bezpośrednio wcześniej (maks. 90 dni). Okno oparte o dni z "
+        "produkcją po filtrach weekendowych."
     )
 
     header = st.columns([2.6, 1.2, 1.6, 1.6, 1.6, 1.4, 1.6, 1.2, 1.0])
@@ -303,6 +313,7 @@ def render(con: sqlite3.Connection) -> None:
         )
         cols = st.columns([2.6, 1.2, 1.6, 1.6, 1.6, 1.4, 1.6, 1.2, 1.0])
         cols[0].markdown(f"[{project_name}]({project_link})")
+        cols[0].caption(row["window_label"])
         cols[1].markdown(row["importance"])
         cols[2].markdown(row["owner_name"])
         cols[3].markdown(row["scrap_label"])
