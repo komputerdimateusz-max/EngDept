@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from action_tracking.services.metrics_scale import normalize_percent
+from action_tracking.services.metrics_scale import normalize_kpi_percent
 
 # =====================================================
 # OPTIONAL IMPORTS (never crash if modules moved / missing)
@@ -155,7 +155,7 @@ def _normalize_impact_aspects_payload(value: Any) -> str | None:
 
 
 def _normalize_percent(value: Any) -> float | None:
-    return normalize_percent(value)
+    return normalize_kpi_percent(value)
 
 
 def _normalize_int(value: Any, default: int | None = None) -> int | None:
@@ -3125,6 +3125,8 @@ class ProductionDataRepository:
             row["oee_pct"] = _normalize_percent(row.get("oee_pct"))
             row["availability_pct"] = _normalize_percent(row.get("availability_pct"))
             row["quality_pct"] = _normalize_percent(row.get("quality_pct"))
+        kpi_cols = ("performance_pct", "oee_pct", "availability_pct", "quality_pct")
+        rows = [row for row in rows if any(row.get(col) is not None for col in kpi_cols)]
         return rows
 
     def rescale_kpi_daily_percent(self) -> dict[str, int]:

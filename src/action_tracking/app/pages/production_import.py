@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from action_tracking.data.repositories import ProductionDataRepository
-from action_tracking.services.metrics_scale import detect_percent_scale, normalize_percent
+from action_tracking.services.metrics_scale import detect_percent_scale, normalize_kpi_percent
 
 SCRAP_REQUIRED_COLUMNS = [
     "DATE",
@@ -238,24 +238,24 @@ def _prepare_kpi_rows(
                 return None
             return float(mean_value)
 
-        oee_pct = normalize_percent(
+        oee_pct = normalize_kpi_percent(
             _resolve_metric(row["oee_weighted"], row["oee_weight"], row["oee_mean"])
         )
-        performance_pct = normalize_percent(
+        performance_pct = normalize_kpi_percent(
             _resolve_metric(
                 row["performance_weighted"],
                 row["performance_weight"],
                 row["performance_mean"],
             )
         )
-        availability_pct = normalize_percent(
+        availability_pct = normalize_kpi_percent(
             _resolve_metric(
                 row["availability_weighted"],
                 row["availability_weight"],
                 row["availability_mean"],
             )
         )
-        quality_pct = normalize_percent(
+        quality_pct = normalize_kpi_percent(
             _resolve_metric(
                 row["quality_weighted"],
                 row["quality_weight"],
