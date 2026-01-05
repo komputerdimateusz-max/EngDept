@@ -4,7 +4,6 @@ from __future__ import annotations
 # - Added empty-filter debug info and classification sanity checks.
 
 from datetime import date, timedelta
-import re
 import sqlite3
 from typing import Any
 
@@ -18,7 +17,7 @@ from action_tracking.data.repositories import (
     ProductionDataRepository,
     ProjectRepository,
 )
-from action_tracking.services.effectiveness import parse_date
+from action_tracking.services.effectiveness import parse_date, parse_work_centers
 from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_COLORS,
     OVERLAY_TARGET_LABELS,
@@ -187,24 +186,16 @@ def _format_window_label(window: dict[str, Any]) -> str:
     )
 
 
-def _resolve_project_filters(project: dict[str, Any] | None) -> list[str]:
-    if not project:
-        return []
-    full_project = str(project.get("id") or "").strip()
-    if not full_project or full_project.lower() == "none":
-        return []
-    return [full_project]
-
-
 def _load_kpi_rows(
     production_repo: ProductionDataRepository,
     date_from: date,
     date_to: date,
     full_project: str | list[str] | None,
     workcenter_areas: set[str] | None,
+    work_centers: list[str] | None,
 ) -> list[dict[str, Any]]:
     return production_repo.list_kpi_daily(
-        None,
+        work_centers,
         date_from,
         date_to,
         full_project=full_project,
@@ -249,14 +240,34 @@ def render(con: sqlite3.Connection) -> None:
     )
     if selected_project == "Wszystkie":
         st.session_state.pop("production_explorer_selected_project_id", None)
-        full_project_filter = None
         selected_project_id = None
+        selected_project_name = None
+        selected_project_code = None
+        project_scope_key = ""
+        project_work_centers: list[str] = []
     else:
         st.session_state["production_explorer_selected_project_id"] = selected_project
         project = projects_by_id.get(selected_project)
-        project_full_projects = _resolve_project_filters(project)
-        full_project_filter = project_full_projects or [selected_project]
+        selected_project_name = project.get("name") if project else None
+        selected_project_code = project.get("project_code") if project else None
+        project_scope_key = (selected_project_code or "").strip() or (selected_project_name or "").strip()
+        project_work_centers = (
+            parse_work_centers(project.get("work_center"), project.get("related_work_center"))
+            if project
+            else []
+        )
         selected_project_id = selected_project
+
+    has_full_project_scrap = production_repo.has_full_project_column("scrap_daily")
+    has_full_project_kpi = production_repo.has_full_project_column("production_kpi_daily")
+    has_full_project_column = has_full_project_scrap and has_full_project_kpi
+    active_work_centers = None
+    active_full_project: str | None = None
+    if selected_project != "Wszystkie":
+        if has_full_project_column and project_scope_key:
+            active_full_project = project_scope_key
+        else:
+            active_work_centers = project_work_centers or None
 
     scrap_component = filter_col2.selectbox(
         "Scrap – komponent",
@@ -290,8 +301,9 @@ def render(con: sqlite3.Connection) -> None:
             production_repo,
             selected_from,
             selected_to,
-            full_project_filter,
+            active_full_project,
             KPI_COMPONENTS.get("Wtrysk (Mxx)"),
+            active_work_centers,
         )
         machine_options = ["Wszystkie"] + extract_injection_machines(injection_rows)
         selected_machine = machine_col.selectbox(
@@ -315,20 +327,19 @@ def render(con: sqlite3.Connection) -> None:
     scrap_area_filter = SCRAP_COMPONENTS.get(scrap_component)
     kpi_area_filter = KPI_COMPONENTS.get(kpi_component)
     currency_filter = "PLN" if currency == "PLN" else None
+
     scrap_daily, kpi_daily, _ = load_daily_frames(
         production_repo,
-        None,
-        kpi_machine_filter,
+        active_work_centers,
+        kpi_machine_filter or active_work_centers,
         selected_from,
         selected_to,
         currency=currency_filter,
-        full_project=full_project_filter,
+        full_project=active_full_project,
         scrap_areas=scrap_area_filter,
         kpi_areas=kpi_area_filter,
     )
     searchback_from = selected_to - timedelta(days=searchback_calendar_days)
-    active_full_project = full_project_filter
-    active_work_centers = None
     kpi_scrap_rows = production_repo.list_scrap_daily(
         active_work_centers,
         searchback_from,
@@ -357,65 +368,44 @@ def render(con: sqlite3.Connection) -> None:
     oee_scale = kpi_daily.attrs.get("oee_scale", "unknown")
     perf_scale = kpi_daily.attrs.get("perf_scale", "unknown")
 
-    if selected_project != "Wszystkie" and active_full_project:
-        debug_scrap_rows = production_repo.list_scrap_daily(
-            None,
-            selected_from,
-            selected_to,
-            currency=None,
-            full_project=active_full_project,
-            workcenter_areas=None,
+    if selected_project != "Wszystkie":
+        count_full_project_matches_scrap = production_repo.count_full_project_matches(
+            "scrap_daily",
+            project_scope_key,
         )
-        debug_kpi_rows = production_repo.list_kpi_daily(
-            None,
-            selected_from,
-            selected_to,
-            full_project=active_full_project,
-            workcenter_areas=None,
+        count_full_project_matches_kpi = production_repo.count_full_project_matches(
+            "production_kpi_daily",
+            project_scope_key,
         )
-        debug_workcenters = [
-            " ".join(str(row.get("work_center") or "").replace("\u00a0", " ").split()).upper()
-            for row in (debug_scrap_rows + debug_kpi_rows)
-            if str(row.get("work_center") or "").strip()
-        ]
-        debug_workcenters = [wc for wc in debug_workcenters if wc]
-        distinct_workcenters = sorted(set(debug_workcenters))[:20]
-        counts_by_area: dict[str, int] = {}
-        for row in debug_scrap_rows + debug_kpi_rows:
-            area = classify_workcenter(row.get("work_center") or "").get("area") or "other"
-            counts_by_area[area] = counts_by_area.get(area, 0) + 1
-        metalization_token_re = re.compile(r"M(?:TZ|ZT)", re.IGNORECASE)
-        has_metalization_token = any(
-            metalization_token_re.search(str(row.get("work_center") or ""))
-            for row in (debug_scrap_rows + debug_kpi_rows)
+        distinct_full_project_scrap = production_repo.list_distinct_full_project(
+            "scrap_daily",
+            limit=20,
         )
-        metalization_count = counts_by_area.get("metalization", 0)
-        with st.expander("Debug: matching keys", expanded=False):
-            st.caption(f"Selected project id: {selected_project_id}")
-            st.caption(f"Selected project name: {project_names.get(selected_project_id, '—')}")
-            st.caption(
-                "Rows matched by FULL PROJECT: "
-                f"{len(debug_scrap_rows)} scrap / {len(debug_kpi_rows)} KPI"
-            )
-            if distinct_workcenters:
-                st.caption(
-                    "Distinct WORKCENTER tokens (top 20): "
-                    + ", ".join(distinct_workcenters)
-                )
+        distinct_full_project_kpi = production_repo.list_distinct_full_project(
+            "production_kpi_daily",
+            limit=20,
+        )
+        with st.expander("Debug (Production Explorer)", expanded=False):
+            st.write("selected_project_id:", selected_project_id)
+            st.write("selected_project_name:", selected_project_name)
+            st.write("selected_project_code:", selected_project_code)
+            st.write("project_scope_key:", project_scope_key)
+            if count_full_project_matches_scrap is None:
+                st.write("scrap_daily:", "No FULL PROJECT column in DB (old schema)")
             else:
-                st.caption("Distinct WORKCENTER tokens (top 20): —")
-            if counts_by_area:
-                area_rows = [
-                    {"Area": area, "Rows": count}
-                    for area, count in sorted(counts_by_area.items())
-                ]
-                st.dataframe(area_rows, use_container_width=True)
+                st.write("count_full_project_matches_scrap:", count_full_project_matches_scrap)
+            if count_full_project_matches_kpi is None:
+                st.write("production_kpi_daily:", "No FULL PROJECT column in DB (old schema)")
             else:
-                st.caption("Counts by area: —")
-            if has_metalization_token and metalization_count == 0:
-                st.caption(
-                    "Debug: wykryto token MZT/MTZ w WORKCENTER, ale 0 w Metalizacji."
-                )
+                st.write("count_full_project_matches_kpi:", count_full_project_matches_kpi)
+            if distinct_full_project_scrap is not None:
+                st.write("Top FULL PROJECT (scrap_daily):")
+                st.dataframe(distinct_full_project_scrap, use_container_width=True)
+            if distinct_full_project_kpi is not None:
+                st.write("Top FULL PROJECT (production_kpi_daily):")
+                st.dataframe(distinct_full_project_kpi, use_container_width=True)
+            if distinct_full_project_scrap is None and distinct_full_project_kpi is None:
+                st.write("Top FULL PROJECT:", "No FULL PROJECT column in DB (old schema)")
 
     if scrap_daily.empty and kpi_daily.empty:
         pre_scrap_rows = production_repo.list_scrap_daily(
