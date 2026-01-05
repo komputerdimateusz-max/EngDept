@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# What changed:
+# - Defaulted analysis area selection to "Montaż" when missing.
+# - Added helper to keep area defaults consistent across create/edit.
+
 import json
 import sqlite3
 from datetime import date
@@ -17,6 +21,12 @@ from action_tracking.data.repositories import (
 
 TOOL_TYPES = ["5WHY", "Diagram Ishikawy", "Raport A3", "Raport 8D"]
 AREA_OPTIONS = ["(brak)", "Montaż", "Wtrysk", "Metalizacja", "Podgrupa", "Inne"]
+
+
+def _resolve_area_default(selected_area: Any) -> str:
+    if selected_area in AREA_OPTIONS:
+        return selected_area
+    return "Montaż"
 
 
 def _default_template(tool_type: str) -> dict[str, Any]:
@@ -305,7 +315,11 @@ def render(con: sqlite3.Connection) -> None:
                 else champion_names.get(cid, cid),
             )
             tool_type = st.selectbox("Typ narzędzia", TOOL_TYPES)
-            area = st.selectbox("Obszar", AREA_OPTIONS)
+            area = st.selectbox(
+                "Obszar",
+                AREA_OPTIONS,
+                index=AREA_OPTIONS.index(_resolve_area_default(None)),
+            )
             submitted = st.form_submit_button("Utwórz analizę")
 
         if submitted:
@@ -385,7 +399,7 @@ def render(con: sqlite3.Connection) -> None:
     status = st.selectbox(
         "Status", ["open", "closed"], index=0 if current_status != "closed" else 1
     )
-    current_area = selected_analysis.get("area") or "(brak)"
+    current_area = _resolve_area_default(selected_analysis.get("area") or "(brak)")
     area = st.selectbox(
         "Obszar",
         AREA_OPTIONS,
