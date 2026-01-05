@@ -4,6 +4,7 @@ from datetime import date, timedelta
 import sqlite3
 from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -82,16 +83,6 @@ def _format_kpi_cell(current: float | None, baseline: float | None) -> tuple[str
     if delta_pp is None:
         return current_label, None
     return f"{current_label} ({delta_pp:+.1f} pp)", delta_pp
-
-
-def _set_query_params(params: dict[str, str | None]) -> None:
-    clean_params = {k: v for k, v in params.items() if v}
-    if hasattr(st, "query_params"):
-        st.query_params.clear()
-        for key, value in clean_params.items():
-            st.query_params[key] = value
-    else:
-        st.experimental_set_query_params(**clean_params)
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -297,17 +288,13 @@ def render(con: sqlite3.Connection) -> None:
         cols[7].markdown(row["risk_flags"])
 
         if cols[8].button("Dodaj akcję", key=f"add_action_{project_id}"):
-            st.session_state["prefill_action_project_id"] = project_id
-            if row["owner_champion_id"]:
-                st.session_state["prefill_action_owner_champion_id"] = row["owner_champion_id"]
-            st.session_state["prefill_action_work_center"] = ", ".join(row["work_centers"])
-            st.session_state["prefill_action_applied"] = False
-            st.session_state["sidebar_page"] = "Akcje"
-            _set_query_params(
-                {
-                    "page": "Akcje",
-                    "prefill_action_project_id": str(project_id),
-                    "prefill_action_owner_champion_id": str(row["owner_champion_id"] or ""),
-                }
-            )
+            nav_nonce = str(uuid4())
+            st.session_state["nav_to_page"] = "Akcje"
+            st.session_state["nav_action_prefill"] = {
+                "project_id": project_id,
+                "work_centers": row["work_centers"],
+                "owner_champion_id": row["owner_champion_id"],
+                "nonce": nav_nonce,
+            }
+            st.session_state["nav_nonce"] = nav_nonce
             st.rerun()
