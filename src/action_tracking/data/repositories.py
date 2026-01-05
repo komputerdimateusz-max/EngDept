@@ -3234,6 +3234,50 @@ class ProductionDataRepository:
         rows = [row for row in rows if any(row.get(col) is not None for col in kpi_cols)]
         return rows
 
+    def has_full_project_column(self, table: str) -> bool:
+        if not _table_exists(self.con, table):
+            return False
+        return "full_project" in _table_columns(self.con, table)
+
+    def count_full_project_matches(self, table: str, project_key: str) -> int | None:
+        if not self.has_full_project_column(table):
+            return None
+        if not project_key:
+            return 0
+        try:
+            cur = self.con.execute(
+                f"""
+                SELECT COUNT(1) AS row_count
+                FROM {table}
+                WHERE TRIM(full_project) = TRIM(?)
+                """,
+                (project_key,),
+            )
+            row = cur.fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return 0
+        return int(row[0] or 0)
+
+    def list_distinct_full_project(self, table: str, limit: int = 20) -> list[str] | None:
+        if not self.has_full_project_column(table):
+            return None
+        try:
+            cur = self.con.execute(
+                f"""
+                SELECT DISTINCT full_project
+                FROM {table}
+                ORDER BY full_project
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+        except sqlite3.Error:
+            return None
+        return [row[0] for row in rows if row and row[0] is not None]
+
     def rescale_kpi_daily_percent(self) -> dict[str, int]:
         if not _table_exists(self.con, "production_kpi_daily"):
             return {}

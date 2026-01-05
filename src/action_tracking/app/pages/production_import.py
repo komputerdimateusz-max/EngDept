@@ -441,6 +441,7 @@ def _render_import_tab(
 
 def render(con: sqlite3.Connection) -> None:
     st.header("Import danych produkcyjnych")
+    # TODO: Ensure FULL PROJECT in production DB matches project_scope_key (project_code preferred).
     st.write(
         "Wczytaj eksport CSV (separator ; lub ,; liczby z przecinkiem). Dane są agregowane "
         "dziennie per FULL PROJECT i WORKCENTER."
