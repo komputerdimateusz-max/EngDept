@@ -1223,6 +1223,193 @@ class ActionRepository:
             row.setdefault("owner_name", None)
         return rows
 
+    def list_actions_for_markers(
+        self,
+        project_id: str | None,
+        date_from: date | str | None,
+        date_to: date | str | None,
+    ) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "actions"):
+            return []
+
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols or "closed_at" not in action_cols:
+            return []
+
+        select_cols = [f"a.{c}" for c in action_cols]
+        if "id" not in action_cols:
+            select_cols.append("a.rowid AS id")
+
+        joins: list[str] = []
+        project_name_select = "NULL AS project_name"
+        if _table_exists(self.con, "projects") and "project_id" in action_cols:
+            project_cols = _table_columns(self.con, "projects")
+            if "id" in project_cols and "name" in project_cols:
+                joins.append("LEFT JOIN projects p ON p.id = a.project_id")
+                project_name_select = "p.name AS project_name"
+
+        owner_name_select = "NULL AS owner_name"
+        if _table_exists(self.con, "champions") and "owner_champion_id" in action_cols:
+            champion_cols = _table_columns(self.con, "champions")
+            if "id" in champion_cols:
+                joins.append("LEFT JOIN champions ch ON ch.id = a.owner_champion_id")
+                owner_name_select = (
+                    "TRIM(COALESCE(ch.first_name, '') || ' ' || COALESCE(ch.last_name, '')) AS owner_name"
+                )
+
+        def _coerce_date(value: date | str | None) -> str | None:
+            if not value:
+                return None
+            if isinstance(value, datetime):
+                return value.date().isoformat()
+            if isinstance(value, date):
+                return value.isoformat()
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                try:
+                    return date.fromisoformat(text[:10]).isoformat()
+                except ValueError:
+                    return None
+            return None
+
+        from_value = _coerce_date(date_from)
+        to_value = _coerce_date(date_to)
+
+        select_sql = ", ".join(select_cols + [project_name_select, owner_name_select])
+        base_query = f"""
+            SELECT {select_sql}
+            FROM actions a
+            {' '.join(joins)}
+        """
+
+        filters: list[str] = ["a.closed_at IS NOT NULL"]
+        params: list[Any] = []
+
+        if "is_draft" in action_cols:
+            filters.append("a.is_draft = 0")
+        if project_id and "project_id" in action_cols:
+            filters.append("a.project_id = ?")
+            params.append(project_id)
+        if from_value and to_value:
+            filters.append("date(a.closed_at) BETWEEN date(?) AND date(?)")
+            params.extend([from_value, to_value])
+        elif from_value:
+            filters.append("date(a.closed_at) >= date(?)")
+            params.append(from_value)
+        elif to_value:
+            filters.append("date(a.closed_at) <= date(?)")
+            params.append(to_value)
+
+        if filters:
+            base_query += " WHERE " + " AND ".join(filters)
+
+        base_query += " ORDER BY a.closed_at ASC"
+
+        try:
+            cur = self.con.execute(base_query, params)
+            rows = [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
+        for row in rows:
+            row.setdefault("project_name", None)
+            row.setdefault("owner_name", None)
+        return rows
+
+    def count_actions(self, project_id: str | None = None) -> int:
+        if not _table_exists(self.con, "actions"):
+            return 0
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols:
+            return 0
+
+        filters: list[str] = []
+        params: list[Any] = []
+        if project_id and "project_id" in action_cols:
+            filters.append("project_id = ?")
+            params.append(project_id)
+
+        query = "SELECT COUNT(*) FROM actions"
+        if filters:
+            query += " WHERE " + " AND ".join(filters)
+        try:
+            cur = self.con.execute(query, params)
+            row = cur.fetchone()
+        except sqlite3.Error:
+            return 0
+        return int(row[0] if row else 0)
+
+    def count_done_closed_actions(self, project_id: str | None = None) -> int:
+        if not _table_exists(self.con, "actions"):
+            return 0
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols or "closed_at" not in action_cols:
+            return 0
+
+        filters: list[str] = ["closed_at IS NOT NULL"]
+        params: list[Any] = []
+        if "status" in action_cols:
+            filters.append("status = 'done'")
+        if "is_draft" in action_cols:
+            filters.append("is_draft = 0")
+        if project_id and "project_id" in action_cols:
+            filters.append("project_id = ?")
+            params.append(project_id)
+
+        query = "SELECT COUNT(*) FROM actions WHERE " + " AND ".join(filters)
+        try:
+            cur = self.con.execute(query, params)
+            row = cur.fetchone()
+        except sqlite3.Error:
+            return 0
+        return int(row[0] if row else 0)
+
+    def list_recent_actions(
+        self,
+        project_id: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        if not _table_exists(self.con, "actions"):
+            return []
+
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols:
+            return []
+
+        select_cols = [f"a.{c}" for c in action_cols]
+        if "id" not in action_cols:
+            select_cols.append("a.rowid AS id")
+
+        select_sql = ", ".join(select_cols)
+        base_query = f"""
+            SELECT {select_sql}
+            FROM actions a
+        """
+        filters: list[str] = []
+        params: list[Any] = []
+
+        if project_id and "project_id" in action_cols:
+            filters.append("a.project_id = ?")
+            params.append(project_id)
+
+        if filters:
+            base_query += " WHERE " + " AND ".join(filters)
+
+        if "created_at" in action_cols:
+            base_query += " ORDER BY a.created_at DESC"
+        else:
+            base_query += " ORDER BY a.rowid DESC"
+        base_query += " LIMIT ?"
+        params.append(limit)
+
+        try:
+            cur = self.con.execute(base_query, params)
+            return [dict(r) for r in cur.fetchall()]
+        except sqlite3.Error:
+            return []
+
     def create_action(self, data: dict[str, Any]) -> str:
         action_id = data.get("id") or str(uuid4())
         if not _table_exists(self.con, "actions"):

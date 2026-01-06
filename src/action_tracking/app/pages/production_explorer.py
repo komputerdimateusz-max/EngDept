@@ -587,48 +587,68 @@ def render(con: sqlite3.Connection) -> None:
     kpi_marker_areas = marker_areas_for_component(kpi_component)
 
     markers_df = pd.DataFrame()
-    if selected_project_id:
-        markers: list[dict[str, Any]] = []
-        actions = action_repo.list_actions(
-            status="done",
-            project_id=selected_project_id,
-            is_draft=False,
-        )
-        for action in actions:
-            closed_date = parse_date(action.get("closed_at"))
-            if not closed_date:
-                continue
-            if not (selected_from <= closed_date <= selected_to):
-                continue
-            action_area = normalize_action_area(action.get("area"))
-            overlay_targets = _resolve_overlay_targets(action, rules_repo)
-            for overlay_target in overlay_targets:
-                markers.append(
-                    {
-                        "action_id": action.get("id"),
-                        "closed_at": pd.to_datetime(closed_date),
-                        "action_title": action.get("title") or "—",
-                        "owner_name": action.get("owner_name") or "—",
-                        "category": action.get("category") or "—",
-                        "action_area": action_area,
-                        "action_area_label": action_area or "—",
-                        "overlay_target": overlay_target,
-                        "overlay_label": OVERLAY_TARGET_LABELS.get(
-                            overlay_target, overlay_target
-                        ),
-                    }
-                )
-        markers_df = pd.DataFrame(markers)
-        if markers_df.empty:
-            st.caption("Brak zamkniętych akcji w zakresie.")
-    else:
-        st.caption("Markery akcji są dostępne po wyborze projektu.")
+    markers: list[dict[str, Any]] = []
+    marker_actions = action_repo.list_actions_for_markers(
+        project_id=selected_project_id,
+        date_from=selected_from,
+        date_to=selected_to,
+    )
+    for action in marker_actions:
+        closed_date = parse_date(action.get("closed_at"))
+        if not closed_date:
+            continue
+        action_area = normalize_action_area(action.get("area"))
+        overlay_targets = _resolve_overlay_targets(action, rules_repo)
+        for overlay_target in overlay_targets:
+            markers.append(
+                {
+                    "action_id": action.get("id"),
+                    "closed_at": pd.to_datetime(closed_date),
+                    "action_title": action.get("title") or "—",
+                    "owner_name": action.get("owner_name") or "—",
+                    "category": action.get("category") or "—",
+                    "action_area": action_area,
+                    "action_area_label": action_area or "—",
+                    "overlay_target": overlay_target,
+                    "overlay_label": OVERLAY_TARGET_LABELS.get(
+                        overlay_target, overlay_target
+                    ),
+                }
+            )
+    markers_df = pd.DataFrame(markers)
+    if markers_df.empty:
+        st.caption("Brak zamkniętych akcji w zakresie.")
 
     debug_markers = st.checkbox("Debug markers", value=False)
     if debug_markers:
+        repo_actions_count_all = action_repo.count_actions()
+        repo_done_closed_count = action_repo.count_done_closed_actions(
+            project_id=selected_project_id,
+        )
+        recent_actions_all = action_repo.list_recent_actions()
+        recent_actions_project = (
+            action_repo.list_recent_actions(project_id=selected_project_id)
+            if selected_project_id
+            else []
+        )
+        debug_action_columns = ["id", "project_id", "status", "closed_at", "area"]
         filtered_scrap = _apply_marker_area_filter(markers_df, scrap_marker_areas)
         filtered_kpi = _apply_marker_area_filter(markers_df, kpi_marker_areas)
         with st.expander("Debug: Markery akcji", expanded=True):
+            st.write("selected_project_id:", selected_project_id)
+            st.write("actions_count_all:", repo_actions_count_all)
+            st.write("done_with_closed_at_count:", repo_done_closed_count)
+            st.write("date_from/date_to:", selected_from, selected_to)
+            if recent_actions_all:
+                st.write("Top 10 actions (all projects):")
+                debug_df = pd.DataFrame(recent_actions_all)
+                cols = [col for col in debug_action_columns if col in debug_df.columns]
+                st.dataframe(debug_df[cols].head(10), use_container_width=True)
+            if recent_actions_project:
+                st.write("Top 10 actions (selected project):")
+                debug_df = pd.DataFrame(recent_actions_project)
+                cols = [col for col in debug_action_columns if col in debug_df.columns]
+                st.dataframe(debug_df[cols].head(10), use_container_width=True)
             st.write("Marker count (total):", len(markers_df))
             st.write("Marker count (scrap area filter):", len(filtered_scrap))
             st.write("Marker count (kpi area filter):", len(filtered_kpi))
