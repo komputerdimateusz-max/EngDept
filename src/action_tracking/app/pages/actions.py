@@ -145,7 +145,7 @@ def _get_query_param(key: str) -> str | None:
 def _resolve_area_default(selected_area: Any) -> str:
     if selected_area in AREA_OPTIONS:
         return selected_area
-    return "Montaż"
+    return "Inne"
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -423,6 +423,7 @@ def render(con: sqlite3.Connection) -> None:
     actions_by_id = {a["id"]: a for a in all_actions}
 
     st.subheader("Dodaj / Edytuj akcję")
+    debug_mode = st.checkbox("Debug", value=False)
 
     if not projects:
         st.warning("Dodawanie akcji wymaga wcześniej utworzonych projektów.")
@@ -502,12 +503,6 @@ def render(con: sqlite3.Connection) -> None:
                 "Opis",
                 value=selected.get("description", "") or "",
                 max_chars=500,
-            )
-            area = st.selectbox(
-                "Obszar",
-                AREA_OPTIONS,
-                index=AREA_OPTIONS.index(_resolve_area_default(selected.get("area"))),
-                key="action_area_select",
             )
             area = st.selectbox(
                 "Obszar",
@@ -629,6 +624,14 @@ def render(con: sqlite3.Connection) -> None:
             submitted = st.form_submit_button("Zakończ draft")
 
         if submitted:
+            if debug_mode:
+                st.write("DEBUG payload", payload)
+            if not (title or "").strip():
+                st.error("Pole 'Krótka nazwa' jest wymagane.")
+                return
+            if not project_id:
+                st.error("Pole 'Projekt' jest wymagane.")
+                return
             if category not in active_categories and category != selected.get("category"):
                 st.error("Wybierz aktywną kategorię akcji.")
                 return
@@ -674,8 +677,11 @@ def render(con: sqlite3.Connection) -> None:
                 repo.update_action(selected_action, payload)
                 st.success("Draft uzupełniony.")
                 st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
+            except Exception as exc:
+                if debug_mode:
+                    st.exception(exc)
+                else:
+                    st.error(str(exc))
     else:
         selected_category = selected.get("category")
         category_options_form = list(active_categories)
@@ -850,6 +856,14 @@ def render(con: sqlite3.Connection) -> None:
             submitted = st.form_submit_button("Zapisz")
 
         if submitted:
+            if debug_mode:
+                st.write("DEBUG payload", payload)
+            if not (title or "").strip():
+                st.error("Pole 'Krótka nazwa' jest wymagane.")
+                return
+            if not project_id:
+                st.error("Pole 'Projekt' jest wymagane.")
+                return
             if category not in active_categories and category != selected.get("category"):
                 st.error("Wybierz aktywną kategorię akcji.")
                 return
@@ -898,8 +912,11 @@ def render(con: sqlite3.Connection) -> None:
                     repo.create_action(payload)
                     st.success("Akcja dodana.")
                 st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
+            except Exception as exc:
+                if debug_mode:
+                    st.exception(exc)
+                else:
+                    st.error(str(exc))
 
     st.subheader("Usuń akcję")
     delete_options = ["(brak)"] + [a["id"] for a in all_actions]

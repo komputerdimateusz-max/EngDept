@@ -1445,6 +1445,8 @@ class ActionRepository:
         if not action_cols:
             return action_id
         payload = self._normalize_action_payload(action_id, data)
+        if "area" in action_cols and not payload.get("area"):
+            payload["area"] = "Inne"
 
         cols = [
             "id",
@@ -1484,8 +1486,15 @@ class ActionRepository:
                 vals,
             )
             self.con.commit()
-        except sqlite3.Error:
-            return action_id
+            cur = self.con.execute(
+                "SELECT COUNT(*) FROM actions WHERE id = ?",
+                (action_id,),
+            )
+            if cur.fetchone()[0] == 0:
+                raise RuntimeError("Insert failed: action row missing after commit.")
+        except sqlite3.Error as exc:
+            _rollback_safely(self.con)
+            raise RuntimeError("Failed to insert action.") from exc
         return action_id
 
     def update_action(self, action_id: str, data: dict[str, Any]) -> None:
@@ -1521,10 +1530,9 @@ class ActionRepository:
         if "created_at" not in (data or {}) or not (data or {}).get("created_at"):
             merged["created_at"] = existing.get("created_at") or date.today().isoformat()
 
-        try:
-            payload = self._normalize_action_payload(action_id, merged)
-        except ValueError:
-            return
+        payload = self._normalize_action_payload(action_id, merged)
+        if "area" in action_cols and not payload.get("area"):
+            payload["area"] = "Inne"
 
         allowed_cols = [
             "project_id",
@@ -1568,8 +1576,9 @@ class ActionRepository:
         try:
             self.con.execute(sql, params)
             self.con.commit()
-        except sqlite3.Error:
-            return
+        except sqlite3.Error as exc:
+            _rollback_safely(self.con)
+            raise RuntimeError("Failed to update action.") from exc
 
     def delete_action(self, action_id: str) -> None:
         if not action_id:
@@ -1650,11 +1659,20 @@ class ActionRepository:
         if due_date:
             due_date = self._parse_date(due_date, "due_date").isoformat()
 
+        title = (data.get("title") or "").strip()
+        if not title:
+            raise ValueError("Title is required.")
+        if len(title) > 20:
+            raise ValueError("Title must be at most 20 characters.")
+        project_id = (data.get("project_id") or "").strip()
+        if not project_id:
+            raise ValueError("Project is required.")
+
         return {
             "id": action_id,
-            "project_id": (data.get("project_id") or "").strip() or None,
+            "project_id": project_id,
             "analysis_id": (data.get("analysis_id") or "").strip() or None,
-            "title": (data.get("title") or "").strip(),
+            "title": title,
             "description": (data.get("description") or "").strip() or None,
             "owner_champion_id": (data.get("owner_champion_id") or "").strip() or None,
             "priority": data.get("priority") or "med",
