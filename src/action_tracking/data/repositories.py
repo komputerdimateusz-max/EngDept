@@ -2278,14 +2278,16 @@ class ProjectRepository:
         if not cols:
             return
 
+        data_keys = set(data.keys())
         name = (data.get("name") or "").strip()
         work_center = (data.get("work_center") or "").strip()
-        if "name" in cols and not name:
+        if "name" in data_keys and "name" in cols and not name:
             raise ValueError("name is required")
-        if "work_center" in cols and not work_center:
+        if "work_center" in data_keys and "work_center" in cols and not work_center:
             raise ValueError("work_center is required")
+        if "full_project" in data_keys and "full_project" not in cols:
+            raise ValueError("full_project column missing; run migration")
 
-        data_keys = set(data.keys())
         payload: dict[str, Any] = {}
 
         if "name" in data_keys and "name" in cols:
