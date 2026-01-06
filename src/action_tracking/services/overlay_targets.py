@@ -27,6 +27,17 @@ OVERLAY_TARGET_COLORS: dict[str, str] = {
     "PERFORMANCE": IMPACT_ASPECT_COLORS.get("PERFORMANCE", "#2ca02c"),
 }
 
+ACTION_AREA_ALIASES: dict[str, str] = {
+    "montaż": "Montaż",
+    "montaz": "Montaż",
+    "wtrysk": "Wtrysk",
+    "metalizacja": "Metalizacja",
+    "metalization": "Metalizacja",
+    "podgrupa": "Podgrupa",
+    "podgrupy": "Podgrupa",
+    "inne": "Inne",
+}
+
 
 def parse_overlay_targets(value: Any) -> list[str]:
     if value in (None, ""):
@@ -72,3 +83,40 @@ def default_overlay_targets(effect_model: str | None) -> list[str]:
     if key == "PERFORMANCE":
         return ["PERFORMANCE"]
     return []
+
+
+def normalize_action_area(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    normalized = raw.casefold()
+    return ACTION_AREA_ALIASES.get(normalized, raw)
+
+
+def marker_areas_for_component(component_label: Any) -> set[str] | None:
+    if component_label in (None, ""):
+        return None
+    text = str(component_label).strip()
+    if not text:
+        return None
+    normalized = text.casefold()
+    if "total" in normalized or "all" in normalized:
+        return None
+
+    areas: set[str] = set()
+    if "montaż" in normalized or "montaz" in normalized:
+        areas.add("Montaż")
+        if "subgroup" in normalized or "podgrup" in normalized:
+            areas.add("Podgrupa")
+    if "podgrup" in normalized:
+        areas.add("Podgrupa")
+    if "wtrysk" in normalized:
+        areas.add("Wtrysk")
+    if "metaliz" in normalized or "mzt" in normalized or "mtz" in normalized:
+        areas.add("Metalizacja")
+    if "inne" in normalized:
+        areas.add("Inne")
+
+    return areas or None
