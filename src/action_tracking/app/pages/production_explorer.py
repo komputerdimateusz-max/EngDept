@@ -22,6 +22,8 @@ from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_COLORS,
     OVERLAY_TARGET_LABELS,
     default_overlay_targets,
+    marker_areas_for_component,
+    normalize_action_area,
 )
 from action_tracking.services.kpi_windows import compute_project_kpi_windows
 from action_tracking.services.production_outcome import (
@@ -107,6 +109,7 @@ def _line_chart_with_markers(
     markers_df: pd.DataFrame,
     show_markers: bool,
     overlay_target: str,
+    area_filter: set[str] | None = None,
 ) -> alt.Chart:
     base = (
         alt.Chart(data)
@@ -120,6 +123,11 @@ def _line_chart_with_markers(
     if not show_markers or markers_df.empty:
         return base
     filtered_markers = markers_df[markers_df["overlay_target"] == overlay_target]
+    if area_filter and "action_area" in filtered_markers.columns:
+        if filtered_markers["action_area"].notna().any():
+            filtered_markers = filtered_markers[
+                filtered_markers["action_area"].isin(area_filter)
+            ]
     if filtered_markers.empty:
         return base
     marker_labels = list(OVERLAY_TARGET_COLORS.keys())
@@ -138,13 +146,38 @@ def _line_chart_with_markers(
             ),
             tooltip=[
                 alt.Tooltip("action_title:N", title="Akcja"),
+                alt.Tooltip("owner_name:N", title="Właściciel"),
                 alt.Tooltip("category:N", title="Kategoria"),
+                alt.Tooltip("action_area_label:N", title="Obszar"),
                 alt.Tooltip("closed_at:T", title="Zamknięta"),
                 alt.Tooltip("overlay_label:N", title="Wykres"),
             ],
         )
     )
     return base + marker_layer
+
+
+def _apply_marker_area_filter(
+    markers_df: pd.DataFrame,
+    area_filter: set[str] | None,
+) -> pd.DataFrame:
+    if not area_filter or markers_df.empty or "action_area" not in markers_df.columns:
+        return markers_df
+    if not markers_df["action_area"].notna().any():
+        return markers_df
+    return markers_df[markers_df["action_area"].isin(area_filter)]
+
+
+def _markers_available_for(
+    markers_df: pd.DataFrame,
+    overlay_target: str,
+    area_filter: set[str] | None,
+) -> bool:
+    if markers_df.empty:
+        return False
+    filtered = markers_df[markers_df["overlay_target"] == overlay_target]
+    filtered = _apply_marker_area_filter(filtered, area_filter)
+    return not filtered.empty
 
 
 def _resolve_overlay_targets(
@@ -550,6 +583,9 @@ def render(con: sqlite3.Connection) -> None:
     if oee_scale != "unknown" or perf_scale != "unknown":
         st.caption("KPI zapisane w bazie jako procenty (0-100).")
 
+    scrap_marker_areas = marker_areas_for_component(scrap_component)
+    kpi_marker_areas = marker_areas_for_component(kpi_component)
+
     markers_df = pd.DataFrame()
     if selected_project_id:
         markers: list[dict[str, Any]] = []
@@ -564,13 +600,18 @@ def render(con: sqlite3.Connection) -> None:
                 continue
             if not (selected_from <= closed_date <= selected_to):
                 continue
+            action_area = normalize_action_area(action.get("area"))
             overlay_targets = _resolve_overlay_targets(action, rules_repo)
             for overlay_target in overlay_targets:
                 markers.append(
                     {
+                        "action_id": action.get("id"),
                         "closed_at": pd.to_datetime(closed_date),
                         "action_title": action.get("title") or "—",
+                        "owner_name": action.get("owner_name") or "—",
                         "category": action.get("category") or "—",
+                        "action_area": action_area,
+                        "action_area_label": action_area or "—",
                         "overlay_target": overlay_target,
                         "overlay_label": OVERLAY_TARGET_LABELS.get(
                             overlay_target, overlay_target
@@ -583,13 +624,37 @@ def render(con: sqlite3.Connection) -> None:
     else:
         st.caption("Markery akcji są dostępne po wyborze projektu.")
 
-    markers_available = not markers_df.empty
+    debug_markers = st.checkbox("Debug markers", value=False)
+    if debug_markers:
+        filtered_scrap = _apply_marker_area_filter(markers_df, scrap_marker_areas)
+        filtered_kpi = _apply_marker_area_filter(markers_df, kpi_marker_areas)
+        with st.expander("Debug: Markery akcji", expanded=True):
+            st.write("Marker count (total):", len(markers_df))
+            st.write("Marker count (scrap area filter):", len(filtered_scrap))
+            st.write("Marker count (kpi area filter):", len(filtered_kpi))
+            if not markers_df.empty:
+                st.write("Top 5 markers:")
+                st.dataframe(
+                    markers_df[
+                        [
+                            "action_id",
+                            "closed_at",
+                            "action_area_label",
+                            "overlay_target",
+                        ]
+                    ].head(5),
+                    use_container_width=True,
+                )
+
     chart_cols = st.columns(2)
     if not scrap_daily.empty:
+        scrap_qty_markers_available = _markers_available_for(
+            markers_df, "SCRAP_QTY", scrap_marker_areas
+        )
         show_scrap_qty_markers = chart_cols[0].checkbox(
             "Pokaż markery akcji",
-            value=markers_available,
-            disabled=not markers_available,
+            value=scrap_qty_markers_available,
+            disabled=not scrap_qty_markers_available,
             key="prod_explorer_markers_scrap_qty",
         )
         chart_cols[0].altair_chart(
@@ -601,16 +666,20 @@ def render(con: sqlite3.Connection) -> None:
                 markers_df,
                 show_scrap_qty_markers,
                 "SCRAP_QTY",
+                scrap_marker_areas,
             ),
             use_container_width=True,
         )
         if currency == "All currencies":
             chart_cols[1].info("Koszt scrap: wybierz PLN, aby zobaczyć wykres.")
         else:
+            scrap_cost_markers_available = _markers_available_for(
+                markers_df, "SCRAP_COST", scrap_marker_areas
+            )
             show_scrap_cost_markers = chart_cols[1].checkbox(
                 "Pokaż markery akcji",
-                value=markers_available,
-                disabled=not markers_available,
+                value=scrap_cost_markers_available,
+                disabled=not scrap_cost_markers_available,
                 key="prod_explorer_markers_scrap_cost",
             )
             chart_cols[1].altair_chart(
@@ -622,6 +691,7 @@ def render(con: sqlite3.Connection) -> None:
                     markers_df,
                     show_scrap_cost_markers,
                     "SCRAP_COST",
+                    scrap_marker_areas,
                 ),
                 use_container_width=True,
             )
@@ -630,10 +700,13 @@ def render(con: sqlite3.Connection) -> None:
 
     chart_cols = st.columns(2)
     if not kpi_daily.empty:
+        oee_markers_available = _markers_available_for(
+            markers_df, "OEE", kpi_marker_areas
+        )
         show_oee_markers = chart_cols[0].checkbox(
             "Pokaż markery akcji",
-            value=markers_available,
-            disabled=not markers_available,
+            value=oee_markers_available,
+            disabled=not oee_markers_available,
             key="prod_explorer_markers_oee",
         )
         chart_cols[0].altair_chart(
@@ -645,13 +718,17 @@ def render(con: sqlite3.Connection) -> None:
                 markers_df,
                 show_oee_markers,
                 "OEE",
+                kpi_marker_areas,
             ),
             use_container_width=True,
         )
+        perf_markers_available = _markers_available_for(
+            markers_df, "PERFORMANCE", kpi_marker_areas
+        )
         show_perf_markers = chart_cols[1].checkbox(
             "Pokaż markery akcji",
-            value=markers_available,
-            disabled=not markers_available,
+            value=perf_markers_available,
+            disabled=not perf_markers_available,
             key="prod_explorer_markers_perf",
         )
         chart_cols[1].altair_chart(
@@ -663,6 +740,7 @@ def render(con: sqlite3.Connection) -> None:
                 markers_df,
                 show_perf_markers,
                 "PERFORMANCE",
+                kpi_marker_areas,
             ),
             use_container_width=True,
         )
