@@ -30,12 +30,21 @@ OVERLAY_TARGET_COLORS: dict[str, str] = {
 ACTION_AREA_ALIASES: dict[str, str] = {
     "montaż": "Montaż",
     "montaz": "Montaż",
+    "assembly": "Montaż",
+    "assembly_main": "Montaż",
+    "assembly_line": "Montaż",
     "wtrysk": "Wtrysk",
+    "injection": "Wtrysk",
     "metalizacja": "Metalizacja",
     "metalization": "Metalizacja",
+    "metalisation": "Metalizacja",
     "podgrupa": "Podgrupa",
     "podgrupy": "Podgrupa",
+    "subgroup": "Podgrupa",
+    "subgroups": "Podgrupa",
     "inne": "Inne",
+    "other": "Inne",
+    "unknown": "Inne",
 }
 
 

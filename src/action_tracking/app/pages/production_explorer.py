@@ -138,7 +138,7 @@ def _line_chart_with_markers(
         alt.Chart(filtered_markers)
         .mark_rule(strokeDash=[6, 4])
         .encode(
-            x=alt.X("closed_at:T"),
+            x=alt.X("marker_date:T"),
             color=alt.Color(
                 "overlay_target:N",
                 scale=alt.Scale(domain=marker_labels, range=marker_colors),
@@ -149,7 +149,8 @@ def _line_chart_with_markers(
                 alt.Tooltip("owner_name:N", title="Właściciel"),
                 alt.Tooltip("category:N", title="Kategoria"),
                 alt.Tooltip("action_area_label:N", title="Obszar"),
-                alt.Tooltip("closed_at:T", title="Zamknięta"),
+                alt.Tooltip("marker_date:T", title="Data"),
+                alt.Tooltip("marker_kind:N", title="Typ"),
                 alt.Tooltip("overlay_label:N", title="Wykres"),
             ],
         )
@@ -193,6 +194,63 @@ def _resolve_overlay_targets(
         return overlay_targets
     effect_model = rule.get("effectiveness_model") if rule else None
     return default_overlay_targets(effect_model)
+
+
+def _normalize_marker_area(value: Any) -> str:
+    return normalize_action_area(value) or "Inne"
+
+
+def _date_in_range(value: date | None, start: date, end: date) -> bool:
+    if value is None:
+        return False
+    return start <= value <= end
+
+
+def _marker_payload_for_action(
+    action: dict[str, Any],
+    date_from: date,
+    date_to: date,
+    rules_repo: GlobalSettingsRepository,
+) -> list[dict[str, Any]]:
+    status = str(action.get("status") or "").strip().lower()
+    closed_date = parse_date(action.get("closed_at"))
+    created_date = parse_date(action.get("created_at"))
+
+    marker_date: date | None = None
+    marker_kind = None
+    if status == "done":
+        if _date_in_range(closed_date, date_from, date_to):
+            marker_date = closed_date
+            marker_kind = "Zamknięcie"
+    else:
+        if _date_in_range(created_date, date_from, date_to):
+            marker_date = created_date
+            marker_kind = "Utworzenie"
+
+    if not marker_date:
+        return []
+
+    action_area = _normalize_marker_area(action.get("area"))
+    overlay_targets = _resolve_overlay_targets(action, rules_repo)
+    markers: list[dict[str, Any]] = []
+    for overlay_target in overlay_targets:
+        markers.append(
+            {
+                "action_id": action.get("id"),
+                "marker_date": pd.to_datetime(marker_date),
+                "marker_kind": marker_kind,
+                "action_title": action.get("title") or "—",
+                "owner_name": action.get("owner_name") or "—",
+                "category": action.get("category") or "—",
+                "action_area": action_area,
+                "action_area_label": action_area,
+                "overlay_target": overlay_target,
+                "overlay_label": OVERLAY_TARGET_LABELS.get(
+                    overlay_target, overlay_target
+                ),
+            }
+        )
+    return markers
 
 
 def _get_query_param(key: str) -> str | None:
@@ -594,36 +652,34 @@ def render(con: sqlite3.Connection) -> None:
         date_to=selected_to,
     )
     for action in marker_actions:
-        closed_date = parse_date(action.get("closed_at"))
-        if not closed_date:
-            continue
-        action_area = normalize_action_area(action.get("area"))
-        overlay_targets = _resolve_overlay_targets(action, rules_repo)
-        for overlay_target in overlay_targets:
-            markers.append(
-                {
-                    "action_id": action.get("id"),
-                    "closed_at": pd.to_datetime(closed_date),
-                    "action_title": action.get("title") or "—",
-                    "owner_name": action.get("owner_name") or "—",
-                    "category": action.get("category") or "—",
-                    "action_area": action_area,
-                    "action_area_label": action_area or "—",
-                    "overlay_target": overlay_target,
-                    "overlay_label": OVERLAY_TARGET_LABELS.get(
-                        overlay_target, overlay_target
-                    ),
-                }
+        markers.extend(
+            _marker_payload_for_action(
+                action,
+                selected_from,
+                selected_to,
+                rules_repo,
             )
+        )
     markers_df = pd.DataFrame(markers)
     if markers_df.empty:
-        st.caption("Brak zamkniętych akcji w zakresie.")
+        st.caption("Brak markerów akcji w zakresie.")
 
     debug_markers = st.checkbox("Debug markers", value=False)
     if debug_markers:
-        repo_actions_count_all = action_repo.count_actions()
-        repo_done_closed_count = action_repo.count_done_closed_actions(
-            project_id=selected_project_id,
+        action_count_in_range = len(marker_actions)
+        action_count_filtered_scrap = len(
+            [
+                action
+                for action in marker_actions
+                if _normalize_marker_area(action.get("area")) in (scrap_marker_areas or set())
+            ]
+        )
+        action_count_filtered_kpi = len(
+            [
+                action
+                for action in marker_actions
+                if _normalize_marker_area(action.get("area")) in (kpi_marker_areas or set())
+            ]
         )
         recent_actions_all = action_repo.list_recent_actions()
         recent_actions_project = (
@@ -631,14 +687,34 @@ def render(con: sqlite3.Connection) -> None:
             if selected_project_id
             else []
         )
-        debug_action_columns = ["id", "project_id", "status", "closed_at", "area"]
+        debug_action_columns = [
+            "id",
+            "project_id",
+            "status",
+            "created_at",
+            "closed_at",
+            "due_date",
+            "area",
+        ]
         filtered_scrap = _apply_marker_area_filter(markers_df, scrap_marker_areas)
         filtered_kpi = _apply_marker_area_filter(markers_df, kpi_marker_areas)
         with st.expander("Debug: Markery akcji", expanded=True):
             st.write("selected_project_id:", selected_project_id)
-            st.write("actions_count_all:", repo_actions_count_all)
-            st.write("done_with_closed_at_count:", repo_done_closed_count)
+            st.write("actions_in_range_count:", action_count_in_range)
+            st.write(
+                "actions_in_range_count (scrap area filter):",
+                action_count_filtered_scrap if scrap_marker_areas else action_count_in_range,
+            )
+            st.write(
+                "actions_in_range_count (kpi area filter):",
+                action_count_filtered_kpi if kpi_marker_areas else action_count_in_range,
+            )
             st.write("date_from/date_to:", selected_from, selected_to)
+            if marker_actions:
+                st.write("Sample actions in range:")
+                debug_df = pd.DataFrame(marker_actions)
+                cols = [col for col in debug_action_columns if col in debug_df.columns]
+                st.dataframe(debug_df[cols].head(5), use_container_width=True)
             if recent_actions_all:
                 st.write("Top 10 actions (all projects):")
                 debug_df = pd.DataFrame(recent_actions_all)
@@ -658,7 +734,8 @@ def render(con: sqlite3.Connection) -> None:
                     markers_df[
                         [
                             "action_id",
-                            "closed_at",
+                            "marker_date",
+                            "marker_kind",
                             "action_area_label",
                             "overlay_target",
                         ]
@@ -781,6 +858,7 @@ def render(con: sqlite3.Connection) -> None:
             st.dataframe(scrap_currency_view, use_container_width=True)
 
     st.caption(
-        "Markery akcji są ustawiane na dacie zamknięcia i widoczne po wyborze projektu "
+        "Markery akcji są ustawiane na dacie zamknięcia (status done) lub utworzenia "
+        "(status open/in-progress/blocked) i widoczne po wyborze projektu "
         "(mapowanie wykresów definiuje Global Settings)."
     )
