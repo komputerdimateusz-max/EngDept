@@ -424,6 +424,7 @@ def render(con: sqlite3.Connection) -> None:
 
     st.subheader("Dodaj / Edytuj akcję")
     debug_mode = st.checkbox("Debug", value=False)
+    debug_insert = st.checkbox("Debug insert (temporary)", value=False)
 
     if not projects:
         st.warning("Dodawanie akcji wymaga wcześniej utworzonych projektów.")
@@ -624,8 +625,6 @@ def render(con: sqlite3.Connection) -> None:
             submitted = st.form_submit_button("Zakończ draft")
 
         if submitted:
-            if debug_mode:
-                st.write("DEBUG payload", payload)
             if not (title or "").strip():
                 st.error("Pole 'Krótka nazwa' jest wymagane.")
                 return
@@ -904,16 +903,22 @@ def render(con: sqlite3.Connection) -> None:
                 "manual_savings_currency": manual_currency if manual_required else None,
                 "manual_savings_note": manual_note if manual_required else None,
             }
+            if debug_insert:
+                st.write("DEBUG payload keys:", sorted(payload.keys()))
+                st.write("DEBUG payload:", payload)
             try:
                 if editing:
                     repo.update_action(selected_action, payload)
                     st.success("Akcja zaktualizowana.")
                 else:
-                    repo.create_action(payload)
+                    repo.create_action(payload, debug=debug_insert)
                     st.success("Akcja dodana.")
                 st.rerun()
             except Exception as exc:
-                if debug_mode:
+                if debug_insert:
+                    st.exception(exc)
+                    st.error(f"{type(exc).__name__}: {exc}")
+                elif debug_mode:
                     st.exception(exc)
                 else:
                     st.error(str(exc))
