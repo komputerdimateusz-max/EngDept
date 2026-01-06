@@ -3382,6 +3382,83 @@ class ProductionDataRepository:
             cur = self.con.execute("SELECT work_center FROM production_kpi_daily ORDER BY work_center ASC")
         return [row["work_center"] for row in cur.fetchall()]
 
+    def full_project_exists(self, value: str) -> bool:
+        project_key = (value or "").strip()
+        if not project_key:
+            return False
+        for table in ("scrap_daily", "production_kpi_daily"):
+            if not self.has_full_project_column(table):
+                continue
+            cur = self.con.execute(
+                f"""
+                SELECT 1
+                FROM {table}
+                WHERE TRIM(full_project) = TRIM(?)
+                LIMIT 1
+                """,
+                (project_key,),
+            )
+            if cur.fetchone():
+                return True
+        return False
+
+    def list_full_project_candidates_by_wc(self) -> dict[str, list[dict[str, Any]]]:
+        from action_tracking.services.effectiveness import normalize_wc  # type: ignore
+
+        candidates: dict[str, dict[str, dict[str, Any]]] = {}
+
+        def _accumulate(table: str) -> None:
+            if not _table_exists(self.con, table):
+                return
+            cols = _table_columns(self.con, table)
+            if "work_center" not in cols or "full_project" not in cols:
+                return
+            if "metric_date" not in cols:
+                return
+            cur = self.con.execute(
+                f"""
+                SELECT work_center,
+                       full_project,
+                       COUNT(*) AS row_count,
+                       MAX(metric_date) AS last_seen
+                FROM {table}
+                WHERE full_project IS NOT NULL
+                  AND TRIM(full_project) != ''
+                GROUP BY work_center, full_project
+                """
+            )
+            for row in cur.fetchall():
+                wc_raw = row["work_center"]
+                wc_norm = normalize_wc(wc_raw)
+                full_project = (row["full_project"] or "").strip()
+                if not wc_norm or not full_project:
+                    continue
+                wc_entries = candidates.setdefault(wc_norm, {})
+                entry = wc_entries.setdefault(
+                    full_project,
+                    {
+                        "full_project": full_project,
+                        "row_count": 0,
+                        "last_seen": None,
+                        "wc_raw": wc_raw,
+                    },
+                )
+                entry["row_count"] += int(row["row_count"] or 0)
+                if entry["last_seen"] is None or (
+                    row["last_seen"] and row["last_seen"] > entry["last_seen"]
+                ):
+                    entry["last_seen"] = row["last_seen"]
+                if not entry.get("wc_raw"):
+                    entry["wc_raw"] = wc_raw
+
+        _accumulate("scrap_daily")
+        _accumulate("production_kpi_daily")
+
+        result: dict[str, list[dict[str, Any]]] = {}
+        for wc_norm, entries in candidates.items():
+            result[wc_norm] = list(entries.values())
+        return result
+
     def list_production_work_centers_with_stats(self) -> list[dict[str, Any]]:
         from action_tracking.services.effectiveness import normalize_wc  # type: ignore
 
@@ -3488,11 +3565,13 @@ class WcInboxRepository:
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
         _configure_sqlite_connection(self.con)
+        _ensure_column(self.con, "wc_inbox", "full_project", "TEXT")
 
     def upsert_from_production(
         self,
         work_centers_stats: list[dict[str, Any]],
         existing_project_wc_norms: set[str],
+        full_project_by_wc_norm: dict[str, str] | None = None,
     ) -> None:
         if not _table_exists(self.con, "wc_inbox"):
             return
@@ -3563,33 +3642,63 @@ class WcInboxRepository:
                 if existing and existing.get("wc_raw"):
                     wc_raw_value = existing.get("wc_raw") or wc_raw_value
 
-                self.con.execute(
-                    """
-                    INSERT INTO wc_inbox (
-                        id, wc_raw, wc_norm, sources,
-                        first_seen_date, last_seen_date,
-                        status, linked_project_id,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(wc_norm) DO UPDATE SET
-                        wc_raw = excluded.wc_raw,
-                        sources = excluded.sources,
-                        first_seen_date = COALESCE(
-                            MIN(wc_inbox.first_seen_date, excluded.first_seen_date),
-                            excluded.first_seen_date,
-                            wc_inbox.first_seen_date
-                        ),
-                        last_seen_date = COALESCE(
-                            MAX(wc_inbox.last_seen_date, excluded.last_seen_date),
-                            excluded.last_seen_date,
-                            wc_inbox.last_seen_date
-                        ),
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        str(uuid4()),
-                        wc_raw_value,
-                        wc_norm,
+                full_project_value = None
+                if "full_project" in cols:
+                    full_project_value = row.get("full_project") or None
+                    if full_project_by_wc_norm:
+                        full_project_value = full_project_by_wc_norm.get(wc_norm) or full_project_value
+                    if full_project_value is not None:
+                        full_project_value = str(full_project_value).strip() or None
+
+                insert_cols = [
+                    "id",
+                    "wc_raw",
+                    "wc_norm",
+                    "sources",
+                    "first_seen_date",
+                    "last_seen_date",
+                    "status",
+                    "linked_project_id",
+                    "created_at",
+                    "updated_at",
+                ]
+                if "full_project" in cols:
+                    insert_cols.insert(3, "full_project")
+                placeholders = ", ".join(["?"] * len(insert_cols))
+                update_sets = [
+                    "wc_raw = excluded.wc_raw",
+                    "sources = excluded.sources",
+                    "first_seen_date = COALESCE("
+                    "MIN(wc_inbox.first_seen_date, excluded.first_seen_date),"
+                    "excluded.first_seen_date,"
+                    "wc_inbox.first_seen_date"
+                    ")",
+                    "last_seen_date = COALESCE("
+                    "MAX(wc_inbox.last_seen_date, excluded.last_seen_date),"
+                    "excluded.last_seen_date,"
+                    "wc_inbox.last_seen_date"
+                    ")",
+                    "updated_at = excluded.updated_at",
+                ]
+                if "full_project" in cols:
+                    update_sets.insert(
+                        2,
+                        "full_project = CASE "
+                        "WHEN excluded.full_project IS NOT NULL "
+                        "AND TRIM(excluded.full_project) != '' "
+                        "THEN excluded.full_project "
+                        "ELSE wc_inbox.full_project END",
+                    )
+
+                values = [
+                    str(uuid4()),
+                    wc_raw_value,
+                    wc_norm,
+                ]
+                if "full_project" in cols:
+                    values.append(full_project_value)
+                values.extend(
+                    [
                         json.dumps(sources, ensure_ascii=False),
                         row.get("first_seen_date"),
                         row.get("last_seen_date"),
@@ -3597,7 +3706,17 @@ class WcInboxRepository:
                         None,
                         now,
                         now,
-                    ),
+                    ]
+                )
+
+                self.con.execute(
+                    f"""
+                    INSERT INTO wc_inbox ({', '.join(insert_cols)})
+                    VALUES ({placeholders})
+                    ON CONFLICT(wc_norm) DO UPDATE SET
+                        {", ".join(update_sets)}
+                    """,
+                    values,
                 )
             self.con.execute("COMMIT")
         except Exception:
