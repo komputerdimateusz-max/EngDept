@@ -1437,7 +1437,7 @@ class ActionRepository:
         except sqlite3.Error:
             return []
 
-    def create_action(self, data: dict[str, Any]) -> str:
+    def create_action(self, data: dict[str, Any], debug: bool = False) -> str:
         action_id = data.get("id") or str(uuid4())
         if not _table_exists(self.con, "actions"):
             return action_id
@@ -1494,6 +1494,64 @@ class ActionRepository:
                 raise RuntimeError("Insert failed: action row missing after commit.")
         except sqlite3.Error as exc:
             _rollback_safely(self.con)
+            if debug:
+                debug_context: dict[str, Any] = {
+                    "action_id": action_id,
+                    "payload_keys": sorted(payload.keys()),
+                    "insert_cols": insert_cols,
+                    "placeholders_count": len(insert_cols),
+                    "exception_type": type(exc).__name__,
+                    "exception_message": str(exc),
+                }
+                try:
+                    table_info = self.con.execute("PRAGMA table_info(actions)").fetchall()
+                    debug_context["table_info"] = [
+                        {
+                            "name": col[1],
+                            "notnull": col[3],
+                            "default": col[4],
+                        }
+                        for col in table_info
+                    ]
+                except sqlite3.Error:
+                    debug_context["table_info_error"] = "Failed to read PRAGMA table_info(actions)."
+                try:
+                    debug_context["foreign_keys"] = self.con.execute(
+                        "PRAGMA foreign_keys"
+                    ).fetchone()[0]
+                except sqlite3.Error:
+                    debug_context["foreign_keys_error"] = "Failed to read PRAGMA foreign_keys."
+                try:
+                    debug_context["foreign_key_list"] = [
+                        dict(row)
+                        for row in self.con.execute("PRAGMA foreign_key_list(actions)").fetchall()
+                    ]
+                except sqlite3.Error:
+                    debug_context["foreign_key_list_error"] = (
+                        "Failed to read PRAGMA foreign_key_list(actions)."
+                    )
+                project_id = payload.get("project_id")
+                if project_id is not None:
+                    try:
+                        debug_context["project_id_exists"] = self.con.execute(
+                            "SELECT COUNT(*) FROM projects WHERE id = ?",
+                            (project_id,),
+                        ).fetchone()[0]
+                    except sqlite3.Error:
+                        debug_context["project_id_exists"] = "query_failed"
+                owner_champion_id = payload.get("owner_champion_id")
+                if owner_champion_id is not None:
+                    try:
+                        debug_context["owner_champion_id_exists"] = self.con.execute(
+                            "SELECT COUNT(*) FROM champions WHERE id = ?",
+                            (owner_champion_id,),
+                        ).fetchone()[0]
+                    except sqlite3.Error:
+                        debug_context["owner_champion_id_exists"] = "query_failed"
+                raise RuntimeError(
+                    "Action insert failed; debug="
+                    + json.dumps(debug_context, ensure_ascii=False)
+                ) from exc
             raise RuntimeError("Failed to insert action.") from exc
         return action_id
 
