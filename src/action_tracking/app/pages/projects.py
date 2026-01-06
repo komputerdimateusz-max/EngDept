@@ -5,6 +5,7 @@ import sqlite3
 from datetime import date
 from typing import Any
 
+import pandas as pd
 import streamlit as st
 
 from action_tracking.data.repositories import (
@@ -113,6 +114,15 @@ def _select_full_project_candidate(
     return (best if best else None), len(candidates) > 1
 
 
+def _is_full_project_missing(project: dict[str, Any]) -> bool:
+    full_project_value = project.get("full_project") if "full_project" in project else None
+    if full_project_value is None:
+        return True
+    if isinstance(full_project_value, str):
+        return not full_project_value.strip()
+    return False
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Projekty")
 
@@ -151,14 +161,22 @@ def render(con: sqlite3.Connection) -> None:
         st.caption(f"Liczba projektów: {len(projects)}")
         if not projects:
             st.info("Brak projektów.")
+        show_missing_only = st.checkbox("Pokaż tylko projekty bez FULL_PROJECT", value=False)
+        missing_count = sum(1 for project in projects if _is_full_project_missing(project))
+        st.caption(f"Braki FULL_PROJECT: {missing_count} / {len(projects)}")
+
         table_rows = []
-        for project in projects:
+        projects_for_table = [project for project in projects if not show_missing_only or _is_full_project_missing(project)]
+        for project in projects_for_table:
             total = project.get("actions_total") or 0
             closed = project.get("actions_closed") or 0
             open_count = project.get("actions_open") or 0
             pct_closed = project.get("pct_closed")
             pct_label = f"{pct_closed:.1f}%" if pct_closed is not None else "—"
             importance = project.get("importance") or "Mid Runner"
+            full_project_value = project.get("full_project", "")
+            full_project_raw = full_project_value if full_project_value is not None else ""
+            full_project_status = "⚠ Missing" if _is_full_project_missing(project) else "✅ OK"
             table_rows.append(
                 {
                     "Nazwa projektu": project.get("name"),
@@ -168,13 +186,23 @@ def render(con: sqlite3.Connection) -> None:
                     "Champion": project.get("owner_champion_name")
                     or champion_names.get(project.get("owner_champion_id"), "—"),
                     "Status": project.get("status"),
+                    "FULL_PROJECT status": full_project_status,
+                    "Full Project (production key)": full_project_raw,
                     "Akcje (łącznie)": total,
                     "Akcje (otwarte)": open_count,
                     "Akcje (zamknięte)": closed,
                     "% zamkniętych": pct_label,
                 }
             )
-        st.dataframe(table_rows, use_container_width=True)
+        projects_df = pd.DataFrame(table_rows)
+        st.dataframe(
+            projects_df,
+            use_container_width=True,
+            column_config={
+                "FULL_PROJECT status": st.column_config.TextColumn("FULL_PROJECT status"),
+                "Full Project (production key)": st.column_config.TextColumn("Full Project (production key)"),
+            },
+        )
 
         st.subheader("Uzupełnianie FULL PROJECT")
         st.caption("Uzupełnij tylko projekty bez FULL PROJECT (bezpieczne dopasowanie).")
