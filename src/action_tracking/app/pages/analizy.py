@@ -230,22 +230,25 @@ def _render_analysis_actions(
                 continue
 
             if col5.button("Dodaj do Akcji", key=f"add_{analysis_action['id']}"):
-                action_id = action_repo.create_action(
-                    {
-                        "project_id": analysis_project_id,
-                        "analysis_id": analysis_id,
-                        "title": analysis_action.get("title"),
-                        "description": analysis_action.get("description"),
-                        "owner_champion_id": analysis_action.get("owner_champion_id")
-                        or analysis_champion_id,
-                        "due_date": analysis_action.get("due_date"),
-                        "source": "analysis",
-                        "area": analysis_area,
-                    }
-                )
-                analysis_repo.mark_analysis_action_added(analysis_action["id"], action_id)
-                st.success("Dodano do modułu Akcje.")
-                st.rerun()
+                try:
+                    action_id = action_repo.create_action(
+                        {
+                            "project_id": analysis_project_id,
+                            "analysis_id": analysis_id,
+                            "title": analysis_action.get("title"),
+                            "description": analysis_action.get("description"),
+                            "owner_champion_id": analysis_action.get("owner_champion_id")
+                            or analysis_champion_id,
+                            "due_date": analysis_action.get("due_date"),
+                            "source": "analysis",
+                            "area": analysis_area,
+                        }
+                    )
+                    analysis_repo.mark_analysis_action_added(analysis_action["id"], action_id)
+                    st.success("Dodano do modułu Akcje.")
+                    st.rerun()
+                except Exception as exc:
+                    st.exception(exc)
 
     _render_group("corrective", "Działania korygujące")
     _render_group("preventive", "Działania zapobiegawcze")
