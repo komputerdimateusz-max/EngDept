@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS wc_inbox (
   id TEXT PRIMARY KEY,
   wc_raw TEXT NOT NULL,
   wc_norm TEXT NOT NULL UNIQUE,
+  full_project TEXT,
   sources TEXT NOT NULL,
   first_seen_date TEXT,
   last_seen_date TEXT,
@@ -583,6 +584,7 @@ def _migrate_to_v13(con: sqlite3.Connection) -> None:
           id TEXT PRIMARY KEY,
           wc_raw TEXT NOT NULL,
           wc_norm TEXT NOT NULL UNIQUE,
+          full_project TEXT,
           sources TEXT NOT NULL,
           first_seen_date TEXT,
           last_seen_date TEXT,
@@ -724,6 +726,12 @@ def _migrate_to_v17(con: sqlite3.Connection) -> None:
     _set_user_version(con, 17)
 
 
+def _migrate_to_v18(con: sqlite3.Connection) -> None:
+    if _table_exists(con, "wc_inbox") and not _column_exists(con, "wc_inbox", "full_project"):
+        con.execute("ALTER TABLE wc_inbox ADD COLUMN full_project TEXT;")
+    _set_user_version(con, 18)
+
+
 def _seed_action_categories(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "action_categories"):
         return
@@ -861,6 +869,8 @@ def init_db(con: sqlite3.Connection) -> None:
         _migrate_to_v16(con)
     if current_version < 17:
         _migrate_to_v17(con)
+    if current_version < 18:
+        _migrate_to_v18(con)
     _seed_action_categories(con)
     _seed_category_rules(con)
     con.commit()

@@ -96,6 +96,23 @@ def _resolve_work_center_default(
     return options[0] if options else ""
 
 
+def _select_full_project_candidate(
+    candidates: list[dict[str, Any]],
+) -> tuple[str | None, bool]:
+    if not candidates:
+        return None, False
+    ordered = sorted(
+        candidates,
+        key=lambda row: (
+            int(row.get("row_count") or 0),
+            row.get("last_seen") or "",
+        ),
+        reverse=True,
+    )
+    best = ordered[0].get("full_project") if ordered else None
+    return (best if best else None), len(candidates) > 1
+
+
 def render(con: sqlite3.Connection) -> None:
     st.header("Projekty")
 
@@ -119,6 +136,15 @@ def render(con: sqlite3.Connection) -> None:
 
     production_stats = production_repo.list_production_work_centers_with_stats()
     production_stats_by_norm = {row["wc_norm"]: row for row in production_stats if row.get("wc_norm")}
+    full_project_candidates_by_wc = production_repo.list_full_project_candidates_by_wc()
+    full_project_choice_by_wc: dict[str, str] = {}
+    ambiguous_full_project_wc: set[str] = set()
+    for wc_norm, candidates in full_project_candidates_by_wc.items():
+        selected, ambiguous = _select_full_project_candidate(candidates)
+        if selected:
+            full_project_choice_by_wc[wc_norm] = selected
+        if ambiguous:
+            ambiguous_full_project_wc.add(wc_norm)
 
     with st.expander("📁 Zarządzanie projektami (lista + edycja)", expanded=False):
         st.subheader("Lista projektów")
@@ -149,6 +175,50 @@ def render(con: sqlite3.Connection) -> None:
                 }
             )
         st.dataframe(table_rows, use_container_width=True)
+
+        st.subheader("Uzupełnianie FULL PROJECT")
+        st.caption("Uzupełnij tylko projekty bez FULL PROJECT (bezpieczne dopasowanie).")
+        if st.button("Uzupełnij FULL PROJECT z danych produkcyjnych", key="projects_backfill_full_project"):
+            updated_projects: list[str] = []
+            ambiguous_work_centers: set[str] = set()
+            skipped_projects: list[str] = []
+            for project in projects:
+                if (project.get("full_project") or "").strip():
+                    continue
+                project_name = (project.get("name") or "").strip()
+                project_code = (project.get("project_code") or "").strip()
+                candidate = None
+                if project_name and production_repo.full_project_exists(project_name):
+                    candidate = project_name
+                elif project_code and production_repo.full_project_exists(project_code):
+                    candidate = project_code
+                else:
+                    wc_norm = normalize_wc(project.get("work_center") or "")
+                    if wc_norm and wc_norm in full_project_candidates_by_wc:
+                        selected, ambiguous = _select_full_project_candidate(
+                            full_project_candidates_by_wc.get(wc_norm, []),
+                        )
+                        if selected and not ambiguous:
+                            candidate = selected
+                        elif ambiguous:
+                            ambiguous_work_centers.add(project.get("work_center") or wc_norm)
+
+                if candidate:
+                    project_repo.update_project(project["id"], {"full_project": candidate})
+                    updated_projects.append(project_name or project.get("id", "—"))
+                else:
+                    if (project.get("work_center") or project.get("id", "—")) not in ambiguous_work_centers:
+                        skipped_projects.append(project_name or project.get("id", "—"))
+
+            if updated_projects:
+                st.success(f"Uzupełniono FULL PROJECT dla {len(updated_projects)} projektów.")
+            if ambiguous_work_centers:
+                st.warning(
+                    "Pominięto projekty z niejednoznacznym FULL PROJECT dla WC: "
+                    f"{', '.join(sorted(ambiguous_work_centers))}."
+                )
+            if skipped_projects and not updated_projects:
+                st.info("Brak pewnych dopasowań FULL PROJECT dla pustych projektów.")
 
         st.subheader("Dodaj / Edytuj projekt")
         project_options = ["(nowy)"] + [project["id"] for project in projects]
@@ -319,7 +389,11 @@ def render(con: sqlite3.Connection) -> None:
     with st.expander("Pokaż wykryte Work Center", expanded=False):
         if st.button("Odśwież wykrywanie (scan DB)", key="wc_inbox_refresh"):
             refreshed_stats = production_repo.list_production_work_centers_with_stats()
-            wc_inbox_repo.upsert_from_production(refreshed_stats, project_wc_norms)
+            wc_inbox_repo.upsert_from_production(
+                refreshed_stats,
+                project_wc_norms,
+                full_project_choice_by_wc,
+            )
             st.rerun()
 
         open_items = wc_inbox_repo.list_open()
@@ -336,6 +410,7 @@ def render(con: sqlite3.Connection) -> None:
                 table_rows.append(
                     {
                         "WC": item.get("wc_raw") or "—",
+                        "FULL PROJECT": item.get("full_project") or "—",
                         "Źródła": sources_label,
                         "First seen": item.get("first_seen_date") or "—",
                         "Last seen": item.get("last_seen_date") or "—",
@@ -351,13 +426,20 @@ def render(con: sqlite3.Connection) -> None:
                 wc_key = wc_norm or item.get("id") or wc_raw
                 with st.expander(f"Akcje: {wc_raw}", expanded=False):
                     st.caption(f"Normalized WC: {wc_norm}")
+                    if wc_norm in ambiguous_full_project_wc:
+                        st.warning("Wiele FULL PROJECT dla tego WC — wybierz ręcznie.")
 
                     with st.form(f"wc_inbox_create_{wc_key}"):
                         project_name = st.text_input("Nazwa projektu", value=wc_raw, key=f"wc_inbox_name_{wc_key}")
                         st.text_input("Work center", value=wc_raw, disabled=True, key=f"wc_inbox_wc_{wc_key}")
+                        default_full_project = (
+                            item.get("full_project")
+                            or full_project_choice_by_wc.get(wc_norm)
+                            or project_name
+                        )
                         full_project = st.text_input(
                             "FULL PROJECT (production key)",
-                            value=project_name,
+                            value=default_full_project,
                             help=(
                                 "Musi odpowiadać dokładnie wartości FULL PROJECT w danych produkcyjnych "
                                 "(np. 'REAR LAMP BMW U10')."

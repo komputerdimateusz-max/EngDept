@@ -14,7 +14,7 @@ from action_tracking.services.metrics_scale import detect_percent_scale, normali
 
 SCRAP_COLUMN_CANDIDATES = {
     "date": ["DATE", "DATA"],
-    "full_project": ["FULL PROJECT", "FULLPROJECT"],
+    "full_project": ["FULL PROJECT", "FULL_PROJECT", "FULLPROJECT"],
     "workcenter": ["WORKCENTER", "WORK CENTER"],
     "scrap_qty": ["SCRAP QTY [PCS]", "SCRAPQTY", "OK S. QTY [PCS]", "OKSQTYPCS"],
     "scrap_value": ["SCRAP VALUE [PLN]", "SCRAP VALUE", "SCRAP VAL", "SCRAPVALPLN"],
@@ -23,7 +23,7 @@ SCRAP_COLUMN_CANDIDATES = {
 
 KPI_COLUMN_CANDIDATES = {
     "date": ["DATE", "DATA"],
-    "full_project": ["FULL PROJECT", "FULLPROJECT"],
+    "full_project": ["FULL PROJECT", "FULL_PROJECT", "FULLPROJECT"],
     "workcenter": ["WORKCENTER", "WORK CENTER"],
     "worktime": ["WORKTIME  [MIN]", "WORKTIME [MIN]", "WORKTIME PROC[S]", "WORKTIME"],
     "oee": ["OEE [%]", "OEE"],
