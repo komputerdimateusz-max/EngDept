@@ -1233,7 +1233,11 @@ class ActionRepository:
             return []
 
         action_cols = _table_columns(self.con, "actions")
-        if not action_cols or "closed_at" not in action_cols:
+        if not action_cols:
+            return []
+        has_closed_at = "closed_at" in action_cols
+        has_created_at = "created_at" in action_cols
+        if not has_closed_at and not has_created_at:
             return []
 
         select_cols = [f"a.{c}" for c in action_cols]
@@ -1274,6 +1278,15 @@ class ActionRepository:
                     return None
             return None
 
+        def _date_clause(column: str, from_value: str | None, to_value: str | None) -> tuple[str, list[Any]]:
+            if from_value and to_value:
+                return f"date({column}) BETWEEN date(?) AND date(?)", [from_value, to_value]
+            if from_value:
+                return f"date({column}) >= date(?)", [from_value]
+            if to_value:
+                return f"date({column}) <= date(?)", [to_value]
+            return "", []
+
         from_value = _coerce_date(date_from)
         to_value = _coerce_date(date_to)
 
@@ -1284,7 +1297,7 @@ class ActionRepository:
             {' '.join(joins)}
         """
 
-        filters: list[str] = ["a.closed_at IS NOT NULL"]
+        filters: list[str] = []
         params: list[Any] = []
 
         if "is_draft" in action_cols:
@@ -1292,20 +1305,34 @@ class ActionRepository:
         if project_id and "project_id" in action_cols:
             filters.append("a.project_id = ?")
             params.append(project_id)
-        if from_value and to_value:
-            filters.append("date(a.closed_at) BETWEEN date(?) AND date(?)")
-            params.extend([from_value, to_value])
-        elif from_value:
-            filters.append("date(a.closed_at) >= date(?)")
-            params.append(from_value)
-        elif to_value:
-            filters.append("date(a.closed_at) <= date(?)")
-            params.append(to_value)
+        if from_value or to_value:
+            date_filters: list[str] = []
+            date_params: list[Any] = []
+            if has_closed_at:
+                clause, clause_params = _date_clause("a.closed_at", from_value, to_value)
+                if clause:
+                    date_filters.append(clause)
+                    date_params.extend(clause_params)
+            if has_created_at:
+                clause, clause_params = _date_clause("a.created_at", from_value, to_value)
+                if clause:
+                    date_filters.append(clause)
+                    date_params.extend(clause_params)
+            if date_filters:
+                filters.append("(" + " OR ".join(date_filters) + ")")
+                params.extend(date_params)
 
         if filters:
             base_query += " WHERE " + " AND ".join(filters)
 
-        base_query += " ORDER BY a.closed_at ASC"
+        if has_closed_at and has_created_at:
+            base_query += " ORDER BY COALESCE(a.closed_at, a.created_at) ASC"
+        elif has_closed_at:
+            base_query += " ORDER BY a.closed_at ASC"
+        elif has_created_at:
+            base_query += " ORDER BY a.created_at ASC"
+        else:
+            base_query += " ORDER BY a.rowid ASC"
 
         try:
             cur = self.con.execute(base_query, params)
