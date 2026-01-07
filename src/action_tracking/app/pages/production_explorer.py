@@ -3,7 +3,7 @@ from __future__ import annotations
 # What changed:
 # - Added empty-filter debug info and classification sanity checks.
 
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 import sqlite3
 from typing import Any
 
@@ -16,7 +16,11 @@ from action_tracking.data.repositories import (
     ProductionDataRepository,
     ProjectRepository,
 )
-from action_tracking.services.effectiveness import parse_date, parse_work_centers
+from action_tracking.services.effectiveness import parse_work_centers
+from action_tracking.services.markers import (
+    action_marker_date_with_source,
+    action_marker_fields,
+)
 from action_tracking.services.areas import (
     kpi_area_to_allowed_areas,
     normalize_area,
@@ -164,6 +168,9 @@ def _line_chart_with_markers(
                 alt.Tooltip("action_area_label:N", title="Obszar"),
                 alt.Tooltip("marker_date:T", title="Data"),
                 alt.Tooltip("marker_kind:N", title="Typ"),
+                alt.Tooltip("action_due_date:N", title="Termin zamknięcia"),
+                alt.Tooltip("action_closed_at:N", title="Zamknięta"),
+                alt.Tooltip("action_created_at:N", title="Utworzona"),
                 alt.Tooltip("overlay_label:N", title="Wykres"),
             ],
         )
@@ -201,34 +208,6 @@ def _date_in_range(value: date | None, start: date, end: date) -> bool:
     return start <= value <= end
 
 
-def _parse_action_date(value: Any) -> date | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, date) and not isinstance(value, datetime):
-        return value
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            return date.fromisoformat(text[:10])
-        except ValueError:
-            pass
-    return parse_date(value)
-
-
-def _action_date_payload(action: dict[str, Any]) -> tuple[date | None, str | None]:
-    closed_date = _parse_action_date(action.get("closed_at"))
-    if closed_date:
-        return closed_date, "closed_at"
-    created_date = _parse_action_date(action.get("created_at"))
-    if created_date:
-        return created_date, "created_at"
-    return None, None
-
-
 def _marker_payload_for_action(
     action: dict[str, Any],
     date_from: date,
@@ -238,22 +217,31 @@ def _marker_payload_for_action(
     if status == "draft":
         return []
 
-    action_date, date_field = _action_date_payload(action)
+    action_date, date_field = action_marker_date_with_source(action)
     if not _date_in_range(action_date, date_from, date_to):
         return []
 
     action_area = _normalize_marker_area(action.get("area"))
-    marker_kind = "Zamknięcie" if date_field == "closed_at" else "Utworzenie"
+    marker_kind = {
+        "due_date": "Termin",
+        "closed_at": "Zamknięcie",
+        "created_at": "Utworzenie",
+    }.get(date_field, "Utworzenie")
+    date_fields = action_marker_fields(action)
     return [
         {
             "action_id": action.get("id"),
             "marker_date": pd.to_datetime(action_date),
             "marker_kind": marker_kind,
+            "marker_source": date_field,
             "action_title": action.get("title") or "—",
             "owner_name": action.get("owner_name") or "—",
             "category": action.get("category") or "—",
             "action_area": action_area,
             "action_area_label": action_area,
+            "action_due_date": date_fields.get("due_date"),
+            "action_closed_at": date_fields.get("closed_at"),
+            "action_created_at": date_fields.get("created_at"),
         }
     ]
 
@@ -722,17 +710,19 @@ def render(con: sqlite3.Connection) -> None:
             actions_matching_area_scrap_count = 0
             actions_matching_area_kpi_count = 0
             action_date_sources_all: dict[str, int] = {
+                "due_date": 0,
                 "closed_at": 0,
                 "created_at": 0,
                 "missing": 0,
             }
             action_date_sources_in_window: dict[str, int] = {
+                "due_date": 0,
                 "closed_at": 0,
                 "created_at": 0,
             }
             action_dates_in_window: list[date] = []
             for action in project_actions:
-                action_date, date_field = _action_date_payload(action)
+                action_date, date_field = action_marker_date_with_source(action)
                 if not action_date:
                     action_date_sources_all["missing"] += 1
                     continue
@@ -751,6 +741,11 @@ def render(con: sqlite3.Connection) -> None:
             st.write("marker_total_count:", len(markers_df))
             st.write("marker_count_scrap_area:", len(markers_scrap))
             st.write("marker_count_kpi_area:", len(markers_kpi))
+            if not markers_df.empty and "marker_source" in markers_df.columns:
+                marker_source_counts = (
+                    markers_df["marker_source"].value_counts().to_dict()
+                )
+                st.write("marker_source_counts:", marker_source_counts)
             st.write("actions_for_project_count:", actions_for_project_count)
             st.write("actions_with_date_in_window_count:", actions_with_date_in_window_count)
             st.write("actions_matching_area_count_scrap:", actions_matching_area_scrap_count)
@@ -776,6 +771,7 @@ def render(con: sqlite3.Connection) -> None:
                     "id",
                     "project_id",
                     "status",
+                    "due_date",
                     "closed_at",
                     "area",
                     "created_at",
@@ -796,13 +792,14 @@ def render(con: sqlite3.Connection) -> None:
                 st.write("Marker filters summary:")
                 st.json(marker_debug, expanded=False)
             if not markers_df.empty:
-                st.write("Top 5 markers:")
+                st.write("Top 5 markers (date + source):")
                 st.dataframe(
                     markers_df[
                         [
                             "action_id",
                             "marker_date",
                             "marker_kind",
+                            "marker_source",
                             "action_area_label",
                         ]
                     ].head(5),
@@ -924,6 +921,7 @@ def render(con: sqlite3.Connection) -> None:
             st.dataframe(scrap_currency_view, use_container_width=True)
 
     st.caption(
-        "Markery akcji są ustawiane na dacie zamknięcia (jeśli dostępne) "
-        "lub na dacie utworzenia (otwarte akcje) i widoczne po wyborze projektu."
+        "Markery akcji są ustawiane na terminie zamknięcia (due_date), "
+        "potem na dacie zamknięcia lub na dacie utworzenia (otwarte akcje) "
+        "i widoczne po wyborze projektu."
     )
