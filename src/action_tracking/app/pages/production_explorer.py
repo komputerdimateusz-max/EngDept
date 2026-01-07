@@ -13,7 +13,6 @@ import streamlit as st
 
 from action_tracking.data.repositories import (
     ActionRepository,
-    GlobalSettingsRepository,
     ProductionDataRepository,
     ProjectRepository,
 )
@@ -21,7 +20,6 @@ from action_tracking.services.effectiveness import parse_date, parse_work_center
 from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_COLORS,
     OVERLAY_TARGET_LABELS,
-    default_overlay_targets,
     marker_areas_for_component,
     normalize_action_area,
 )
@@ -108,7 +106,6 @@ def _line_chart_with_markers(
     title: str,
     markers_df: pd.DataFrame,
     show_markers: bool,
-    overlay_target: str,
     area_filter: set[str] | None = None,
 ) -> alt.Chart:
     base = (
@@ -122,7 +119,7 @@ def _line_chart_with_markers(
     )
     if not show_markers or markers_df.empty:
         return base
-    filtered_markers = markers_df[markers_df["overlay_target"] == overlay_target]
+    filtered_markers = markers_df.copy()
     if area_filter and "action_area" in filtered_markers.columns:
         if filtered_markers["action_area"].notna().any():
             filtered_markers = filtered_markers[
@@ -171,29 +168,11 @@ def _apply_marker_area_filter(
 
 def _markers_available_for(
     markers_df: pd.DataFrame,
-    overlay_target: str,
     area_filter: set[str] | None,
 ) -> bool:
     if markers_df.empty:
         return False
-    filtered = markers_df[markers_df["overlay_target"] == overlay_target]
-    filtered = _apply_marker_area_filter(filtered, area_filter)
-    return not filtered.empty
-
-
-def _resolve_overlay_targets(
-    action_row: dict[str, Any],
-    rules_repo: GlobalSettingsRepository,
-) -> list[str]:
-    rule = rules_repo.resolve_category_rule(action_row.get("category") or "")
-    if rule and rule.get("overlay_targets_configured"):
-        overlay_targets = list(rule.get("overlay_targets") or [])
-    else:
-        overlay_targets = []
-    if overlay_targets:
-        return overlay_targets
-    effect_model = rule.get("effectiveness_model") if rule else None
-    return default_overlay_targets(effect_model)
+    return not _apply_marker_area_filter(markers_df, area_filter).empty
 
 
 def _normalize_marker_area(value: Any) -> str:
@@ -210,47 +189,41 @@ def _marker_payload_for_action(
     action: dict[str, Any],
     date_from: date,
     date_to: date,
-    rules_repo: GlobalSettingsRepository,
 ) -> list[dict[str, Any]]:
     status = str(action.get("status") or "").strip().lower()
     closed_date = parse_date(action.get("closed_at"))
-    created_date = parse_date(action.get("created_at"))
 
-    marker_date: date | None = None
-    marker_kind = None
-    if status == "done":
-        if _date_in_range(closed_date, date_from, date_to):
-            marker_date = closed_date
-            marker_kind = "Zamknięcie"
-    else:
-        if _date_in_range(created_date, date_from, date_to):
-            marker_date = created_date
-            marker_kind = "Utworzenie"
+    if status != "done" or not closed_date:
+        return []
 
-    if not marker_date:
+    if not _date_in_range(closed_date, date_from, date_to):
         return []
 
     action_area = _normalize_marker_area(action.get("area"))
-    overlay_targets = _resolve_overlay_targets(action, rules_repo)
-    markers: list[dict[str, Any]] = []
-    for overlay_target in overlay_targets:
-        markers.append(
-            {
-                "action_id": action.get("id"),
-                "marker_date": pd.to_datetime(marker_date),
-                "marker_kind": marker_kind,
-                "action_title": action.get("title") or "—",
-                "owner_name": action.get("owner_name") or "—",
-                "category": action.get("category") or "—",
-                "action_area": action_area,
-                "action_area_label": action_area,
-                "overlay_target": overlay_target,
-                "overlay_label": OVERLAY_TARGET_LABELS.get(
-                    overlay_target, overlay_target
-                ),
-            }
-        )
-    return markers
+    return [
+        {
+            "action_id": action.get("id"),
+            "marker_date": pd.to_datetime(closed_date),
+            "marker_kind": "Zamknięcie",
+            "action_title": action.get("title") or "—",
+            "owner_name": action.get("owner_name") or "—",
+            "category": action.get("category") or "—",
+            "action_area": action_area,
+            "action_area_label": action_area,
+        }
+    ]
+
+
+def _attach_overlay_target(
+    markers_df: pd.DataFrame,
+    overlay_target: str,
+) -> pd.DataFrame:
+    if markers_df.empty:
+        return markers_df
+    temp = markers_df.copy()
+    temp["overlay_target"] = overlay_target
+    temp["overlay_label"] = OVERLAY_TARGET_LABELS.get(overlay_target, overlay_target)
+    return temp
 
 
 def _get_query_param(key: str) -> str | None:
@@ -299,7 +272,6 @@ def render(con: sqlite3.Connection) -> None:
     production_repo = ProductionDataRepository(con)
     project_repo = ProjectRepository(con)
     action_repo = ActionRepository(con)
-    rules_repo = GlobalSettingsRepository(con)
 
     projects = project_repo.list_projects(include_counts=True)
     project_names = {p["id"]: p.get("name") or p.get("id") for p in projects}
@@ -319,7 +291,9 @@ def render(con: sqlite3.Connection) -> None:
     filter_col1, filter_col2, filter_col3, filter_col4, filter_col5 = st.columns(
         [1.4, 2.4, 2.0, 1.4, 1.4]
     )
-    project_options = ["Wszystkie"] + [p["id"] for p in projects]
+    project_placeholder = "(wybierz)"
+    project_total_option = "TOTAL (all)"
+    project_options = [project_placeholder, project_total_option] + [p["id"] for p in projects]
     project_index = 0
     if selected_project_state in project_options:
         project_index = project_options.index(selected_project_state)
@@ -327,9 +301,13 @@ def render(con: sqlite3.Connection) -> None:
         "Projekt",
         project_options,
         index=project_index,
-        format_func=lambda pid: "Wszystkie" if pid == "Wszystkie" else project_names.get(pid, pid),
+        format_func=lambda pid: project_names.get(pid, pid),
     )
-    if selected_project == "Wszystkie":
+    if selected_project == project_placeholder:
+        st.session_state.pop("production_explorer_selected_project_id", None)
+        st.info("Wybierz projekt lub TOTAL (all), aby policzyć KPI.")
+        return
+    if selected_project == project_total_option:
         st.session_state.pop("production_explorer_selected_project_id", None)
         selected_project_id = None
         selected_project_name = None
@@ -354,7 +332,7 @@ def render(con: sqlite3.Connection) -> None:
     has_full_project_column = has_full_project_scrap and has_full_project_kpi
     active_work_centers = None
     active_full_project: str | None = None
-    if selected_project != "Wszystkie":
+    if selected_project != project_total_option:
         if has_full_project_column:
             if production_key:
                 active_full_project = production_key
@@ -465,7 +443,7 @@ def render(con: sqlite3.Connection) -> None:
     oee_scale = kpi_daily.attrs.get("oee_scale", "unknown")
     perf_scale = kpi_daily.attrs.get("perf_scale", "unknown")
 
-    if selected_project != "Wszystkie":
+    if selected_project != project_total_option:
         count_full_project_matches_scrap = production_repo.count_full_project_matches(
             "scrap_daily",
             production_key,
@@ -657,77 +635,21 @@ def render(con: sqlite3.Connection) -> None:
                 action,
                 selected_from,
                 selected_to,
-                rules_repo,
             )
         )
     markers_df = pd.DataFrame(markers)
+    markers_scrap = _apply_marker_area_filter(markers_df, scrap_marker_areas)
+    markers_kpi = _apply_marker_area_filter(markers_df, kpi_marker_areas)
     if markers_df.empty:
         st.caption("Brak markerów akcji w zakresie.")
 
-    debug_markers = st.checkbox("Debug markers", value=False)
-    if debug_markers:
-        action_count_in_range = len(marker_actions)
-        action_count_filtered_scrap = len(
-            [
-                action
-                for action in marker_actions
-                if _normalize_marker_area(action.get("area")) in (scrap_marker_areas or set())
-            ]
-        )
-        action_count_filtered_kpi = len(
-            [
-                action
-                for action in marker_actions
-                if _normalize_marker_area(action.get("area")) in (kpi_marker_areas or set())
-            ]
-        )
-        recent_actions_all = action_repo.list_recent_actions()
-        recent_actions_project = (
-            action_repo.list_recent_actions(project_id=selected_project_id)
-            if selected_project_id
-            else []
-        )
-        debug_action_columns = [
-            "id",
-            "project_id",
-            "status",
-            "created_at",
-            "closed_at",
-            "due_date",
-            "area",
-        ]
-        filtered_scrap = _apply_marker_area_filter(markers_df, scrap_marker_areas)
-        filtered_kpi = _apply_marker_area_filter(markers_df, kpi_marker_areas)
-        with st.expander("Debug: Markery akcji", expanded=True):
-            st.write("selected_project_id:", selected_project_id)
-            st.write("actions_in_range_count:", action_count_in_range)
-            st.write(
-                "actions_in_range_count (scrap area filter):",
-                action_count_filtered_scrap if scrap_marker_areas else action_count_in_range,
-            )
-            st.write(
-                "actions_in_range_count (kpi area filter):",
-                action_count_filtered_kpi if kpi_marker_areas else action_count_in_range,
-            )
+    with st.expander("Debug: Markery akcji", expanded=False):
+        debug_markers = st.checkbox("Pokaż debug markerów", value=False)
+        if debug_markers:
+            st.write("marker_total_count:", len(markers_df))
+            st.write("marker_count_scrap_area:", len(markers_scrap))
+            st.write("marker_count_kpi_area:", len(markers_kpi))
             st.write("date_from/date_to:", selected_from, selected_to)
-            if marker_actions:
-                st.write("Sample actions in range:")
-                debug_df = pd.DataFrame(marker_actions)
-                cols = [col for col in debug_action_columns if col in debug_df.columns]
-                st.dataframe(debug_df[cols].head(5), use_container_width=True)
-            if recent_actions_all:
-                st.write("Top 10 actions (all projects):")
-                debug_df = pd.DataFrame(recent_actions_all)
-                cols = [col for col in debug_action_columns if col in debug_df.columns]
-                st.dataframe(debug_df[cols].head(10), use_container_width=True)
-            if recent_actions_project:
-                st.write("Top 10 actions (selected project):")
-                debug_df = pd.DataFrame(recent_actions_project)
-                cols = [col for col in debug_action_columns if col in debug_df.columns]
-                st.dataframe(debug_df[cols].head(10), use_container_width=True)
-            st.write("Marker count (total):", len(markers_df))
-            st.write("Marker count (scrap area filter):", len(filtered_scrap))
-            st.write("Marker count (kpi area filter):", len(filtered_kpi))
             if not markers_df.empty:
                 st.write("Top 5 markers:")
                 st.dataframe(
@@ -737,7 +659,6 @@ def render(con: sqlite3.Connection) -> None:
                             "marker_date",
                             "marker_kind",
                             "action_area_label",
-                            "overlay_target",
                         ]
                     ].head(5),
                     use_container_width=True,
@@ -746,7 +667,7 @@ def render(con: sqlite3.Connection) -> None:
     chart_cols = st.columns(2)
     if not scrap_daily.empty:
         scrap_qty_markers_available = _markers_available_for(
-            markers_df, "SCRAP_QTY", scrap_marker_areas
+            markers_scrap, scrap_marker_areas
         )
         show_scrap_qty_markers = chart_cols[0].checkbox(
             "Pokaż markery akcji",
@@ -760,9 +681,8 @@ def render(con: sqlite3.Connection) -> None:
                 "scrap_qty_sum",
                 "Scrap qty",
                 "Scrap qty",
-                markers_df,
+                _attach_overlay_target(markers_scrap, "SCRAP_QTY"),
                 show_scrap_qty_markers,
-                "SCRAP_QTY",
                 scrap_marker_areas,
             ),
             use_container_width=True,
@@ -771,7 +691,7 @@ def render(con: sqlite3.Connection) -> None:
             chart_cols[1].info("Koszt scrap: wybierz PLN, aby zobaczyć wykres.")
         else:
             scrap_cost_markers_available = _markers_available_for(
-                markers_df, "SCRAP_COST", scrap_marker_areas
+                markers_scrap, scrap_marker_areas
             )
             show_scrap_cost_markers = chart_cols[1].checkbox(
                 "Pokaż markery akcji",
@@ -785,9 +705,8 @@ def render(con: sqlite3.Connection) -> None:
                     "scrap_pln_sum",
                     "Scrap PLN",
                     "Scrap PLN",
-                    markers_df,
+                    _attach_overlay_target(markers_scrap, "SCRAP_COST"),
                     show_scrap_cost_markers,
-                    "SCRAP_COST",
                     scrap_marker_areas,
                 ),
                 use_container_width=True,
@@ -798,7 +717,7 @@ def render(con: sqlite3.Connection) -> None:
     chart_cols = st.columns(2)
     if not kpi_daily.empty:
         oee_markers_available = _markers_available_for(
-            markers_df, "OEE", kpi_marker_areas
+            markers_kpi, kpi_marker_areas
         )
         show_oee_markers = chart_cols[0].checkbox(
             "Pokaż markery akcji",
@@ -812,15 +731,14 @@ def render(con: sqlite3.Connection) -> None:
                 "oee_avg",
                 "OEE (%)",
                 "OEE",
-                markers_df,
+                _attach_overlay_target(markers_kpi, "OEE"),
                 show_oee_markers,
-                "OEE",
                 kpi_marker_areas,
             ),
             use_container_width=True,
         )
         perf_markers_available = _markers_available_for(
-            markers_df, "PERFORMANCE", kpi_marker_areas
+            markers_kpi, kpi_marker_areas
         )
         show_perf_markers = chart_cols[1].checkbox(
             "Pokaż markery akcji",
@@ -834,9 +752,8 @@ def render(con: sqlite3.Connection) -> None:
                 "performance_avg",
                 "Performance (%)",
                 "Performance",
-                markers_df,
+                _attach_overlay_target(markers_kpi, "PERFORMANCE"),
                 show_perf_markers,
-                "PERFORMANCE",
                 kpi_marker_areas,
             ),
             use_container_width=True,
@@ -858,7 +775,6 @@ def render(con: sqlite3.Connection) -> None:
             st.dataframe(scrap_currency_view, use_container_width=True)
 
     st.caption(
-        "Markery akcji są ustawiane na dacie zamknięcia (status done) lub utworzenia "
-        "(status open/in-progress/blocked) i widoczne po wyborze projektu "
-        "(mapowanie wykresów definiuje Global Settings)."
+        "Markery akcji są ustawiane na dacie zamknięcia (status done) "
+        "i widoczne po wyborze projektu."
     )
