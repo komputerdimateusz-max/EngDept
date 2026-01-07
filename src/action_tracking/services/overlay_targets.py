@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from action_tracking.services.areas import normalize_area
 from action_tracking.services.impact_aspects import IMPACT_ASPECT_COLORS
 
 
@@ -25,26 +26,6 @@ OVERLAY_TARGET_COLORS: dict[str, str] = {
     "SCRAP_COST": IMPACT_ASPECT_COLORS.get("SCRAP", "#d62728"),
     "OEE": IMPACT_ASPECT_COLORS.get("OEE", "#1f77b4"),
     "PERFORMANCE": IMPACT_ASPECT_COLORS.get("PERFORMANCE", "#2ca02c"),
-}
-
-ACTION_AREA_ALIASES: dict[str, str] = {
-    "montaż": "Montaż",
-    "montaz": "Montaż",
-    "assembly": "Montaż",
-    "assembly_main": "Montaż",
-    "assembly_line": "Montaż",
-    "wtrysk": "Wtrysk",
-    "injection": "Wtrysk",
-    "metalizacja": "Metalizacja",
-    "metalization": "Metalizacja",
-    "metalisation": "Metalizacja",
-    "podgrupa": "Podgrupa",
-    "podgrupy": "Podgrupa",
-    "subgroup": "Podgrupa",
-    "subgroups": "Podgrupa",
-    "inne": "Inne",
-    "other": "Inne",
-    "unknown": "Inne",
 }
 
 AREA_SELECTION_HINTS: tuple[tuple[str, str], ...] = (
@@ -110,8 +91,7 @@ def normalize_action_area(value: Any) -> str | None:
     raw = str(value).strip()
     if not raw:
         return None
-    normalized = raw.casefold()
-    return ACTION_AREA_ALIASES.get(normalized, raw)
+    return normalize_area(raw)
 
 
 # Normalize UI selections (e.g. "Montaż (PLxx/P)") to base action area labels.

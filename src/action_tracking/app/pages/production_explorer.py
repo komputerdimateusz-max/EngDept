@@ -17,11 +17,14 @@ from action_tracking.data.repositories import (
     ProjectRepository,
 )
 from action_tracking.services.effectiveness import parse_date, parse_work_centers
+from action_tracking.services.areas import (
+    kpi_area_to_allowed_areas,
+    normalize_area,
+    scrap_component_to_allowed_areas,
+)
 from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_COLORS,
     OVERLAY_TARGET_LABELS,
-    marker_areas_for_component,
-    normalize_action_area,
     normalize_area_selection,
 )
 from action_tracking.services.kpi_windows import compute_project_kpi_windows
@@ -59,6 +62,18 @@ def _weighted_or_mean(values: pd.Series, weights: pd.Series | None) -> float | N
 
 def _weekly_bucket(df: pd.DataFrame, date_col: str = "metric_date") -> pd.Series:
     return df[date_col].dt.to_period("W-MON").apply(lambda period: period.start_time)
+
+
+def _bucket_marker_dates(markers_df: pd.DataFrame) -> pd.DataFrame:
+    if markers_df.empty or "marker_date" not in markers_df.columns:
+        return markers_df
+    temp = markers_df.copy()
+    temp["marker_date"] = pd.to_datetime(temp["marker_date"], errors="coerce")
+    temp = temp.dropna(subset=["marker_date"])
+    temp["marker_date"] = temp["marker_date"].dt.to_period("W-MON").apply(
+        lambda period: period.start_time
+    )
+    return temp
 
 
 def _weekly_scrap_aggregation(scrap_df: pd.DataFrame) -> pd.DataFrame:
@@ -177,7 +192,7 @@ def _markers_available_for(
 
 
 def _normalize_marker_area(value: Any) -> str:
-    return normalize_action_area(value) or "Inne"
+    return normalize_area(value)
 
 
 def _date_in_range(value: date | None, start: date, end: date) -> bool:
@@ -186,7 +201,7 @@ def _date_in_range(value: date | None, start: date, end: date) -> bool:
     return start <= value <= end
 
 
-def _parse_closed_date(value: Any) -> date | None:
+def _parse_action_date(value: Any) -> date | None:
     if value in (None, ""):
         return None
     if isinstance(value, date) and not isinstance(value, datetime):
@@ -204,26 +219,36 @@ def _parse_closed_date(value: Any) -> date | None:
     return parse_date(value)
 
 
+def _action_date_payload(action: dict[str, Any]) -> tuple[date | None, str | None]:
+    closed_date = _parse_action_date(action.get("closed_at"))
+    if closed_date:
+        return closed_date, "closed_at"
+    created_date = _parse_action_date(action.get("created_at"))
+    if created_date:
+        return created_date, "created_at"
+    return None, None
+
+
 def _marker_payload_for_action(
     action: dict[str, Any],
     date_from: date,
     date_to: date,
 ) -> list[dict[str, Any]]:
     status = str(action.get("status") or "").strip().lower()
-    closed_date = _parse_closed_date(action.get("closed_at"))
-
-    if status != "done" or not closed_date:
+    if status == "draft":
         return []
 
-    if not _date_in_range(closed_date, date_from, date_to):
+    action_date, date_field = _action_date_payload(action)
+    if not _date_in_range(action_date, date_from, date_to):
         return []
 
     action_area = _normalize_marker_area(action.get("area"))
+    marker_kind = "Zamknięcie" if date_field == "closed_at" else "Utworzenie"
     return [
         {
             "action_id": action.get("id"),
-            "marker_date": pd.to_datetime(closed_date),
-            "marker_kind": "Zamknięcie",
+            "marker_date": pd.to_datetime(action_date),
+            "marker_kind": marker_kind,
             "action_title": action.get("title") or "—",
             "owner_name": action.get("owner_name") or "—",
             "category": action.get("category") or "—",
@@ -640,13 +665,12 @@ def render(con: sqlite3.Connection) -> None:
     if oee_scale != "unknown" or perf_scale != "unknown":
         st.caption("KPI zapisane w bazie jako procenty (0-100).")
 
-    scrap_marker_areas = marker_areas_for_component(scrap_component)
-    kpi_marker_areas = marker_areas_for_component(kpi_component)
+    scrap_marker_areas = scrap_component_to_allowed_areas(scrap_component)
+    kpi_marker_areas = kpi_area_to_allowed_areas(kpi_component)
 
     markers_df = pd.DataFrame()
     markers: list[dict[str, Any]] = []
-    # Markers are based on actions.project_id (FK) with status=done and closed_at;
-    # do not use production FULL PROJECT for action markers.
+    # Markers are based on actions.project_id (FK) and action dates; do not use production FULL PROJECT.
     marker_actions = action_repo.list_actions_for_markers(
         project_id=selected_project_id,
         date_from=selected_from,
@@ -661,6 +685,13 @@ def render(con: sqlite3.Connection) -> None:
             )
         )
     markers_df = pd.DataFrame(markers)
+    if not markers_df.empty:
+        markers_df["marker_date"] = pd.to_datetime(
+            markers_df["marker_date"], errors="coerce"
+        )
+        markers_df = markers_df.dropna(subset=["marker_date"])
+        if not daily_view:
+            markers_df = _bucket_marker_dates(markers_df)
     markers_scrap = _apply_marker_area_filter(markers_df, scrap_marker_areas)
     markers_kpi = _apply_marker_area_filter(markers_df, kpi_marker_areas)
     if markers_df.empty:
@@ -674,9 +705,65 @@ def render(con: sqlite3.Connection) -> None:
             st.write("selected_scrap_component:", scrap_component)
             st.write("selected_scrap_area:", scrap_area_selection)
             st.write("selected_kpi_area:", kpi_area_selection)
+            actions_for_project_count = action_repo.count_actions(selected_project_id)
+            project_actions = action_repo.list_actions_for_markers(
+                project_id=selected_project_id,
+                date_from=None,
+                date_to=None,
+            )
+            distinct_action_areas = sorted(
+                {
+                    action.get("area")
+                    for action in project_actions
+                    if action.get("area")
+                }
+            )
+            actions_with_date_in_window_count = 0
+            actions_matching_area_scrap_count = 0
+            actions_matching_area_kpi_count = 0
+            action_date_sources_all: dict[str, int] = {
+                "closed_at": 0,
+                "created_at": 0,
+                "missing": 0,
+            }
+            action_date_sources_in_window: dict[str, int] = {
+                "closed_at": 0,
+                "created_at": 0,
+            }
+            action_dates_in_window: list[date] = []
+            for action in project_actions:
+                action_date, date_field = _action_date_payload(action)
+                if not action_date:
+                    action_date_sources_all["missing"] += 1
+                    continue
+                if date_field:
+                    action_date_sources_all[date_field] += 1
+                if _date_in_range(action_date, selected_from, selected_to):
+                    actions_with_date_in_window_count += 1
+                    action_dates_in_window.append(action_date)
+                    if date_field:
+                        action_date_sources_in_window[date_field] += 1
+                    normalized_area = _normalize_marker_area(action.get("area"))
+                    if not scrap_marker_areas or normalized_area in scrap_marker_areas:
+                        actions_matching_area_scrap_count += 1
+                    if not kpi_marker_areas or normalized_area in kpi_marker_areas:
+                        actions_matching_area_kpi_count += 1
             st.write("marker_total_count:", len(markers_df))
             st.write("marker_count_scrap_area:", len(markers_scrap))
             st.write("marker_count_kpi_area:", len(markers_kpi))
+            st.write("actions_for_project_count:", actions_for_project_count)
+            st.write("actions_with_date_in_window_count:", actions_with_date_in_window_count)
+            st.write("actions_matching_area_count_scrap:", actions_matching_area_scrap_count)
+            st.write("actions_matching_area_count_kpi:", actions_matching_area_kpi_count)
+            st.write("actions_area_distinct_values:", distinct_action_areas)
+            st.write("actions_date_field_counts_all:", action_date_sources_all)
+            st.write("actions_date_field_counts_in_window:", action_date_sources_in_window)
+            if action_dates_in_window:
+                st.write(
+                    "actions_date_window_min/max:",
+                    min(action_dates_in_window),
+                    max(action_dates_in_window),
+                )
             st.write("date_from/date_to:", selected_from, selected_to)
             raw_marker_actions = action_repo.list_recent_actions(
                 project_id=selected_project_id,
@@ -720,6 +807,10 @@ def render(con: sqlite3.Connection) -> None:
                         ]
                     ].head(5),
                     use_container_width=True,
+                )
+                st.write(
+                    "marker_x_values_preview:",
+                    markers_df["marker_date"].head(5).tolist(),
                 )
 
     chart_cols = st.columns(2)
@@ -833,6 +924,6 @@ def render(con: sqlite3.Connection) -> None:
             st.dataframe(scrap_currency_view, use_container_width=True)
 
     st.caption(
-        "Markery akcji są ustawiane na dacie zamknięcia (status done) "
-        "i widoczne po wyborze projektu."
+        "Markery akcji są ustawiane na dacie zamknięcia (jeśli dostępne) "
+        "lub na dacie utworzenia (otwarte akcje) i widoczne po wyborze projektu."
     )

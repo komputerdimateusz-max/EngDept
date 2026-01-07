@@ -1306,18 +1306,23 @@ class ActionRepository:
 
         if "is_draft" in action_cols:
             filters.append("a.is_draft = 0")
-        if "status" in action_cols:
-            filters.append("a.status = 'done'")
-        if has_closed_at:
-            filters.append("a.closed_at IS NOT NULL")
         if project_id and "project_id" in action_cols:
             filters.append("a.project_id = ?")
             params.append(project_id)
-        if (from_value or to_value) and has_closed_at:
-            clause, clause_params = _date_clause("a.closed_at", from_value, to_value)
-            if clause:
-                filters.append(clause)
-                params.extend(clause_params)
+        if from_value or to_value:
+            if has_closed_at and has_created_at:
+                date_expr = "COALESCE(a.closed_at, a.created_at)"
+            elif has_closed_at:
+                date_expr = "a.closed_at"
+            elif has_created_at:
+                date_expr = "a.created_at"
+            else:
+                date_expr = ""
+            if date_expr:
+                clause, clause_params = _date_clause(date_expr, from_value, to_value)
+                if clause:
+                    filters.append(clause)
+                    params.extend(clause_params)
 
         if filters:
             base_query += " WHERE " + " AND ".join(filters)
@@ -1390,21 +1395,28 @@ class ActionRepository:
 
         date_clause = ""
         date_params: list[Any] = []
-        if has_closed_at and (from_value or to_value):
+        date_expr = ""
+        if from_value or to_value:
+            if has_closed_at and has_created_at:
+                date_expr = "COALESCE(closed_at, created_at)"
+            elif has_closed_at:
+                date_expr = "closed_at"
+            elif has_created_at:
+                date_expr = "created_at"
+        if date_expr:
             if from_value and to_value:
-                date_clause = "date(closed_at) BETWEEN date(?) AND date(?)"
+                date_clause = f"date({date_expr}) BETWEEN date(?) AND date(?)"
                 date_params = [from_value, to_value]
             elif from_value:
-                date_clause = "date(closed_at) >= date(?)"
+                date_clause = f"date({date_expr}) >= date(?)"
                 date_params = [from_value]
             elif to_value:
-                date_clause = "date(closed_at) <= date(?)"
+                date_clause = f"date({date_expr}) <= date(?)"
                 date_params = [to_value]
 
         filters_summary = {
             "project_id": project_id,
-            "status_filter": "status = 'done'",
-            "closed_at_filter": "closed_at IS NOT NULL",
+            "draft_filter": "is_draft = 0" if "is_draft" in action_cols else "none",
             "date_filter": date_clause or "none",
             "scrap_area_filter": scrap_area or "TOTAL",
             "kpi_area_filter": kpi_area or "TOTAL",
@@ -1416,20 +1428,13 @@ class ActionRepository:
             base_filters.append("project_id = ?")
             base_params.append(project_id)
 
-        done_filters = list(base_filters)
-        done_params = list(base_params)
-        if "status" in action_cols:
-            done_filters.append("status = 'done'")
+        non_draft_filters = list(base_filters)
+        non_draft_params = list(base_params)
         if "is_draft" in action_cols:
-            done_filters.append("is_draft = 0")
+            non_draft_filters.append("is_draft = 0")
 
-        closed_filters = list(done_filters)
-        closed_params = list(done_params)
-        if has_closed_at:
-            closed_filters.append("closed_at IS NOT NULL")
-
-        in_range_filters = list(closed_filters)
-        in_range_params = list(closed_params)
+        in_range_filters = list(non_draft_filters)
+        in_range_params = list(non_draft_params)
         if date_clause:
             in_range_filters.append(date_clause)
             in_range_params.extend(date_params)
@@ -1452,10 +1457,9 @@ class ActionRepository:
             "filters": filters_summary,
             "actions_all_count": _count(""),
             "actions_for_project_count": _count(" AND ".join(base_filters), base_params),
-            "actions_done_count": _count(" AND ".join(done_filters), done_params),
-            "actions_with_closed_at_count": _count(
-                " AND ".join(closed_filters),
-                closed_params,
+            "actions_not_draft_count": _count(
+                " AND ".join(non_draft_filters),
+                non_draft_params,
             ),
             "actions_in_date_range_count": _count(
                 " AND ".join(in_range_filters),
