@@ -21,11 +21,8 @@ from action_tracking.services.markers import (
     action_marker_date_with_source,
     action_marker_fields,
 )
-from action_tracking.services.areas import (
-    kpi_area_to_allowed_areas,
-    normalize_area,
-    scrap_component_to_allowed_areas,
-)
+from action_tracking.services.areas import normalize_area
+from action_tracking.services.impact_aspects import parse_impact_aspects_from_db
 from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_COLORS,
     OVERLAY_TARGET_LABELS,
@@ -126,7 +123,6 @@ def _line_chart_with_markers(
     title: str,
     markers_df: pd.DataFrame,
     show_markers: bool,
-    area_filter: set[str] | None = None,
 ) -> alt.Chart:
     base = (
         alt.Chart(data)
@@ -139,20 +135,12 @@ def _line_chart_with_markers(
     )
     if not show_markers or markers_df.empty:
         return base
-    filtered_markers = markers_df.copy()
-    if area_filter and "action_area" in filtered_markers.columns:
-        if filtered_markers["action_area"].notna().any():
-            filtered_markers = filtered_markers[
-                filtered_markers["action_area"].isin(area_filter)
-            ]
-    if filtered_markers.empty:
-        return base
     marker_labels = list(OVERLAY_TARGET_COLORS.keys())
     marker_colors = [
         OVERLAY_TARGET_COLORS.get(label, "#9e9e9e") for label in marker_labels
     ]
     marker_layer = (
-        alt.Chart(filtered_markers)
+        alt.Chart(markers_df)
         .mark_rule(strokeDash=[6, 4])
         .encode(
             x=alt.X("marker_date:T"),
@@ -178,29 +166,75 @@ def _line_chart_with_markers(
     return base + marker_layer
 
 
-def _apply_marker_area_filter(
-    markers_df: pd.DataFrame,
-    area_filter: set[str] | None,
-) -> pd.DataFrame:
-    if not area_filter or markers_df.empty or "action_area" not in markers_df.columns:
-        return markers_df
-    if not markers_df["action_area"].notna().any():
-        return markers_df
-    return markers_df[markers_df["action_area"].isin(area_filter)]
-
-
 def _markers_available_for(
     markers_df: pd.DataFrame,
-    area_filter: set[str] | None,
 ) -> bool:
     if markers_df.empty:
         return False
-    return not _apply_marker_area_filter(markers_df, area_filter).empty
+    return True
 
 
 def _normalize_marker_area(value: Any) -> str:
     return normalize_area(value)
 
+
+def _normalize_marker_aspects(value: Any) -> set[str]:
+    if value in (None, ""):
+        return set()
+    raw: Any = value
+    if isinstance(value, str):
+        raw = parse_impact_aspects_from_db(value)
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    normalized: set[str] = set()
+    for item in raw:
+        if item in (None, ""):
+            continue
+        key = str(item).strip().upper().replace(" ", "_").replace("-", "_")
+        if key == "DOWNTIMES":
+            key = "DOWNTIME"
+        normalized.add(key)
+    return normalized
+
+
+def _marker_aspects_apply(aspects: set[str], chart_type: str) -> bool:
+    if not aspects:
+        return False
+    if chart_type == "scrap":
+        return "SCRAP" in aspects
+    if chart_type == "oee":
+        return "OEE" in aspects or "DOWNTIME" in aspects
+    if chart_type == "performance":
+        return "PERFORMANCE" in aspects
+    return False
+
+
+def _marker_area_matches(action_area: str, selected_area: str | None) -> bool:
+    if not selected_area:
+        return True
+    if not action_area or action_area == "Inne":
+        return True
+    return action_area == selected_area
+
+
+def _filter_markers_for_chart(
+    markers_df: pd.DataFrame,
+    chart_type: str,
+    selected_area: str | None,
+) -> pd.DataFrame:
+    if markers_df.empty:
+        return markers_df
+
+    def _row_matches(row: pd.Series) -> bool:
+        aspects = _normalize_marker_aspects(row.get("impact_aspects"))
+        if not _marker_aspects_apply(aspects, chart_type):
+            return False
+        action_area = _normalize_marker_area(row.get("action_area"))
+        return _marker_area_matches(action_area, selected_area)
+
+    return markers_df[markers_df.apply(_row_matches, axis=1)]
 
 def _date_in_range(value: date | None, start: date, end: date) -> bool:
     if value is None:
@@ -239,6 +273,7 @@ def _marker_payload_for_action(
             "category": action.get("category") or "—",
             "action_area": action_area,
             "action_area_label": action_area,
+            "impact_aspects": action.get("impact_aspects"),
             "action_due_date": date_fields.get("due_date"),
             "action_closed_at": date_fields.get("closed_at"),
             "action_created_at": date_fields.get("created_at"),
@@ -653,9 +688,6 @@ def render(con: sqlite3.Connection) -> None:
     if oee_scale != "unknown" or perf_scale != "unknown":
         st.caption("KPI zapisane w bazie jako procenty (0-100).")
 
-    scrap_marker_areas = scrap_component_to_allowed_areas(scrap_component)
-    kpi_marker_areas = kpi_area_to_allowed_areas(kpi_component)
-
     markers_df = pd.DataFrame()
     markers: list[dict[str, Any]] = []
     # Markers are based on actions.project_id (FK) and action dates; do not use production FULL PROJECT.
@@ -680,8 +712,15 @@ def render(con: sqlite3.Connection) -> None:
         markers_df = markers_df.dropna(subset=["marker_date"])
         if not daily_view:
             markers_df = _bucket_marker_dates(markers_df)
-    markers_scrap = _apply_marker_area_filter(markers_df, scrap_marker_areas)
-    markers_kpi = _apply_marker_area_filter(markers_df, kpi_marker_areas)
+    markers_scrap = _filter_markers_for_chart(
+        markers_df, "scrap", scrap_area_selection
+    )
+    markers_oee = _filter_markers_for_chart(
+        markers_df, "oee", kpi_area_selection
+    )
+    markers_perf = _filter_markers_for_chart(
+        markers_df, "performance", kpi_area_selection
+    )
     if markers_df.empty:
         st.caption("Brak markerów akcji w zakresie.")
 
@@ -709,6 +748,9 @@ def render(con: sqlite3.Connection) -> None:
             actions_with_date_in_window_count = 0
             actions_matching_area_scrap_count = 0
             actions_matching_area_kpi_count = 0
+            actions_matching_aspect_scrap_count = 0
+            actions_matching_aspect_oee_count = 0
+            actions_matching_aspect_perf_count = 0
             action_date_sources_all: dict[str, int] = {
                 "due_date": 0,
                 "closed_at": 0,
@@ -734,13 +776,21 @@ def render(con: sqlite3.Connection) -> None:
                     if date_field:
                         action_date_sources_in_window[date_field] += 1
                     normalized_area = _normalize_marker_area(action.get("area"))
-                    if not scrap_marker_areas or normalized_area in scrap_marker_areas:
+                    aspects = _normalize_marker_aspects(action.get("impact_aspects"))
+                    if _marker_area_matches(normalized_area, scrap_area_selection):
                         actions_matching_area_scrap_count += 1
-                    if not kpi_marker_areas or normalized_area in kpi_marker_areas:
+                    if _marker_area_matches(normalized_area, kpi_area_selection):
                         actions_matching_area_kpi_count += 1
+                    if _marker_aspects_apply(aspects, "scrap"):
+                        actions_matching_aspect_scrap_count += 1
+                    if _marker_aspects_apply(aspects, "oee"):
+                        actions_matching_aspect_oee_count += 1
+                    if _marker_aspects_apply(aspects, "performance"):
+                        actions_matching_aspect_perf_count += 1
             st.write("marker_total_count:", len(markers_df))
-            st.write("marker_count_scrap_area:", len(markers_scrap))
-            st.write("marker_count_kpi_area:", len(markers_kpi))
+            st.write("marker_count_scrap_filtered:", len(markers_scrap))
+            st.write("marker_count_oee_filtered:", len(markers_oee))
+            st.write("marker_count_perf_filtered:", len(markers_perf))
             if not markers_df.empty and "marker_source" in markers_df.columns:
                 marker_source_counts = (
                     markers_df["marker_source"].value_counts().to_dict()
@@ -750,6 +800,9 @@ def render(con: sqlite3.Connection) -> None:
             st.write("actions_with_date_in_window_count:", actions_with_date_in_window_count)
             st.write("actions_matching_area_count_scrap:", actions_matching_area_scrap_count)
             st.write("actions_matching_area_count_kpi:", actions_matching_area_kpi_count)
+            st.write("actions_matching_aspect_count_scrap:", actions_matching_aspect_scrap_count)
+            st.write("actions_matching_aspect_count_oee:", actions_matching_aspect_oee_count)
+            st.write("actions_matching_aspect_count_perf:", actions_matching_aspect_perf_count)
             st.write("actions_area_distinct_values:", distinct_action_areas)
             st.write("actions_date_field_counts_all:", action_date_sources_all)
             st.write("actions_date_field_counts_in_window:", action_date_sources_in_window)
@@ -801,6 +854,7 @@ def render(con: sqlite3.Connection) -> None:
                             "marker_kind",
                             "marker_source",
                             "action_area_label",
+                            "impact_aspects",
                         ]
                     ].head(5),
                     use_container_width=True,
@@ -812,9 +866,7 @@ def render(con: sqlite3.Connection) -> None:
 
     chart_cols = st.columns(2)
     if not scrap_daily.empty:
-        scrap_qty_markers_available = _markers_available_for(
-            markers_scrap, scrap_marker_areas
-        )
+        scrap_qty_markers_available = _markers_available_for(markers_scrap)
         show_scrap_qty_markers = chart_cols[0].checkbox(
             "Pokaż markery akcji",
             value=scrap_qty_markers_available,
@@ -829,16 +881,13 @@ def render(con: sqlite3.Connection) -> None:
                 "Scrap qty",
                 _attach_overlay_target(markers_scrap, "SCRAP_QTY"),
                 show_scrap_qty_markers,
-                scrap_marker_areas,
             ),
             use_container_width=True,
         )
         if currency == "All currencies":
             chart_cols[1].info("Koszt scrap: wybierz PLN, aby zobaczyć wykres.")
         else:
-            scrap_cost_markers_available = _markers_available_for(
-                markers_scrap, scrap_marker_areas
-            )
+            scrap_cost_markers_available = _markers_available_for(markers_scrap)
             show_scrap_cost_markers = chart_cols[1].checkbox(
                 "Pokaż markery akcji",
                 value=scrap_cost_markers_available,
@@ -853,7 +902,6 @@ def render(con: sqlite3.Connection) -> None:
                     "Scrap PLN",
                     _attach_overlay_target(markers_scrap, "SCRAP_COST"),
                     show_scrap_cost_markers,
-                    scrap_marker_areas,
                 ),
                 use_container_width=True,
             )
@@ -862,9 +910,7 @@ def render(con: sqlite3.Connection) -> None:
 
     chart_cols = st.columns(2)
     if not kpi_daily.empty:
-        oee_markers_available = _markers_available_for(
-            markers_kpi, kpi_marker_areas
-        )
+        oee_markers_available = _markers_available_for(markers_oee)
         show_oee_markers = chart_cols[0].checkbox(
             "Pokaż markery akcji",
             value=oee_markers_available,
@@ -877,15 +923,12 @@ def render(con: sqlite3.Connection) -> None:
                 "oee_avg",
                 "OEE (%)",
                 "OEE",
-                _attach_overlay_target(markers_kpi, "OEE"),
+                _attach_overlay_target(markers_oee, "OEE"),
                 show_oee_markers,
-                kpi_marker_areas,
             ),
             use_container_width=True,
         )
-        perf_markers_available = _markers_available_for(
-            markers_kpi, kpi_marker_areas
-        )
+        perf_markers_available = _markers_available_for(markers_perf)
         show_perf_markers = chart_cols[1].checkbox(
             "Pokaż markery akcji",
             value=perf_markers_available,
@@ -898,9 +941,8 @@ def render(con: sqlite3.Connection) -> None:
                 "performance_avg",
                 "Performance (%)",
                 "Performance",
-                _attach_overlay_target(markers_kpi, "PERFORMANCE"),
+                _attach_overlay_target(markers_perf, "PERFORMANCE"),
                 show_perf_markers,
-                kpi_marker_areas,
             ),
             use_container_width=True,
         )
