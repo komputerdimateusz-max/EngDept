@@ -33,27 +33,52 @@ except Exception:  # pragma: no cover
 
 try:
     # preferred: shared service
-    from action_tracking.services.impact_aspects import normalize_impact_aspects  # type: ignore
+    from action_tracking.services.impact_aspects import (  # type: ignore
+        parse_impact_aspects_from_db,
+        serialize_impact_aspects_to_db,
+    )
 except Exception:  # pragma: no cover
-    def normalize_impact_aspects(value: Any) -> list[str]:
-        if value in (None, "", []):
+    def parse_impact_aspects_from_db(value: Any) -> list[str]:
+        if value in (None, ""):
             return []
         if isinstance(value, str):
             v = value.strip()
             if not v:
                 return []
-            # If it's already a JSON list string, best-effort parse
             if v.startswith("[") and v.endswith("]"):
                 try:
                     parsed = json.loads(v)
                     if isinstance(parsed, list):
                         return [str(x).strip() for x in parsed if str(x).strip()]
+                    return [str(parsed).strip()] if str(parsed).strip() else []
                 except Exception:
-                    pass
+                    return [v]
             return [v]
         if isinstance(value, (list, tuple, set)):
             return [str(x).strip() for x in value if str(x).strip()]
         return []
+
+    def serialize_impact_aspects_to_db(value: Any) -> str | None:
+        if value in (None, "", []):
+            return None
+        if isinstance(value, str):
+            v = value.strip()
+            if not v:
+                return None
+            # If it's already a JSON list string, best-effort parse
+            if v.startswith("[") and v.endswith("]"):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        cleaned = [str(x).strip() for x in parsed if str(x).strip()]
+                        return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
+                except Exception:
+                    pass
+            return json.dumps([v], ensure_ascii=False)
+        if isinstance(value, (list, tuple, set)):
+            cleaned = [str(x).strip() for x in value if str(x).strip()]
+            return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
+        return None
 
 try:
     from action_tracking.services.overlay_targets import (  # type: ignore
@@ -171,12 +196,12 @@ def _normalize_impact_aspects_payload(value: Any) -> str | None:
     impact_aspects stored as JSON string in DB.
     Accept list/str/None -> returns JSON list string or None.
     """
-    normalized = normalize_impact_aspects(value)
-    if not normalized:
-        return None
-    # de-dup + stable order
-    cleaned = sorted({x for x in (str(v).strip() for v in normalized) if x})
-    return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
+    return serialize_impact_aspects_to_db(value)
+
+
+def _parse_impact_aspects_row(row: dict[str, Any]) -> None:
+    if "impact_aspects" in row:
+        row["impact_aspects"] = parse_impact_aspects_from_db(row.get("impact_aspects"))
 
 
 def _normalize_percent(value: Any) -> float | None:
@@ -1156,6 +1181,7 @@ class ActionRepository:
         for row in rows:
             row.setdefault("project_name", None)
             row.setdefault("owner_name", None)
+            _parse_impact_aspects_row(row)
         return rows
 
     def list_open_actions(self, project_ids: list[str] | None = None) -> list[dict[str, Any]]:
@@ -1221,6 +1247,7 @@ class ActionRepository:
         for row in rows:
             row.setdefault("project_name", None)
             row.setdefault("owner_name", None)
+            _parse_impact_aspects_row(row)
         return rows
 
     def list_actions_for_markers(
@@ -1345,6 +1372,7 @@ class ActionRepository:
         for row in rows:
             row.setdefault("project_name", None)
             row.setdefault("owner_name", None)
+            _parse_impact_aspects_row(row)
         return rows
 
     def debug_marker_counts(
@@ -1563,9 +1591,12 @@ class ActionRepository:
 
         try:
             cur = self.con.execute(base_query, params)
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
         except sqlite3.Error:
             return []
+        for row in rows:
+            _parse_impact_aspects_row(row)
+        return rows
 
     def create_action(self, data: dict[str, Any], debug: bool = False) -> str:
         action_id = data.get("id") or str(uuid4())
@@ -1949,9 +1980,12 @@ class ActionRepository:
             query += " WHERE " + " AND ".join(filters)
         try:
             cur = self.con.execute(query, params)
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
         except sqlite3.Error:
             return []
+        for row in rows:
+            _parse_impact_aspects_row(row)
+        return rows
 
     def list_actions_for_ranking(
         self,
@@ -2143,6 +2177,7 @@ class ActionRepository:
             r.setdefault("manual_savings_amount", None)
             r.setdefault("manual_savings_currency", None)
             r.setdefault("manual_savings_note", None)
+            _parse_impact_aspects_row(r)
         return rows
 
 
