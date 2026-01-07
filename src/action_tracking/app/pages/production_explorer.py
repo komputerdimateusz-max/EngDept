@@ -3,7 +3,7 @@ from __future__ import annotations
 # What changed:
 # - Added empty-filter debug info and classification sanity checks.
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import sqlite3
 from typing import Any
 
@@ -22,6 +22,7 @@ from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_LABELS,
     marker_areas_for_component,
     normalize_action_area,
+    normalize_area_selection,
 )
 from action_tracking.services.kpi_windows import compute_project_kpi_windows
 from action_tracking.services.production_outcome import (
@@ -185,13 +186,31 @@ def _date_in_range(value: date | None, start: date, end: date) -> bool:
     return start <= value <= end
 
 
+def _parse_closed_date(value: Any) -> date | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            pass
+    return parse_date(value)
+
+
 def _marker_payload_for_action(
     action: dict[str, Any],
     date_from: date,
     date_to: date,
 ) -> list[dict[str, Any]]:
     status = str(action.get("status") or "").strip().lower()
-    closed_date = parse_date(action.get("closed_at"))
+    closed_date = _parse_closed_date(action.get("closed_at"))
 
     if status != "done" or not closed_date:
         return []
@@ -354,6 +373,8 @@ def render(con: sqlite3.Connection) -> None:
         list(KPI_COMPONENTS.keys()),
         index=0,
     )
+    scrap_area_selection = normalize_area_selection(scrap_component)
+    kpi_area_selection = normalize_area_selection(kpi_component)
     granularity = filter_col4.radio(
         "Granularność",
         ["Dziennie", "Tygodniowo"],
@@ -624,6 +645,8 @@ def render(con: sqlite3.Connection) -> None:
 
     markers_df = pd.DataFrame()
     markers: list[dict[str, Any]] = []
+    # Markers are based on actions.project_id (FK) with status=done and closed_at;
+    # do not use production FULL PROJECT for action markers.
     marker_actions = action_repo.list_actions_for_markers(
         project_id=selected_project_id,
         date_from=selected_from,
@@ -646,10 +669,45 @@ def render(con: sqlite3.Connection) -> None:
     with st.expander("Debug: Markery akcji", expanded=False):
         debug_markers = st.checkbox("Pokaż debug markerów", value=False)
         if debug_markers:
+            st.write("selected_project_id:", selected_project_id)
+            st.write("selected_project_full_project:", production_key)
+            st.write("selected_scrap_component:", scrap_component)
+            st.write("selected_scrap_area:", scrap_area_selection)
+            st.write("selected_kpi_area:", kpi_area_selection)
             st.write("marker_total_count:", len(markers_df))
             st.write("marker_count_scrap_area:", len(markers_scrap))
             st.write("marker_count_kpi_area:", len(markers_kpi))
             st.write("date_from/date_to:", selected_from, selected_to)
+            raw_marker_actions = action_repo.list_recent_actions(
+                project_id=selected_project_id,
+                limit=10,
+            )
+            if raw_marker_actions:
+                st.write("Top 10 actions (raw DB rows):")
+                raw_df = pd.DataFrame(raw_marker_actions)
+                desired_cols = [
+                    "id",
+                    "project_id",
+                    "status",
+                    "closed_at",
+                    "area",
+                    "created_at",
+                ]
+                visible_cols = [col for col in desired_cols if col in raw_df.columns]
+                st.dataframe(
+                    raw_df[visible_cols].head(10) if visible_cols else raw_df.head(10),
+                    use_container_width=True,
+                )
+            marker_debug = action_repo.debug_marker_counts(
+                project_id=selected_project_id,
+                date_from=selected_from,
+                date_to=selected_to,
+                scrap_area=scrap_area_selection,
+                kpi_area=kpi_area_selection,
+            )
+            if marker_debug:
+                st.write("Marker filters summary:")
+                st.json(marker_debug, expanded=False)
             if not markers_df.empty:
                 st.write("Top 5 markers:")
                 st.dataframe(

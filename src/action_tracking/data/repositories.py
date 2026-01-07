@@ -1278,7 +1278,11 @@ class ActionRepository:
                     return None
             return None
 
-        def _date_clause(column: str, from_value: str | None, to_value: str | None) -> tuple[str, list[Any]]:
+        def _date_clause(
+            column: str,
+            from_value: str | None,
+            to_value: str | None,
+        ) -> tuple[str, list[Any]]:
             if from_value and to_value:
                 return f"date({column}) BETWEEN date(?) AND date(?)", [from_value, to_value]
             if from_value:
@@ -1302,25 +1306,18 @@ class ActionRepository:
 
         if "is_draft" in action_cols:
             filters.append("a.is_draft = 0")
+        if "status" in action_cols:
+            filters.append("a.status = 'done'")
+        if has_closed_at:
+            filters.append("a.closed_at IS NOT NULL")
         if project_id and "project_id" in action_cols:
             filters.append("a.project_id = ?")
             params.append(project_id)
-        if from_value or to_value:
-            date_filters: list[str] = []
-            date_params: list[Any] = []
-            if has_closed_at:
-                clause, clause_params = _date_clause("a.closed_at", from_value, to_value)
-                if clause:
-                    date_filters.append(clause)
-                    date_params.extend(clause_params)
-            if has_created_at:
-                clause, clause_params = _date_clause("a.created_at", from_value, to_value)
-                if clause:
-                    date_filters.append(clause)
-                    date_params.extend(clause_params)
-            if date_filters:
-                filters.append("(" + " OR ".join(date_filters) + ")")
-                params.extend(date_params)
+        if (from_value or to_value) and has_closed_at:
+            clause, clause_params = _date_clause("a.closed_at", from_value, to_value)
+            if clause:
+                filters.append(clause)
+                params.extend(clause_params)
 
         if filters:
             base_query += " WHERE " + " AND ".join(filters)
@@ -1344,6 +1341,135 @@ class ActionRepository:
             row.setdefault("project_name", None)
             row.setdefault("owner_name", None)
         return rows
+
+    def debug_marker_counts(
+        self,
+        project_id: str | None,
+        date_from: date | str | None,
+        date_to: date | str | None,
+        scrap_area: str | None,
+        kpi_area: str | None,
+    ) -> dict[str, Any]:
+        if not _table_exists(self.con, "actions"):
+            return {}
+        action_cols = _table_columns(self.con, "actions")
+        if not action_cols:
+            return {}
+        has_closed_at = "closed_at" in action_cols
+
+        def _coerce_date(value: date | str | None) -> str | None:
+            if not value:
+                return None
+            if isinstance(value, datetime):
+                return value.date().isoformat()
+            if isinstance(value, date):
+                return value.isoformat()
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                try:
+                    return date.fromisoformat(text[:10]).isoformat()
+                except ValueError:
+                    return None
+            return None
+
+        def _count(where_clause: str, params: list[Any] | None = None) -> int:
+            query = "SELECT COUNT(*) FROM actions"
+            if where_clause:
+                query += " WHERE " + where_clause
+            try:
+                cur = self.con.execute(query, params or [])
+                row = cur.fetchone()
+            except sqlite3.Error:
+                return 0
+            return int(row[0] if row else 0)
+
+        from_value = _coerce_date(date_from)
+        to_value = _coerce_date(date_to)
+
+        date_clause = ""
+        date_params: list[Any] = []
+        if has_closed_at and (from_value or to_value):
+            if from_value and to_value:
+                date_clause = "date(closed_at) BETWEEN date(?) AND date(?)"
+                date_params = [from_value, to_value]
+            elif from_value:
+                date_clause = "date(closed_at) >= date(?)"
+                date_params = [from_value]
+            elif to_value:
+                date_clause = "date(closed_at) <= date(?)"
+                date_params = [to_value]
+
+        filters_summary = {
+            "project_id": project_id,
+            "status_filter": "status = 'done'",
+            "closed_at_filter": "closed_at IS NOT NULL",
+            "date_filter": date_clause or "none",
+            "scrap_area_filter": scrap_area or "TOTAL",
+            "kpi_area_filter": kpi_area or "TOTAL",
+        }
+
+        base_filters: list[str] = []
+        base_params: list[Any] = []
+        if project_id and "project_id" in action_cols:
+            base_filters.append("project_id = ?")
+            base_params.append(project_id)
+
+        done_filters = list(base_filters)
+        done_params = list(base_params)
+        if "status" in action_cols:
+            done_filters.append("status = 'done'")
+        if "is_draft" in action_cols:
+            done_filters.append("is_draft = 0")
+
+        closed_filters = list(done_filters)
+        closed_params = list(done_params)
+        if has_closed_at:
+            closed_filters.append("closed_at IS NOT NULL")
+
+        in_range_filters = list(closed_filters)
+        in_range_params = list(closed_params)
+        if date_clause:
+            in_range_filters.append(date_clause)
+            in_range_params.extend(date_params)
+
+        area_expr = "COALESCE(area, 'Inne')" if "area" in action_cols else "NULL"
+
+        scrap_filters = list(in_range_filters)
+        scrap_params = list(in_range_params)
+        if scrap_area and "area" in action_cols:
+            scrap_filters.append(f"{area_expr} = ?")
+            scrap_params.append(scrap_area)
+
+        kpi_filters = list(in_range_filters)
+        kpi_params = list(in_range_params)
+        if kpi_area and "area" in action_cols:
+            kpi_filters.append(f"{area_expr} = ?")
+            kpi_params.append(kpi_area)
+
+        return {
+            "filters": filters_summary,
+            "actions_all_count": _count(""),
+            "actions_for_project_count": _count(" AND ".join(base_filters), base_params),
+            "actions_done_count": _count(" AND ".join(done_filters), done_params),
+            "actions_with_closed_at_count": _count(
+                " AND ".join(closed_filters),
+                closed_params,
+            ),
+            "actions_in_date_range_count": _count(
+                " AND ".join(in_range_filters),
+                in_range_params,
+            ),
+            "actions_area_match_scrap_count": _count(
+                " AND ".join(scrap_filters),
+                scrap_params,
+            ),
+            "actions_area_match_kpi_count": _count(
+                " AND ".join(kpi_filters),
+                kpi_params,
+            ),
+        }
 
     def count_actions(self, project_id: str | None = None) -> int:
         if not _table_exists(self.con, "actions"):

@@ -47,6 +47,16 @@ ACTION_AREA_ALIASES: dict[str, str] = {
     "unknown": "Inne",
 }
 
+AREA_SELECTION_HINTS: tuple[tuple[str, str], ...] = (
+    ("montaż (pl", "Montaż"),
+    ("montaz (pl", "Montaż"),
+    ("wtrysk (m", "Wtrysk"),
+    ("metalizacja (mzt", "Metalizacja"),
+    ("metalizacja (mtz", "Metalizacja"),
+    ("podgrupy (pl", "Podgrupa"),
+    ("podgrupa", "Podgrupa"),
+)
+
 
 def parse_overlay_targets(value: Any) -> list[str]:
     if value in (None, ""):
@@ -104,6 +114,22 @@ def normalize_action_area(value: Any) -> str | None:
     return ACTION_AREA_ALIASES.get(normalized, raw)
 
 
+# Normalize UI selections (e.g. "Montaż (PLxx/P)") to base action area labels.
+def normalize_area_selection(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.casefold()
+    if "total" in normalized or "all" in normalized:
+        return None
+    for hint, area in AREA_SELECTION_HINTS:
+        if hint in normalized:
+            return area
+    return normalize_action_area(text)
+
+
 def marker_areas_for_component(component_label: Any) -> set[str] | None:
     if component_label in (None, ""):
         return None
@@ -115,6 +141,10 @@ def marker_areas_for_component(component_label: Any) -> set[str] | None:
         return None
 
     areas: set[str] = set()
+    normalized_selection = normalize_area_selection(text)
+    if normalized_selection:
+        areas.add(normalized_selection)
+
     if "montaż" in normalized or "montaz" in normalized:
         areas.add("Montaż")
         if "subgroup" in normalized or "podgrup" in normalized:
