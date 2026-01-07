@@ -179,6 +179,9 @@ def render(con: sqlite3.Connection) -> None:
                 "owner_champion_id"
             )
             st.session_state["actions_prefill_work_centers"] = prefill.get("work_centers")
+            st.session_state["actions_prefill_title"] = prefill.get("title")
+            st.session_state["actions_prefill_description"] = prefill.get("description")
+            st.session_state["actions_prefill_area"] = prefill.get("area")
             st.session_state["actions_prefill_last_applied_nonce"] = prefill_nonce
             st.session_state["actions_prefill_should_apply"] = True
 
@@ -504,20 +507,39 @@ def render(con: sqlite3.Connection) -> None:
             savings_model = "MANUAL_REQUIRED"
         st.caption("Zmiana kategorii odświeża metodę liczenia i wymagane pola.")
         with st.form("complete_draft_form"):
+            prefill_title = (
+                st.session_state.get("actions_prefill_title")
+                if not editing
+                else None
+            )
+            prefill_description = (
+                st.session_state.get("actions_prefill_description")
+                if not editing
+                else None
+            )
+            prefill_area = (
+                st.session_state.get("actions_prefill_area")
+                if not editing
+                else None
+            )
             title = st.text_input(
                 "Krótka nazwa",
-                value=selected.get("title", ""),
+                value=prefill_title if prefill_title is not None else selected.get("title", ""),
                 max_chars=20,
             )
             description = st.text_area(
                 "Opis",
-                value=selected.get("description", "") or "",
+                value=prefill_description
+                if prefill_description is not None
+                else selected.get("description", "") or "",
                 max_chars=500,
             )
             area = st.selectbox(
                 "Obszar",
                 AREA_OPTIONS,
-                index=AREA_OPTIONS.index(_resolve_area_default(selected.get("area"))),
+                index=AREA_OPTIONS.index(_resolve_area_default(prefill_area))
+                if prefill_area in AREA_OPTIONS and not editing
+                else AREA_OPTIONS.index(_resolve_area_default(selected.get("area"))),
                 key="draft_action_area_select",
             )
 
@@ -726,20 +748,39 @@ def render(con: sqlite3.Connection) -> None:
             savings_model = "MANUAL_REQUIRED"
         st.caption("Zmiana kategorii odświeża metodę liczenia i wymagane pola.")
         with st.form("action_form"):
+            prefill_title = (
+                st.session_state.get("actions_prefill_title")
+                if not editing
+                else None
+            )
+            prefill_description = (
+                st.session_state.get("actions_prefill_description")
+                if not editing
+                else None
+            )
+            prefill_area = (
+                st.session_state.get("actions_prefill_area")
+                if not editing
+                else None
+            )
             title = st.text_input(
                 "Krótka nazwa",
-                value=selected.get("title", ""),
+                value=prefill_title if prefill_title is not None else selected.get("title", ""),
                 max_chars=20,
             )
             description = st.text_area(
                 "Opis",
-                value=selected.get("description", "") or "",
+                value=prefill_description
+                if prefill_description is not None
+                else selected.get("description", "") or "",
                 max_chars=500,
             )
             area = st.selectbox(
                 "Obszar",
                 AREA_OPTIONS,
-                index=AREA_OPTIONS.index(_resolve_area_default(selected.get("area"))),
+                index=AREA_OPTIONS.index(_resolve_area_default(prefill_area))
+                if prefill_area in AREA_OPTIONS and not editing
+                else AREA_OPTIONS.index(_resolve_area_default(selected.get("area"))),
                 key="action_area_select",
             )
 

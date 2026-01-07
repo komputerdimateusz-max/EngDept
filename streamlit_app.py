@@ -19,6 +19,7 @@ from action_tracking.app.pages import (
     champions,
     champions_ranking,
     analizy,
+    diagnostics_assistant,
     projects,
     settings,
     production_import,
@@ -67,6 +68,7 @@ PAGES = {
     "Champions ranking": lambda: champions_ranking.render(con),
     "Champions": lambda: champions.render(con),
     "Analizy": lambda: analizy.render(con),
+    "Asystent Diagnostyki": lambda: diagnostics_assistant.render(con),
     "Projekty": lambda: projects.render(con),
     "Ustawienia Globalne": lambda: settings.render(con),
     "Import danych produkcyjnych": lambda: production_import.render(con),
@@ -74,6 +76,7 @@ PAGES = {
 
 nav_target = st.session_state.pop("nav_to_page", None)
 nav_prefill = st.session_state.pop("nav_action_prefill", None)
+nav_analysis_prefill = st.session_state.pop("nav_analysis_prefill", None)
 if nav_prefill:
     project_id = nav_prefill.get("project_id")
     if project_id:
@@ -85,6 +88,14 @@ if nav_prefill:
     if work_center:
         st.session_state["prefill_action_work_center"] = str(work_center)
     st.session_state["prefill_action_applied"] = False
+if nav_analysis_prefill:
+    st.session_state["prefill_analysis_tool_type"] = nav_analysis_prefill.get("tool_type")
+    st.session_state["prefill_analysis_area"] = nav_analysis_prefill.get("area")
+    st.session_state["prefill_analysis_project_id"] = nav_analysis_prefill.get("project_id")
+    st.session_state["prefill_analysis_champion_id"] = nav_analysis_prefill.get("champion_id")
+    st.session_state["prefill_analysis_summary"] = nav_analysis_prefill.get("summary")
+    st.session_state["analysis_prefill_payload"] = nav_analysis_prefill
+    st.session_state["analysis_prefill_should_apply"] = True
 if nav_target in PAGES:
     st.session_state["sidebar_page"] = nav_target
 

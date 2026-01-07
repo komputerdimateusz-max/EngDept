@@ -15,6 +15,7 @@ from action_tracking.data.repositories import (
     SettingsRepository,
 )
 from action_tracking.integrations.email_sender import smtp_config_status
+from action_tracking.services import diagnostics_assistant
 from action_tracking.services.normalize import normalize_key
 from action_tracking.services.overlay_targets import (
     OVERLAY_TARGET_LABELS,
@@ -121,6 +122,26 @@ def render(con: sqlite3.Connection) -> None:
         st.dataframe(logs_df, use_container_width=True, hide_index=True)
     else:
         st.caption("Brak logów powiadomień email.")
+
+    st.divider()
+
+    # =========================
+    # DIAGNOSTICS ASSISTANT
+    # =========================
+    st.subheader("Asystent Diagnostyki")
+    st.caption("Zaufane domeny używane przez Tavily (jedna domena na linię).")
+    current_domains = diagnostics_assistant.load_trusted_domains()
+    domains_text = st.text_area(
+        "Trusted domains for Diagnostics Assistant",
+        value="\\n".join(current_domains),
+        height=160,
+        help="Podaj domeny bez https:// (np. plasticstechnology.com).",
+    )
+    if st.button("Zapisz domeny zaufane"):
+        domains = [line.strip() for line in domains_text.splitlines() if line.strip()]
+        diagnostics_assistant.save_trusted_domains(domains)
+        st.success("Zapisano listę domen zaufanych.")
+        st.rerun()
 
     st.divider()
 
