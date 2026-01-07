@@ -29,10 +29,11 @@ def _resolve_area_default(selected_area: Any) -> str:
     return "Montaż"
 
 
-def _default_template(tool_type: str) -> dict[str, Any]:
+def _default_template(tool_type: str, summary: str | None = None) -> dict[str, Any]:
+    summary_text = (summary or "").strip()
     if tool_type == "5WHY":
         return {
-            "problem_description": "",
+            "problem_description": summary_text,
             "why_1": "",
             "why_2": "",
             "why_3": "",
@@ -42,7 +43,7 @@ def _default_template(tool_type: str) -> dict[str, Any]:
         }
     if tool_type == "Diagram Ishikawy":
         return {
-            "problem": "",
+            "problem": summary_text,
             "categories": {
                 "Man": "",
                 "Machine": "",
@@ -255,6 +256,10 @@ def _render_analysis_actions(
 
 
 def render(con: sqlite3.Connection) -> None:
+    prefill_payload = st.session_state.get("analysis_prefill_payload")
+    if st.session_state.get("analysis_prefill_should_apply") and prefill_payload:
+        st.session_state["show_new_analysis_form"] = True
+
     st.header("Analizy")
 
     analysis_repo = AnalysisRepository(con)
@@ -300,42 +305,64 @@ def render(con: sqlite3.Connection) -> None:
         st.session_state["show_new_analysis_form"] = True
 
     if st.session_state.get("show_new_analysis_form"):
+        prefill_payload = st.session_state.get("analysis_prefill_payload") if st.session_state.get(
+            "analysis_prefill_should_apply"
+        ) else None
         with st.form("new_analysis_form"):
             project_options = ["(brak)"] + [p["id"] for p in projects]
+            prefill_project = prefill_payload.get("project_id") if prefill_payload else None
             selected_project = st.selectbox(
                 "Projekt",
                 project_options,
+                index=project_options.index(prefill_project)
+                if prefill_project in project_options
+                else 0,
                 format_func=lambda pid: "(brak)"
                 if pid == "(brak)"
                 else project_names.get(pid, pid),
             )
             champion_options = ["(brak)"] + [c["id"] for c in champions]
+            prefill_champion = prefill_payload.get("champion_id") if prefill_payload else None
             selected_champion = st.selectbox(
                 "Champion",
                 champion_options,
+                index=champion_options.index(prefill_champion)
+                if prefill_champion in champion_options
+                else 0,
                 format_func=lambda cid: "(brak)"
                 if cid == "(brak)"
                 else champion_names.get(cid, cid),
             )
-            tool_type = st.selectbox("Typ narzędzia", TOOL_TYPES)
+            prefill_tool = prefill_payload.get("tool_type") if prefill_payload else None
+            tool_type = st.selectbox(
+                "Typ narzędzia",
+                TOOL_TYPES,
+                index=TOOL_TYPES.index(prefill_tool)
+                if prefill_tool in TOOL_TYPES
+                else 0,
+            )
             area = st.selectbox(
                 "Obszar",
                 AREA_OPTIONS,
-                index=AREA_OPTIONS.index(_resolve_area_default(None)),
+                index=AREA_OPTIONS.index(
+                    _resolve_area_default(prefill_payload.get("area") if prefill_payload else None)
+                ),
             )
             submitted = st.form_submit_button("Utwórz analizę")
 
         if submitted:
+            summary_text = prefill_payload.get("summary") if prefill_payload else None
             analysis_repo.create_analysis(
                 {
                     "project_id": None if selected_project == "(brak)" else selected_project,
                     "champion_id": None if selected_champion == "(brak)" else selected_champion,
                     "tool_type": tool_type,
                     "area": None if area == "(brak)" else area,
-                    "template_json": _default_template(tool_type),
+                    "template_json": _default_template(tool_type, summary=summary_text),
                 }
             )
             st.session_state["show_new_analysis_form"] = False
+            st.session_state["analysis_prefill_should_apply"] = False
             st.success("Analiza utworzona.")
             st.rerun()
 
@@ -356,6 +383,7 @@ def render(con: sqlite3.Connection) -> None:
             ),
             aid,
         ),
+        key="analysis_select_id",
     )
 
     selected_analysis = next(
