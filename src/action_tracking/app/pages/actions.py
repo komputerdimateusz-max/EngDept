@@ -30,8 +30,7 @@ from action_tracking.services.kpi_delta import compute_kpi_pp_delta, compute_scr
 from action_tracking.services.impact_aspects import (
     IMPACT_ASPECT_LABELS,
     IMPACT_ASPECTS,
-    normalize_impact_aspects,
-    parse_impact_aspects,
+    parse_impact_aspects_from_db,
 )
 from action_tracking.services.normalize import normalize_key
 
@@ -132,6 +131,16 @@ def _default_aspects_from_rule(rule: dict[str, Any]) -> list[str]:
     if effect_model in IMPACT_ASPECTS:
         return [effect_model]
     return []
+
+
+def _impact_aspect_options(existing: list[str]) -> list[str]:
+    extras = [aspect for aspect in existing if aspect not in IMPACT_ASPECTS]
+    return list(IMPACT_ASPECTS) + extras
+
+
+def _ensure_session_default(key: str, default: list[str]) -> None:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 def _get_query_param(key: str) -> str | None:
@@ -569,14 +578,15 @@ def render(con: sqlite3.Connection) -> None:
                 else 0,
             )
 
-            existing_aspects = parse_impact_aspects(selected.get("impact_aspects"))
+            existing_aspects = parse_impact_aspects_from_db(selected.get("impact_aspects"))
             default_aspects = list(existing_aspects)
+            impact_key = f"draft_action_impact_aspects_{selected_action}"
+            _ensure_session_default(impact_key, default_aspects)
             impact_aspects = st.multiselect(
                 "Aspekty Work Center poprawiane przez akcję",
-                options=list(IMPACT_ASPECTS),
-                default=default_aspects,
+                options=_impact_aspect_options(existing_aspects),
                 format_func=lambda aspect: IMPACT_ASPECT_LABELS.get(aspect, aspect),
-                key="draft_action_impact_aspects",
+                key=impact_key,
             )
 
             no_due_date = st.checkbox(
@@ -660,12 +670,7 @@ def render(con: sqlite3.Connection) -> None:
                 "owner_champion_id": None if owner_champion == "(brak)" else owner_champion,
                 "priority": priority,
                 "status": status,
-                "impact_aspects": json.dumps(
-                    normalize_impact_aspects(impact_aspects),
-                    ensure_ascii=False,
-                )
-                if impact_aspects
-                else None,
+                "impact_aspects": impact_aspects or None,
                 "due_date": None if no_due_date else due_date.isoformat(),
                 "manual_savings_amount": manual_amount if manual_required else None,
                 "manual_savings_currency": manual_currency if manual_required else None,
@@ -795,18 +800,19 @@ def render(con: sqlite3.Connection) -> None:
                 else 0,
             )
 
-            existing_aspects = parse_impact_aspects(selected.get("impact_aspects"))
+            existing_aspects = parse_impact_aspects_from_db(selected.get("impact_aspects"))
             default_aspects = (
                 list(existing_aspects)
                 if editing
                 else _default_aspects_from_rule(rule)
             )
+            impact_key = f"action_impact_aspects_{selected_action}"
+            _ensure_session_default(impact_key, default_aspects)
             impact_aspects = st.multiselect(
                 "Aspekty Work Center poprawiane przez akcję",
-                options=list(IMPACT_ASPECTS),
-                default=default_aspects,
+                options=_impact_aspect_options(existing_aspects),
                 format_func=lambda aspect: IMPACT_ASPECT_LABELS.get(aspect, aspect),
-                key="action_impact_aspects",
+                key=impact_key,
             )
 
             no_due_date = st.checkbox(
@@ -892,12 +898,7 @@ def render(con: sqlite3.Connection) -> None:
                 "owner_champion_id": None if owner_champion == "(brak)" else owner_champion,
                 "priority": priority,
                 "status": status,
-                "impact_aspects": json.dumps(
-                    normalize_impact_aspects(impact_aspects),
-                    ensure_ascii=False,
-                )
-                if impact_aspects
-                else None,
+                "impact_aspects": impact_aspects or None,
                 "due_date": None if no_due_date else due_date.isoformat(),
                 "manual_savings_amount": manual_amount if manual_required else None,
                 "manual_savings_currency": manual_currency if manual_required else None,

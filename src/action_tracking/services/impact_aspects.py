@@ -28,50 +28,50 @@ IMPACT_ASPECT_COLORS: dict[str, str] = {
     "DOWNTIMES": "#8c564b",
 }
 
-_ASPECT_SYNONYMS: dict[str, str] = {
-    "SCRAP": "SCRAP",
-    "SCRAPS": "SCRAP",
-    "SCRAPQTY": "SCRAP",
-    "SCRAP_QTY": "SCRAP",
-    "SCRAPCOST": "SCRAP",
-    "SCRAP_COST": "SCRAP",
-    "OEE": "OEE",
-    "PERF": "PERFORMANCE",
-    "PERFORMANCE": "PERFORMANCE",
-    "DLE": "DLE",
-    "DOWNTIME": "DOWNTIMES",
-    "DOWNTIMES": "DOWNTIMES",
-}
-
-
-def parse_impact_aspects(value: Any) -> set[str]:
+def parse_impact_aspects_from_db(value: Any) -> list[str]:
     if value in (None, ""):
-        return set()
+        return []
 
-    raw: Any = value
     if isinstance(value, str):
-        try:
-            raw = json.loads(value)
-        except json.JSONDecodeError:
-            raw = [part.strip() for part in value.replace(";", ",").split(",") if part.strip()]
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return [text]
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+            return [str(parsed).strip()] if str(parsed).strip() else []
+        return [text]
 
-    if isinstance(raw, str):
-        raw = [raw]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
 
-    if not isinstance(raw, list):
-        return set()
-
-    normalized: set[str] = set()
-    for item in raw:
-        if item in (None, ""):
-            continue
-        key = str(item).strip().upper().replace(" ", "_")
-        key = _ASPECT_SYNONYMS.get(key, key)
-        if key in IMPACT_ASPECTS:
-            normalized.add(key)
-    return normalized
+    return []
 
 
-def normalize_impact_aspects(value: Any) -> list[str]:
-    aspects = parse_impact_aspects(value)
-    return [aspect for aspect in IMPACT_ASPECTS if aspect in aspects]
+def serialize_impact_aspects_to_db(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return json.dumps([text], ensure_ascii=False)
+            if isinstance(parsed, list):
+                cleaned = [str(item).strip() for item in parsed if str(item).strip()]
+                return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
+        return json.dumps([text], ensure_ascii=False)
+
+    if isinstance(value, (list, tuple, set)):
+        cleaned = [str(item).strip() for item in value if str(item).strip()]
+        return json.dumps(cleaned, ensure_ascii=False) if cleaned else None
+
+    return None
